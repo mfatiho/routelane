@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+
+  <!--
+  RouteLane privileged helper policy.
+
+  routelane-helper is installed under /usr/lib/routelane/ and is executed via pkexec.
+
+  Install:
+    sudo mkdir -p /usr/lib/routelane
+    sudo cp target/release/routelane-helper /usr/lib/routelane/routelane-helper
+    sudo chmod 755 /usr/lib/routelane/routelane-helper
+    sudo cp data/io.github.routelane.policy \
+         /usr/share/polkit-1/actions/io.github.routelane.policy
+  -->
+
+  <vendor>RouteLane</vendor>
+  <vendor_url>https://github.com/routelane/routelane</vendor_url>
+
+  <action id="io.github.routelane.modify-routing">
+    <description>Modify network routing rules</description>
+    <description xml:lang="tr">Ağ yönlendirme kurallarını değiştir</description>
+    <message>RouteLane needs administrator authentication to modify network routing.</message>
+    <message xml:lang="tr">RouteLane, ağ yönlendirme kurallarını değiştirmek için yönetici parolası gerektiriyor.</message>
+
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/routelane/routelane-helper</annotate>
+  </action>
+
+</policyconfig>

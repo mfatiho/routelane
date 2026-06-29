@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=RouteLane
+Comment=Policy-based routing desktop application
+Exec=routelane
+Icon=network-vpn-symbolic
+Terminal=false
+Categories=Network;System;
+StartupNotify=true
+StartupWMClass=io.github.routelane
