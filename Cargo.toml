@@ -1,0 +1,41 @@
+[package]
+name = "routelane"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "routelane"
+path = "src/main.rs"
+
+# Privileged helper — pkexec ile tek seferlik ayrıcalık yükseltmesi için
+[[bin]]
+name = "routelane-helper"
+path = "src/bin/routelane_helper.rs"
+
+[dependencies]
+# Ubuntu 22.04: libgtk-4-dev (4.6.9) + libadwaita-1-dev (1.1.7)
+#
+# Rust crate ↔ C kütüphane eşlemesi:
+#   gtk4 0.5.x → GTK4 C 4.0-4.4 API (Ubuntu 22.04'te 4.6.9 ile runtime uyumlu)
+#   libadwaita 0.2.x → libadwaita C 1.0-1.1 (libadwaita-sys 0.2 → gtk4-sys 0.5)
+#   glib/gio 0.15.x → GLib 2.70
+#
+# libadwaita 0.2 ve gtk4 0.5 birbirine kenetlenmiştir; gtk4 0.7 ile uyumlu değil.
+gtk4       = { version = "0.5", features = ["v4_4"] }
+libadwaita = { version = "0.2", features = ["v1_1"] }
+# gtk4 0.5, cairo üzerinden glib 0.16 kullanıyor; tek sürüm olması için 0.16 pin'liyoruz
+glib       = "0.16"
+
+# Async runtime (GTK main loop'tan bağımsız)
+tokio = { version = "1", features = ["full"] }
+
+# GTK ↔ Tokio köprüsü — glib MainContext'ten await edilebilir MPMC kanal
+async-channel = "1"
+
+# Genel amaçlı
+anyhow  = "1"
+serde   = { version = "1", features = ["derive"] }
+serde_json = "1"
+log     = "0.4"
+env_logger = "0.11"
+ksni = { version = "0.3.5", features = ["blocking"] }
