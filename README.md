@@ -1,195 +1,202 @@
 # RouteLane
 
-Policy-based routing (PBR) desktop uygulaması. Belirli alan adlarını veya IP adreslerini seçtiğiniz ağ arayüzünden yönlendirirken diğer tüm trafiğin varsayılan bağlantıdan akmasını sağlar.
+RouteLane is a Linux desktop application for policy-based routing. It routes selected domains, IP addresses, or CIDR ranges through a chosen network interface while leaving the rest of the system traffic on the default route.
 
-**Örnek kullanım:** ChatGPT, OpenAI gibi siteleri VPN üzerinden; geri kalan trafiği normal internet bağlantısından yönlendirme.
+Example use case: route ChatGPT or OpenAI traffic through a VPN interface such as `tun0`, while regular browsing continues through your normal connection.
 
-## Özellikler
+## Features
 
-- GTK4 + Libadwaita arayüzü (GNOME HIG uyumlu)
-- Alan adı veya IP/CIDR bazlı yönlendirme kuralları
-- Tek bir `pkexec` çağrısıyla ayrıcalık yükseltme (Polkit)
-- Uygulama kapatıldığında veya switch kapatıldığında tüm kernel kuralları güvenli biçimde temizlenir
-- Ayarlar yeniden açıldığında otomatik geri yüklenir (`~/.config/routelane/config.json`)
+- GTK4 and Libadwaita desktop interface
+- Domain, IP address, and CIDR routing rules
+- Per-rule target interface selection
+- Privileged network changes handled by `routelane-helper` through Polkit
+- Kernel routing rules are removed when routing is disabled or the app exits
+- Configuration is saved to `~/.config/routelane/config.json`
+- Ubuntu `.deb` package build script
 
-## Mimari
+## How It Works
 
+RouteLane keeps the GUI unprivileged. The desktop app stores rules, resolves domain targets, and sends routing operations to the privileged helper only when kernel routing changes are required.
+
+```text
+GTK / Libadwaita UI
+        |
+        | routing commands
+        v
+Tokio routing engine
+        |
+        | pkexec
+        v
+routelane-helper (root)
+        |
+        v
+ip rule / ip route
 ```
-┌───────────────────┐  UiToEngine  ┌────────────────────────┐
-│  GTK main thread  │ ────────────>│  Tokio (arka plan)     │
-│  (window.rs)      │ <────────────│  routing/mod.rs         │
-└───────────────────┘  EngineToUi └────────────────────────┘
-                                           │  pkexec (tek seferlik)
-                                           ▼
-                                   routelane-helper  (root)
-                                   ip rule / ip route
-```
 
-**İki durumlu model:**
+Routing has two main states:
 
-| Switch | Kernel Durumu | Açıklama |
-|--------|--------------|----------|
-| KAPALI | Boş | Kurallar yalnızca bellekte saklanır, kernel'a dokunulmaz |
-| AÇIK   | Aktif | Tüm kurallar tek `pkexec` çağrısıyla kernel'a uygulanır |
+| State | Kernel routing state | Behavior |
+| --- | --- | --- |
+| Off | Empty | Rules are kept in the app configuration only. |
+| On | Active | Rules are applied to the kernel through `routelane-helper`. |
 
-## Gereksinimler
+## Requirements
 
-### Çalışma zamanı
+Runtime requirements on Ubuntu or a compatible distribution:
 
-- Ubuntu 22.04 (veya uyumlu)
-- `libgtk-4-1` ≥ 4.6
-- `libadwaita-1` ≥ 1.1
-- `pkexec` / `polkit`
-- `iproute2` (`ip` komutu)
+- `libgtk-4-1`
+- `libadwaita-1-0`
+- `policykit-1`
+- `iproute2`
 
-### Derleme
+Build requirements:
 
-```
-libgtk-4-dev
-libadwaita-1-dev
-cargo (Rust stable)
-```
+- Rust stable toolchain with `cargo`
+- `libgtk-4-dev`
+- `libadwaita-1-dev`
+- `dpkg-deb` for `.deb` package builds
+
+Install build dependencies on Ubuntu:
 
 ```bash
-sudo apt install libgtk-4-dev libadwaita-1-dev
+sudo apt install cargo libgtk-4-dev libadwaita-1-dev dpkg-dev
 ```
 
-## Derleme
+## Install from a .deb Package
+
+The preferred local install path is the generated `.deb` package.
+
+```bash
+./packaging/deb/build-deb.sh
+sudo apt install ./dist/routelane_0.1.0_amd64.deb
+```
+
+The package installs:
+
+| Source | Installed path |
+| --- | --- |
+| `routelane` | `/usr/bin/routelane` |
+| `routelane-helper` | `/usr/lib/routelane/routelane-helper` |
+| `data/io.github.routelane.desktop` | `/usr/share/applications/io.github.routelane.desktop` |
+| `data/io.github.routelane.policy` | `/usr/share/polkit-1/actions/io.github.routelane.policy` |
+
+After installation, start RouteLane from the application launcher or run:
+
+```bash
+routelane
+```
+
+## Build from Source
 
 ```bash
 git clone <repo-url>
 cd routelane
-cargo build --release
+cargo build --release --bins
 ```
 
-Çıktılar:
+Build outputs:
 
-| Dosya | Açıklama |
-|-------|----------|
-| `target/release/routelane` | GUI uygulaması |
-| `target/release/routelane-helper` | Ayrıcalıklı yardımcı ikili |
+| Binary | Path |
+| --- | --- |
+| GUI application | `target/release/routelane` |
+| Privileged helper | `target/release/routelane-helper` |
 
-## Deb Paketi Olusturma
-
-Ubuntu icin kurulabilir `.deb` paketi uretmek:
+Manual installation from a source build:
 
 ```bash
-./packaging/deb/build-deb.sh
+sudo install -d -m 0755 /usr/lib/routelane
+sudo install -m 0755 target/release/routelane-helper /usr/lib/routelane/routelane-helper
+sudo install -m 0755 target/release/routelane /usr/bin/routelane
+sudo install -m 0644 data/io.github.routelane.desktop /usr/share/applications/io.github.routelane.desktop
+sudo install -m 0644 data/io.github.routelane.policy /usr/share/polkit-1/actions/io.github.routelane.policy
 ```
 
-Paket `dist/` altina yazilir:
+## Development Run
 
-```text
-dist/routelane_0.1.0_amd64.deb
-```
-
-Yerel kurulum:
+For local development, build both binaries and point the GUI to the development helper with `ROUTELANE_HELPER`:
 
 ```bash
-sudo apt install ./dist/routelane_0.1.0_amd64.deb
-```
-
-Paket su dosyalari kurar:
-
-| Dosya | Hedef |
-|-------|-------|
-| `routelane` | `/usr/bin/routelane` |
-| `routelane-helper` | `/usr/lib/routelane/routelane-helper` |
-| `io.github.routelane.desktop` | `/usr/share/applications/io.github.routelane.desktop` |
-| `io.github.routelane.policy` | `/usr/share/polkit-1/actions/io.github.routelane.policy` |
-
-## Kurulum
-
-```bash
-# Yardımcı ikiliyi kur
-sudo mkdir -p /usr/lib/routelane
-sudo cp target/release/routelane-helper /usr/lib/routelane/routelane-helper
-sudo chmod 755 /usr/lib/routelane/routelane-helper
-
-# Polkit politikasını kur (tek seferlik oturum yetkilendirmesi)
-sudo cp data/io.github.routelane.policy \
-     /usr/share/polkit-1/actions/io.github.routelane.policy
-
-# GUI ve Ubuntu dock launcher kaydını kur
-sudo cp target/release/routelane /usr/bin/routelane
-sudo cp data/io.github.routelane.desktop \
-     /usr/share/applications/io.github.routelane.desktop
-
-# GUI'yi başlat
-routelane
-```
-
-### Geliştirme ortamında çalıştırma
-
-Kurulum yapmadan test etmek için helper yolunu çevre değişkeniyle belirtin:
-
-```bash
+cargo build --bins
 ROUTELANE_HELPER=./target/debug/routelane-helper cargo run --bin routelane
 ```
 
-> **Not:** `routelane-helper`'ın root olarak çalışabilmesi için polkit politikası yüklenmiş olmalıdır.
+The Polkit policy must still be installed before `routelane-helper` can run through `pkexec`.
 
-## Kullanım
+## Usage
 
-1. Uygulamayı başlatın.
-2. **İstisna Ağı** açılır menüsünden yönlendirme yapılacak ağ arayüzünü seçin (örn: `wlan0`, `tun0`).
-3. **Adres Ekle** alanına bir alan adı (`chatgpt.com`) veya IP (`8.8.8.8`) yazıp Enter'a basın.
-4. Switch'i **açın** — kurallar kernel'a uygulanır, polkit şifre sorar.
-5. Switch'i **kapatın** veya uygulamayı kapatın — tüm kernel kuralları otomatik temizlenir.
+1. Start RouteLane.
+2. Select the network interface that should carry routed traffic, for example `tun0`, `wg0`, or `wlan0`.
+3. Add a domain, IP address, or CIDR target such as `chatgpt.com`, `8.8.8.8`, or `203.0.113.0/24`.
+4. Turn routing on. Polkit may ask for administrator authentication.
+5. Turn routing off or close the app to remove the active kernel routing rules.
 
-Ayarlar (`~/.config/routelane/config.json`) uygulama kapanınca kaydedilir; sonraki açılışta geri yüklenir. Switch varsayılan olarak kapalı gelir; kullanıcı manuel açar.
+Saved rules are restored when the app starts again. Routing starts disabled; the user must enable it manually.
 
-## Kayıt yapısı
+## Configuration
 
-```
+RouteLane stores its configuration at:
+
+```text
 ~/.config/routelane/config.json
 ```
 
+Example:
+
 ```json
 {
-  "alt_interface": "wlan0",
+  "alt_interface": "tun0",
   "rules": [
-    { "target_str": "chatgpt.com", "is_domain": true, "interface": "wlan0" },
-    { "target_str": "8.8.8.8",    "is_domain": false, "interface": "wlan0" }
+    { "target_str": "chatgpt.com", "is_domain": true, "interface": "tun0" },
+    { "target_str": "8.8.8.8", "is_domain": false, "interface": "tun0" }
   ]
 }
 ```
 
-## Güvenlik
+## Security Model
 
-- GUI uygulaması root yetkisi gerektirmez.
-- `routelane-helper` yalnızca `pkexec` aracılığıyla çalışır; doğrudan çağrılamaz.
-- Helper, her girdi için whitelist doğrulaması yapar: tablo numarası (100–199), öncelik aralığı (10000–10999), IP/CIDR formatı.
-- Polkit politikası `allow_active = auth_admin_keep`: oturumda bir kez şifre sorulur, sonraki işlemler şifresiz geçer.
-- Kernel yönlendirme tablosu: `100 (routelane)`, öncelik aralığı: `10000–10999`.
+- The `routelane` GUI does not run as root.
+- Privileged operations are isolated in `routelane-helper`.
+- The helper is launched through `pkexec` and authorized by `/usr/share/polkit-1/actions/io.github.routelane.policy`.
+- The installed helper path is `/usr/lib/routelane/routelane-helper`.
+- Helper input is validated before any `ip rule` or `ip route` command is executed.
+- RouteLane uses routing table `100` and rule priorities in the `10000` to `10999` range.
+- Kernel routing rules are removed when routing is disabled or the app exits.
 
-## CDN Alan Adları Hakkında
+## CDN and Domain Routing Limitations
 
-`chatgpt.com` gibi Cloudflare/Fastly CDN'li alan adları her DNS sorgusunda farklı IP adresleri döndürebilir. Bu durumda `ip rule + çözümlenen IP` yaklaşımı tam güvenilir değildir. Sürekli çalışan yönlendirme için `dnsmasq + ipset + fwmark` mimarisine geçiş planlanmaktadır (`src/routing/dns_router.rs`).
+Domain rules are resolved to IP addresses before kernel routing rules are applied. This approach works for stable DNS answers, but it has limits with CDN-backed services.
 
-## Proje Yapısı
+Domains such as `chatgpt.com` can return different IP addresses across DNS requests, locations, or time. When that happens, traffic may use an IP address that was not present when the route was applied. For long-running or high-accuracy domain routing, a DNS-integrated design such as `dnsmasq` plus `ipset` and packet marking is more reliable. The experimental backend for that direction lives in `src/routing/dns_router.rs`.
 
-```
+## Project Layout
+
+```text
 src/
-├── main.rs                  — Giriş noktası; GTK + Tokio başlatma
-├── config.rs                — Ayar kalıcılığı (JSON)
-├── models.rs                — Paylaşılan veri yapıları ve kanal mesajları
-├── routing/
-│   ├── mod.rs               — Engine ana döngüsü
-│   ├── manager.rs           — RoutingStateManager (iki durumlu model)
-│   ├── executor.rs          — pkexec / routelane-helper iletişimi
-│   ├── resolver.rs          — Async DNS çözümleme
-│   └── dns_router.rs        — (WIP) dnsmasq + ipset backend
-├── ui/
-│   ├── window.rs            — Ana pencere
-│   └── rule_row.rs          — Kural satırı widget'ı
-└── bin/
-    └── routelane_helper.rs  — Ayrıcalıklı yardımcı ikili
+  main.rs                  Application entry point
+  config.rs                JSON configuration persistence
+  models.rs                Shared data types and channel messages
+  routing/
+    mod.rs                 Routing engine loop
+    manager.rs             Routing state manager
+    executor.rs            pkexec / routelane-helper execution
+    resolver.rs            Async DNS resolution
+    dns_router.rs          Experimental dnsmasq/ipset backend
+  ui/
+    window.rs              Main window
+    rule_row.rs            Rule row widget
+    settings.rs            Settings UI
+    tray.rs                Tray integration
+    i18n.rs                UI text helpers
+  bin/
+    routelane_helper.rs    Privileged helper binary
 data/
-├── io.github.routelane.desktop — Ubuntu/GNOME launcher kaydı
-└── io.github.routelane.policy  — Polkit politikası
+  io.github.routelane.desktop
+  io.github.routelane.policy
+packaging/
+  deb/
+    build-deb.sh           Local Debian package builder
 ```
 
-## Lisans
+## License
 
 MIT
