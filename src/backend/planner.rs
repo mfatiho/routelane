@@ -43,10 +43,10 @@ pub fn compile_profile(
     resolutions: &ResolutionSnapshot,
     generation: u64,
 ) -> Result<KernelPlan, PlanError> {
-    validate_profile(profile)?;
     if !profile.enabled {
         return Err(PlanError::ProfileInactive);
     }
+    validate_profile(profile)?;
 
     let mut lanes = profile.lanes.iter().collect::<Vec<_>>();
     lanes.sort_by(|left, right| left.id.cmp(&right.id));

@@ -281,6 +281,22 @@ fn rejects_inactive_profile_explicitly() {
 }
 
 #[test]
+fn inactive_profile_error_precedes_domain_validation() {
+    let mut profile = profile_with_lane_count(101);
+    profile.enabled = false;
+
+    let error = compile_profile(
+        &profile,
+        &TopologySnapshot::empty(),
+        &ResolutionSnapshot::empty(),
+        1,
+    )
+    .unwrap_err();
+
+    assert_eq!(error, PlanError::ProfileInactive);
+}
+
+#[test]
 fn rejects_lane_when_reserved_table_capacity_would_overflow() {
     let profile = profile_with_lane_count(101);
     let error = compile_profile(
