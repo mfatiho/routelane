@@ -17,11 +17,6 @@ pub struct Texts {
     pub add_rule_tooltip: &'static str,
     pub no_rules_title: &'static str,
     pub no_rules_subtitle: &'static str,
-    pub route_test_title: &'static str,
-    pub route_test_description: &'static str,
-    pub test_address_title: &'static str,
-    pub test_placeholder: &'static str,
-    pub route_test_tooltip: &'static str,
     pub language_title: &'static str,
     pub language_description: &'static str,
     pub language_row_title: &'static str,
@@ -32,8 +27,6 @@ pub struct Texts {
     pub exception_select_prompt: &'static str,
     pub activation_failed: &'static str,
     pub activation_failed_toast: &'static str,
-    pub unselected: &'static str,
-    pub address_word: &'static str,
     pub delete_rule_tooltip: &'static str,
     pub resolving: &'static str,
     pub tray_description: &'static str,
@@ -47,9 +40,6 @@ pub struct Texts {
     pub reset_dialog_body: &'static str,
     pub reset_dialog_confirm: &'static str,
     pub reset_dialog_cancel: &'static str,
-    pub used_network: &'static str,
-    pub expected_network: &'static str,
-    pub probe_samples: &'static str,
 }
 
 impl Language {
@@ -71,11 +61,6 @@ impl Language {
                 add_rule_tooltip: "Kural Ekle",
                 no_rules_title: "Henüz kural eklenmedi",
                 no_rules_subtitle: "Yukarıya bir alan adı veya IP adresi girin",
-                route_test_title: "Rota Testi",
-                route_test_description: "Bir adresin şu anda hangi ağ üzerinden çıktığını kontrol edin.",
-                test_address_title: "Adres Test Et",
-                test_placeholder: "gemini.google.com veya https://gemini.google.com/app",
-                route_test_tooltip: "Rotayı Test Et",
                 language_title: "Dil",
                 language_description: "Arayüz dilini seçin.",
                 language_row_title: "Arayüz Dili",
@@ -86,8 +71,6 @@ impl Language {
                 exception_select_prompt: "İstisna ağını seçin",
                 activation_failed: "Etkinleştirme başarısız",
                 activation_failed_toast: "Etkinleştirilemedi",
-                unselected: "seçilmedi",
-                address_word: "adres",
                 delete_rule_tooltip: "Kuralı Sil",
                 resolving: "çözümleniyor...",
                 tray_description: "Seçili adresleri istisna ağına yönlendirir",
@@ -101,9 +84,6 @@ impl Language {
                 reset_dialog_body: "Bu işlem geri alınamaz. Tüm yönlendirme kuralları ve kernel durumu temizlenir.",
                 reset_dialog_confirm: "Sıfırla",
                 reset_dialog_cancel: "İptal",
-                used_network: "Kullanılan Ağ",
-                expected_network: "Beklenen Ağ",
-                probe_samples: "Adresler",
             },
             Self::En => Texts {
                 inactive: "Routing disabled",
@@ -121,11 +101,6 @@ impl Language {
                 add_rule_tooltip: "Add Rule",
                 no_rules_title: "No rules added yet",
                 no_rules_subtitle: "Enter a domain or IP address above",
-                route_test_title: "Route Test",
-                route_test_description: "Check which network an address currently uses.",
-                test_address_title: "Test Address",
-                test_placeholder: "gemini.google.com or https://gemini.google.com/app",
-                route_test_tooltip: "Test Route",
                 language_title: "Language",
                 language_description: "Choose the interface language.",
                 language_row_title: "Interface Language",
@@ -136,8 +111,6 @@ impl Language {
                 exception_select_prompt: "Select the exception network",
                 activation_failed: "Activation failed",
                 activation_failed_toast: "Could not enable",
-                unselected: "not selected",
-                address_word: "address",
                 delete_rule_tooltip: "Delete Rule",
                 resolving: "resolving...",
                 tray_description: "Routes selected addresses through the exception network",
@@ -151,9 +124,6 @@ impl Language {
                 reset_dialog_body: "This action cannot be undone. All routing rules and kernel state will be cleared.",
                 reset_dialog_confirm: "Reset",
                 reset_dialog_cancel: "Cancel",
-                used_network: "Used Network",
-                expected_network: "Expected Network",
-                probe_samples: "Addresses",
             },
         }
     }
@@ -181,13 +151,6 @@ impl Language {
         match self {
             Self::Tr => format!("{} - varsayılan ağ geçidi {}", name, gateway),
             Self::En => format!("{} - default gateway {}", name, gateway),
-        }
-    }
-
-    pub fn route_sample_more(self, count: usize) -> String {
-        match self {
-            Self::Tr => format!(" +{} {}", count, self.texts().address_word),
-            Self::En => format!(" +{} more {}", count, self.texts().address_word),
         }
     }
 }

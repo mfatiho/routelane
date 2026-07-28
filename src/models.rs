@@ -116,19 +116,6 @@ pub struct RoutingRule {
     pub priority: u32,
 }
 
-#[derive(Debug, Clone)]
-pub struct RouteProbe {
-    pub destination: String,
-    pub family: IpFamily,
-    pub interface: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RouteTestReport {
-    pub expected_interface: Option<String>,
-    pub probes: Vec<RouteProbe>,
-}
-
 impl RoutingRule {
     pub fn subtitle(&self) -> String {
         match &self.target {
@@ -162,8 +149,6 @@ pub enum UiToEngine {
     SetActive(bool),
     /// Tüm kuralları ve kernel durumunu sıfırla
     Reset,
-    /// Girilen adresin kernel tarafından hangi arayüze yönlendirildiğini test et
-    TestRoute { input: String },
     /// Uygulama kapanıyor
     Shutdown,
 }
@@ -184,7 +169,6 @@ pub enum EngineToUi {
     StateRestored {
         alt_interface: Option<String>,
     },
-    RouteTestComplete(RouteTestReport),
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
