@@ -1,11 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
 
 use serde::Deserialize;
 
-use super::{KernelPlan, LaneAvailability};
-use crate::backend::IpFamily;
+use super::{CommandSpec, IpFamily, KernelPlan, LaneAvailability, Program};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SnapshotInput<'a> {
@@ -14,6 +13,33 @@ pub struct SnapshotInput<'a> {
     pub ipv4_rules: &'a [u8],
     pub ipv6_rules: &'a [u8],
     pub nft: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotCommands {
+    pub ipv4_routes: CommandSpec,
+    pub ipv6_routes: CommandSpec,
+    pub ipv4_rules: CommandSpec,
+    pub ipv6_rules: CommandSpec,
+    pub nft: CommandSpec,
+}
+
+pub fn build_snapshot_commands() -> SnapshotCommands {
+    SnapshotCommands {
+        ipv4_routes: CommandSpec::ip4(["-j", "-N", "route", "show", "table", "all"]),
+        ipv6_routes: CommandSpec::ip6(["-j", "-N", "route", "show", "table", "all"]),
+        ipv4_rules: CommandSpec::ip4(["-j", "-N", "rule", "show"]),
+        ipv6_rules: CommandSpec::ip6(["-j", "-N", "rule", "show"]),
+        nft: CommandSpec {
+            program: Program::Nft,
+            family: None,
+            args: ["-j", "list", "table", "inet", "routelane"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            stdin: None,
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,13 +121,18 @@ impl KernelSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RouteEntry {
     family: IpFamily,
-    table: TableRef,
+    table: u32,
     route_type: Option<String>,
     destination: Option<String>,
     gateway: Option<IpAddr>,
     interface: Option<String>,
     metric: Option<u32>,
-    extra: BTreeSet<String>,
+    protocol: Option<String>,
+    scope: Option<String>,
+    preferred_source: Option<IpAddr>,
+    flags: Vec<String>,
+    preference: Option<String>,
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl RouteEntry {
@@ -113,7 +144,7 @@ impl RouteEntry {
         interface: &str,
     ) -> bool {
         self.family == family
-            && self.table.number() == Some(table)
+            && self.table == table
             && self.destination.as_deref() == Some("default")
             && self.gateway == Some(gateway)
             && self.interface.as_deref() == Some(interface)
@@ -126,6 +157,20 @@ impl RouteEntry {
                     IpFamily::V4 => 0,
                     IpFamily::V6 => 1024,
                 }
+            && self
+                .protocol
+                .as_deref()
+                .is_none_or(|protocol| protocol == "boot")
+            && self.scope.as_deref().is_none_or(|scope| scope == "global")
+            && self.preferred_source.is_none()
+            && self.flags.is_empty()
+            && match family {
+                IpFamily::V4 => self.preference.is_none(),
+                IpFamily::V6 => self
+                    .preference
+                    .as_deref()
+                    .is_none_or(|preference| preference == "medium"),
+            }
             && self.extra.is_empty()
     }
 }
@@ -134,18 +179,18 @@ impl RouteEntry {
 struct RuleEntry {
     family: IpFamily,
     priority: u32,
-    table: TableRef,
+    table: Option<u32>,
     mark: Option<Mark>,
     source: Option<String>,
     destination: Option<String>,
-    extra: BTreeSet<String>,
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl RuleEntry {
     fn matches_policy(&self, family: IpFamily, priority: u32, table: u32, mark: u32) -> bool {
         self.family == family
             && self.priority == priority
-            && self.table.number() == Some(table)
+            && self.table == Some(table)
             && self
                 .mark
                 .as_ref()
@@ -173,14 +218,16 @@ impl Default for TableRef {
 }
 
 impl TableRef {
-    fn number(&self) -> Option<u32> {
+    fn into_number(self, source: SnapshotSource) -> Result<u32, SnapshotParseError> {
         match self {
-            Self::Number(number) => Some(*number),
+            Self::Number(number) => Ok(number),
             Self::Name(name) => match name.as_str() {
-                "default" => Some(253),
-                "main" => Some(254),
-                "local" => Some(255),
-                _ => name.parse().ok(),
+                "default" => Ok(253),
+                "main" => Ok(254),
+                "local" => Ok(255),
+                _ => name.parse().map_err(|_| {
+                    parse_error(source, format!("unsupported symbolic table name {name:?}"))
+                }),
             },
         }
     }
@@ -229,7 +276,8 @@ struct RawRoute {
 #[derive(Debug, Deserialize)]
 struct RawRule {
     priority: u32,
-    table: TableRef,
+    #[serde(default)]
+    table: Option<TableRef>,
     #[serde(default, alias = "mark")]
     fwmark: Option<MarkValue>,
     #[serde(default)]
@@ -237,7 +285,7 @@ struct RawRule {
     #[serde(default)]
     dst: Option<String>,
     #[serde(flatten)]
-    extra: std::collections::BTreeMap<String, serde_json::Value>,
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,15 +334,37 @@ fn parse_routes(
                     "gateway address does not match route family",
                 ));
             }
+            let preferred_source = route
+                .prefsrc
+                .map(|value| {
+                    value.parse::<IpAddr>().map_err(|error| {
+                        parse_error(
+                            source,
+                            format!("invalid preferred source {value:?}: {error}"),
+                        )
+                    })
+                })
+                .transpose()?;
+            if preferred_source.is_some_and(|address| !family_matches(family, address)) {
+                return Err(parse_error(
+                    source,
+                    "preferred source address does not match route family",
+                ));
+            }
             Ok(RouteEntry {
                 family,
-                table: route.table,
+                table: route.table.into_number(source)?,
                 route_type: route.route_type,
                 destination: route.dst,
                 gateway,
                 interface: route.dev,
                 metric: route.metric,
-                extra: route.extra.into_keys().collect(),
+                protocol: route.protocol,
+                scope: route.scope,
+                preferred_source,
+                flags: route.flags,
+                preference: route.pref,
+                extra: route.extra,
             })
         })
         .collect()
@@ -311,14 +381,17 @@ fn parse_rules(
             Ok(RuleEntry {
                 family,
                 priority: rule.priority,
-                table: rule.table,
+                table: rule
+                    .table
+                    .map(|table| table.into_number(source))
+                    .transpose()?,
                 mark: rule
                     .fwmark
                     .map(|value| parse_mark(value, source))
                     .transpose()?,
                 source: rule.src,
                 destination: rule.dst,
-                extra: rule.extra.into_keys().collect(),
+                extra: rule.extra,
             })
         })
         .collect()
@@ -452,14 +525,14 @@ fn check_route(
     gateway: IpAddr,
     interface: &str,
 ) -> Result<(), ResourceConflict> {
-    if snapshot.routes.iter().any(|route| {
-        route.family == family
-            && route.table.number() == Some(table)
-            && !route.matches_default(family, table, gateway, interface)
-    }) {
-        Err(ResourceConflict::RoutingTableInUse(table))
-    } else {
-        Ok(())
+    let mut entries = snapshot
+        .routes
+        .iter()
+        .filter(|route| route.family == family && route.table == table);
+    match (entries.next(), entries.next()) {
+        (None, None) => Ok(()),
+        (Some(route), None) if route.matches_default(family, table, gateway, interface) => Ok(()),
+        _ => Err(ResourceConflict::RoutingTableInUse(table)),
     }
 }
 
@@ -470,22 +543,22 @@ fn check_rule(
     table: u32,
     mark: u32,
 ) -> Result<(), ResourceConflict> {
-    if snapshot.rules.iter().any(|rule| {
-        rule.family == family
-            && rule.priority == priority
-            && !rule.matches_policy(family, priority, table, mark)
-    }) {
-        Err(ResourceConflict::RulePriorityInUse(priority))
-    } else {
-        Ok(())
+    let mut entries = snapshot
+        .rules
+        .iter()
+        .filter(|rule| rule.family == family && rule.priority == priority);
+    match (entries.next(), entries.next()) {
+        (None, None) => Ok(()),
+        (Some(rule), None) if rule.matches_policy(family, priority, table, mark) => Ok(()),
+        _ => Err(ResourceConflict::RulePriorityInUse(priority)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::backend::{
-        detect_resource_conflicts, KernelPlan, LaneAvailability, LanePlan, ResourceConflict,
-        SnapshotInput, SnapshotSource,
+        build_snapshot_commands, detect_resource_conflicts, CommandSpec, IpFamily, KernelPlan,
+        LaneAvailability, LanePlan, Program, ResourceConflict, SnapshotInput, SnapshotSource,
     };
     use crate::domain::{LaneFailurePolicy, LaneId, ProfileId};
 
@@ -708,5 +781,223 @@ mod tests {
             detect_resource_conflicts(&plan(), &snapshot),
             Err(ResourceConflict::RulePriorityInUse(10_000))
         );
+    }
+
+    #[test]
+    fn parses_non_table_rule_actions_outside_requested_priorities() {
+        let snapshot = parse(
+            EMPTY,
+            EMPTY,
+            br#"[
+                {"priority":9000,"src":"all","goto":10000},
+                {"priority":9001,"src":"all","nop":null},
+                {"priority":9002,"src":"all","action":"blackhole"}
+            ]"#,
+            EMPTY,
+            EMPTY_NFT,
+        );
+
+        assert_eq!(detect_resource_conflicts(&plan(), &snapshot), Ok(()));
+    }
+
+    #[test]
+    fn treats_non_table_rule_action_at_requested_priority_as_foreign() {
+        let snapshot = parse(
+            EMPTY,
+            EMPTY,
+            br#"[{"priority":10000,"src":"all","action":"blackhole"}]"#,
+            EMPTY,
+            EMPTY_NFT,
+        );
+
+        assert_eq!(
+            detect_resource_conflicts(&plan(), &snapshot),
+            Err(ResourceConflict::RulePriorityInUse(10_000))
+        );
+    }
+
+    #[test]
+    fn refuses_owned_route_shape_with_foreign_preferred_source() {
+        let snapshot = parse(
+            br#"[{
+                "dst":"default",
+                "gateway":"10.0.0.1",
+                "dev":"wg0",
+                "table":"20000",
+                "prefsrc":"10.0.0.99",
+                "flags":[]
+            }]"#,
+            EMPTY,
+            EMPTY,
+            EMPTY,
+            EMPTY_NFT,
+        );
+
+        assert_eq!(
+            detect_resource_conflicts(&plan(), &snapshot),
+            Err(ResourceConflict::RoutingTableInUse(20_000))
+        );
+    }
+
+    #[test]
+    fn refuses_owned_route_shape_with_onlink_flag() {
+        let snapshot = parse(
+            br#"[{
+                "dst":"default",
+                "gateway":"10.0.0.1",
+                "dev":"wg0",
+                "table":"20000",
+                "flags":["onlink"]
+            }]"#,
+            EMPTY,
+            EMPTY,
+            EMPTY,
+            EMPTY_NFT,
+        );
+
+        assert_eq!(
+            detect_resource_conflicts(&plan(), &snapshot),
+            Err(ResourceConflict::RoutingTableInUse(20_000))
+        );
+    }
+
+    #[test]
+    fn refuses_non_default_route_protocol_scope_and_ipv6_preference() {
+        let cases = [
+            (
+                br#"[{"dst":"default","gateway":"10.0.0.1","dev":"wg0","table":"20000","protocol":"dhcp","flags":[]}]"#
+                    .as_slice(),
+                EMPTY,
+            ),
+            (
+                br#"[{"dst":"default","gateway":"10.0.0.1","dev":"wg0","table":"20000","scope":"link","flags":[]}]"#
+                    .as_slice(),
+                EMPTY,
+            ),
+            (
+                EMPTY,
+                br#"[{"dst":"default","gateway":"2001:db8::1","dev":"wg0","table":"20000","metric":1024,"flags":[],"pref":"high"}]"#
+                    .as_slice(),
+            ),
+        ];
+
+        for (ipv4_routes, ipv6_routes) in cases {
+            let snapshot = parse(ipv4_routes, ipv6_routes, EMPTY, EMPTY, EMPTY_NFT);
+            assert_eq!(
+                detect_resource_conflicts(&plan(), &snapshot),
+                Err(ResourceConflict::RoutingTableInUse(20_000))
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_duplicate_exact_route_in_requested_table() {
+        let snapshot = parse(
+            br#"[
+                {"dst":"default","gateway":"10.0.0.1","dev":"wg0","table":"20000","flags":[]},
+                {"dst":"default","gateway":"10.0.0.1","dev":"wg0","table":"20000","flags":[]}
+            ]"#,
+            EMPTY,
+            EMPTY,
+            EMPTY,
+            EMPTY_NFT,
+        );
+
+        assert_eq!(
+            detect_resource_conflicts(&plan(), &snapshot),
+            Err(ResourceConflict::RoutingTableInUse(20_000))
+        );
+    }
+
+    #[test]
+    fn refuses_duplicate_exact_rule_at_requested_priority() {
+        let snapshot = parse(
+            EMPTY,
+            EMPTY,
+            br#"[
+                {"priority":10000,"src":"all","fwmark":"0x524c0001","table":"20000"},
+                {"priority":10000,"src":"all","fwmark":"0x524c0001","table":"20000"}
+            ]"#,
+            EMPTY,
+            EMPTY_NFT,
+        );
+
+        assert_eq!(
+            detect_resource_conflicts(&plan(), &snapshot),
+            Err(ResourceConflict::RulePriorityInUse(10_000))
+        );
+    }
+
+    #[test]
+    fn reports_unknown_symbolic_table_names_for_routes_and_rules() {
+        let cases = [
+            (
+                SnapshotSource::Ipv4Routes,
+                SnapshotInput {
+                    ipv4_routes:
+                        br#"[{"dst":"default","gateway":"10.0.0.1","dev":"wg0","table":"vpn","flags":[]}]"#,
+                    ipv6_routes: EMPTY,
+                    ipv4_rules: EMPTY,
+                    ipv6_rules: EMPTY,
+                    nft: EMPTY_NFT,
+                },
+            ),
+            (
+                SnapshotSource::Ipv4Rules,
+                SnapshotInput {
+                    ipv4_routes: EMPTY,
+                    ipv6_routes: EMPTY,
+                    ipv4_rules:
+                        br#"[{"priority":10000,"src":"all","fwmark":"0x524c0001","table":"vpn"}]"#,
+                    ipv6_rules: EMPTY,
+                    nft: EMPTY_NFT,
+                },
+            ),
+        ];
+
+        for (expected_source, input) in cases {
+            let error = KernelSnapshot::parse(input).unwrap_err();
+            assert_eq!(error.source, expected_source);
+            assert!(error.message.contains("vpn"));
+        }
+    }
+
+    #[test]
+    fn snapshot_commands_request_json_with_numeric_table_ids() {
+        let commands = build_snapshot_commands();
+
+        assert_eq!(
+            commands.ipv4_routes,
+            CommandSpec::ip4(["-j", "-N", "route", "show", "table", "all"])
+        );
+        assert_eq!(
+            commands.ipv6_routes,
+            CommandSpec::ip6(["-j", "-N", "route", "show", "table", "all"])
+        );
+        assert_eq!(
+            commands.ipv4_rules,
+            CommandSpec::ip4(["-j", "-N", "rule", "show"])
+        );
+        assert_eq!(
+            commands.ipv6_rules,
+            CommandSpec::ip6(["-j", "-N", "rule", "show"])
+        );
+        assert_eq!(
+            commands.nft,
+            CommandSpec {
+                program: Program::Nft,
+                family: None,
+                args: vec![
+                    "-j".to_owned(),
+                    "list".to_owned(),
+                    "table".to_owned(),
+                    "inet".to_owned(),
+                    "routelane".to_owned(),
+                ],
+                stdin: None,
+            }
+        );
+        assert_eq!(commands.ipv4_routes.family, Some(IpFamily::V4));
+        assert_eq!(commands.ipv6_rules.family, Some(IpFamily::V6));
     }
 }
