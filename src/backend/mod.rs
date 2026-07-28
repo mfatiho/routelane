@@ -5,8 +5,8 @@ mod planner;
 mod policy_route;
 
 pub use inspect::{
-    detect_resource_conflicts, KernelSnapshot, ResourceConflict, SnapshotInput, SnapshotParseError,
-    SnapshotSource,
+    build_snapshot_commands, detect_resource_conflicts, KernelSnapshot, ResourceConflict,
+    SnapshotCommands, SnapshotInput, SnapshotParseError, SnapshotSource,
 };
 pub use nftables::{render_ruleset, NftRenderError, TableMode};
 pub use plan::{
