@@ -4,10 +4,9 @@ pub mod manager;
 pub mod resolver;
 
 use crate::config::{PersistedRule, PersistedState};
-use crate::models::{EngineToUi, RouteTestReport, RuleTarget, UiToEngine};
+use crate::models::{EngineToUi, RuleTarget, UiToEngine};
 use async_channel::{Receiver, Sender};
 use manager::RoutingStateManager;
-use std::net::IpAddr;
 
 pub async fn engine_main(from_ui: Receiver<UiToEngine>, to_ui: Sender<EngineToUi>) {
     let mut manager = RoutingStateManager::new();
@@ -221,19 +220,6 @@ pub async fn engine_main(from_ui: Receiver<UiToEngine>, to_ui: Sender<EngineToUi
                         }
                     }
 
-                    UiToEngine::TestRoute { input } => {
-                        match run_route_test(&manager, input).await {
-                            Ok(report) => {
-                                let _ = to_ui.send(EngineToUi::RouteTestComplete(report)).await;
-                            }
-                            Err(e) => {
-                                let _ = to_ui.send(EngineToUi::Error(
-                                    format!("Test başarısız: {}", e)
-                                )).await;
-                            }
-                        }
-                    }
-
                     UiToEngine::Shutdown => break 'main,
                 }
             }
@@ -242,32 +228,6 @@ pub async fn engine_main(from_ui: Receiver<UiToEngine>, to_ui: Sender<EngineToUi
 
     // Kapanışta kernel temizliği
     manager.reset_all_kernel().await.ok();
-}
-
-async fn run_route_test(
-    manager: &RoutingStateManager,
-    input: String,
-) -> anyhow::Result<RouteTestReport> {
-    let target = RuleTarget::from_user_input(&input)
-        .ok_or_else(|| anyhow::anyhow!("Geçerli bir adres girin"))?;
-
-    let ips: Vec<IpAddr> = match &target {
-        RuleTarget::Ip(ip) => {
-            let ip = ip.split_once('/').map(|(ip, _)| ip).unwrap_or(ip);
-            vec![ip.parse()?]
-        }
-        RuleTarget::Domain(domain) => resolver::resolve_domain(domain).await?,
-    };
-
-    let mut probes = Vec::new();
-    for ip in ips.into_iter().take(8) {
-        probes.push(executor::probe_route(ip)?);
-    }
-
-    Ok(RouteTestReport {
-        expected_interface: manager.alt_interface().map(str::to_owned),
-        probes,
-    })
 }
 
 fn should_refresh_domain_rules(is_active: bool) -> bool {

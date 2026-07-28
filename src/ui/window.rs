@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 
@@ -188,60 +188,6 @@ pub fn build_window(
 
     prefs_page.add(&rules_group);
 
-    // ── Rota Testi ───────────────────────────────────────────────────────────
-    let test_group = adw::PreferencesGroup::builder()
-        .title(texts.route_test_title)
-        .description(texts.route_test_description)
-        .build();
-
-    let test_row = adw::ActionRow::builder()
-        .title(texts.test_address_title)
-        .build();
-
-    let test_entry = gtk::Entry::builder()
-        .placeholder_text(texts.test_placeholder)
-        .hexpand(true)
-        .valign(gtk::Align::Center)
-        .build();
-
-    let test_btn = gtk::Button::builder()
-        .icon_name("system-search-symbolic")
-        .valign(gtk::Align::Center)
-        .tooltip_text(texts.route_test_tooltip)
-        .build();
-    test_btn.add_css_class("flat");
-    test_btn.add_css_class("circular");
-
-    test_row.add_suffix(&test_entry);
-    test_row.add_suffix(&test_btn);
-    test_row.set_activatable_widget(Some(&test_btn));
-    test_group.add(&test_row);
-
-    let test_status_icon = gtk::Image::builder()
-        .valign(gtk::Align::Center)
-        .visible(false)
-        .build();
-    let test_network_row = adw::ActionRow::new();
-    test_network_row.set_title(texts.used_network);
-    test_network_row.set_subtitle("-");
-    test_network_row.set_sensitive(false);
-    test_network_row.add_suffix(&test_status_icon);
-    test_group.add(&test_network_row);
-
-    let test_expected_row = adw::ActionRow::new();
-    test_expected_row.set_title(texts.expected_network);
-    test_expected_row.set_subtitle("-");
-    test_expected_row.set_sensitive(false);
-    test_group.add(&test_expected_row);
-
-    let test_probes_row = adw::ActionRow::new();
-    test_probes_row.set_title(texts.probe_samples);
-    test_probes_row.set_subtitle("-");
-    test_probes_row.set_sensitive(false);
-    test_group.add(&test_probes_row);
-
-    prefs_page.add(&test_group);
-
     // ── Pencere düzeni ────────────────────────────────────────────────────────
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     vbox.append(&header);
@@ -256,8 +202,6 @@ pub fn build_window(
 
     // Kaç kural var — boş durum satırını göster/gizle için
     let rule_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
-
-    let test_has_result: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
     // ── Sinyaller ─────────────────────────────────────────────────────────────
 
@@ -285,14 +229,6 @@ pub fn build_window(
         let target_entry = target_entry.clone();
         let add_btn = add_btn.clone();
         let empty_row = empty_row.clone();
-        let test_group = test_group.clone();
-        let test_row = test_row.clone();
-        let test_entry = test_entry.clone();
-        let test_btn = test_btn.clone();
-        let test_network_row = test_network_row.clone();
-        let test_expected_row = test_expected_row.clone();
-        let test_probes_row = test_probes_row.clone();
-        let test_has_result = test_has_result.clone();
         let iface_group = iface_group.clone();
         let language_group = language_group.clone();
         let iface_model = iface_model.clone();
@@ -327,20 +263,6 @@ pub fn build_window(
             add_btn.set_tooltip_text(Some(texts.add_rule_tooltip));
             empty_row.set_title(texts.no_rules_title);
             empty_row.set_subtitle(texts.no_rules_subtitle);
-
-            test_group.set_title(texts.route_test_title);
-            test_group.set_description(Some(texts.route_test_description));
-            test_row.set_title(texts.test_address_title);
-            test_entry.set_placeholder_text(Some(texts.test_placeholder));
-            test_btn.set_tooltip_text(Some(texts.route_test_tooltip));
-            test_network_row.set_title(texts.used_network);
-            test_expected_row.set_title(texts.expected_network);
-            test_probes_row.set_title(texts.probe_samples);
-            if !*test_has_result.borrow() {
-                test_network_row.set_subtitle("-");
-                test_expected_row.set_subtitle("-");
-                test_probes_row.set_subtitle("-");
-            }
 
             // Settings diyaloğu widget'larını güncelle
             iface_group.set_title(texts.network_title);
@@ -483,43 +405,6 @@ pub fn build_window(
     });
     target_entry.connect_activate(move |_| add_rule());
 
-    // Rota testi
-    let run_test = {
-        let sender = ui_sender.clone();
-        let test_entry = test_entry.clone();
-        let test_network_row = test_network_row.clone();
-        let test_expected_row = test_expected_row.clone();
-        let test_probes_row = test_probes_row.clone();
-        let test_status_icon = test_status_icon.clone();
-        let test_has_result = test_has_result.clone();
-
-        move || {
-            let input = test_entry.text().trim().to_owned();
-            if input.is_empty() {
-                return;
-            }
-            test_network_row.set_subtitle("...");
-            test_network_row.set_sensitive(false);
-            test_expected_row.set_subtitle("...");
-            test_expected_row.set_sensitive(false);
-            test_probes_row.set_subtitle("...");
-            test_probes_row.set_sensitive(false);
-            test_status_icon.set_visible(false);
-            *test_has_result.borrow_mut() = true;
-
-            let sender = sender.clone();
-            glib::MainContext::default().spawn_local(async move {
-                sender.send(UiToEngine::TestRoute { input }).await.ok();
-            });
-        }
-    };
-
-    test_btn.connect_clicked({
-        let run_test = run_test.clone();
-        move |_| run_test()
-    });
-    test_entry.connect_activate(move |_| run_test());
-
     // ── Engine → UI güncelleme döngüsü ───────────────────────────────────────
     {
         let rule_rows = rule_rows.clone();
@@ -533,12 +418,7 @@ pub fn build_window(
         let default_info_row = default_info_row.clone();
         let empty_row = empty_row.clone();
         let rule_count = rule_count.clone();
-        let test_network_row = test_network_row.clone();
-        let test_expected_row = test_expected_row.clone();
-        let test_probes_row = test_probes_row.clone();
-        let test_status_icon = test_status_icon.clone();
         let current_language = current_language.clone();
-        let test_has_result = test_has_result.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(msg) = engine_receiver.recv().await {
@@ -680,70 +560,6 @@ pub fn build_window(
                         // Kural sayısına göre boş durum satırını ayarla
                         let count = *rule_count.borrow();
                         empty_row.set_visible(count == 0);
-                    }
-
-                    EngineToUi::RouteTestComplete(report) => {
-                        let routed_ifaces: Vec<String> = report
-                            .probes
-                            .iter()
-                            .filter_map(|probe| probe.interface.clone())
-                            .collect();
-                        let seen_ifaces: BTreeSet<String> = routed_ifaces.iter().cloned().collect();
-                        let all_match =
-                            report.expected_interface.as_ref().is_some_and(|expected| {
-                                !routed_ifaces.is_empty()
-                                    && routed_ifaces.iter().all(|iface| iface == expected)
-                            });
-
-                        let icon_name = if all_match {
-                            "emblem-ok-symbolic"
-                        } else if routed_ifaces.is_empty() {
-                            "dialog-error-symbolic"
-                        } else {
-                            "dialog-warning-symbolic"
-                        };
-
-                        let seen = if seen_ifaces.is_empty() {
-                            "?".to_owned()
-                        } else {
-                            seen_ifaces.into_iter().collect::<Vec<_>>().join(", ")
-                        };
-
-                        let expected = report
-                            .expected_interface
-                            .as_deref()
-                            .unwrap_or(texts.unselected);
-
-                        let mut samples = report
-                            .probes
-                            .iter()
-                            .take(4)
-                            .map(|probe| {
-                                let family = match probe.family {
-                                    crate::models::IpFamily::V4 => "IPv4",
-                                    crate::models::IpFamily::V6 => "IPv6",
-                                };
-                                let iface = probe.interface.as_deref().unwrap_or("?");
-                                format!("{} {} → {}", family, probe.destination, iface)
-                            })
-                            .collect::<Vec<_>>()
-                            .join("  ·  ");
-                        if report.probes.len() > 4 {
-                            samples.push_str(&language.route_sample_more(report.probes.len() - 4));
-                        }
-                        if samples.is_empty() {
-                            samples = "?".to_owned();
-                        }
-
-                        test_network_row.set_subtitle(&seen);
-                        test_network_row.set_sensitive(true);
-                        test_status_icon.set_icon_name(Some(icon_name));
-                        test_status_icon.set_visible(true);
-                        test_expected_row.set_subtitle(expected);
-                        test_expected_row.set_sensitive(true);
-                        test_probes_row.set_subtitle(&samples);
-                        test_probes_row.set_sensitive(true);
-                        *test_has_result.borrow_mut() = true;
                     }
                 }
             }

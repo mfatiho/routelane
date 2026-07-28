@@ -1,8 +1,5 @@
-use crate::models::{
-    HelperOp, HelperRequest, HelperResponse, IpFamily, NetworkInterface, RouteProbe,
-};
+use crate::models::{HelperOp, HelperRequest, HelperResponse, NetworkInterface};
 use anyhow::{bail, Context, Result};
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -221,61 +218,10 @@ pub fn detect_gateway_v6(interface: &str) -> Option<String> {
     })
 }
 
-/// Hedef IP için kernel'in seçeceği route'u döner. Root gerektirmez.
-pub fn probe_route(ip: IpAddr) -> Result<RouteProbe> {
-    let family = match ip {
-        IpAddr::V4(_) => IpFamily::V4,
-        IpAddr::V6(_) => IpFamily::V6,
-    };
-    let family_arg = match family {
-        IpFamily::V4 => "-4",
-        IpFamily::V6 => "-6",
-    };
-    let ip_str = ip.to_string();
-
-    let output = Command::new("ip")
-        .args([family_arg, "route", "get", &ip_str])
-        .output()
-        .with_context(|| format!("{} için rota sorgusu başlatılamadı", ip_str))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("{} için rota bulunamadı: {}", ip_str, stderr.trim());
-    }
-
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let interface = parse_route_get_output(&raw);
-
-    Ok(RouteProbe {
-        destination: ip_str,
-        family,
-        interface,
-    })
-}
-
-fn parse_route_get_output(raw: &str) -> Option<String> {
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
-
-    for pair in tokens.windows(2) {
-        if pair[0] == "dev" {
-            return Some(pair[1].to_owned());
-        }
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{parse_route_get_output, resolve_helper_path_from};
+    use super::resolve_helper_path_from;
     use std::path::{Path, PathBuf};
-
-    #[test]
-    fn parses_route_get_output() {
-        let dev =
-            parse_route_get_output("142.250.184.206 via 192.168.1.1 dev wlan0 src 192.168.1.25");
-        assert_eq!(dev.as_deref(), Some("wlan0"));
-    }
 
     #[test]
     fn prefers_policy_helper_path_over_sibling_helper() {
