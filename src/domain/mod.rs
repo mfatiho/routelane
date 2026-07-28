@@ -4,6 +4,9 @@ mod rule;
 
 pub use health::HealthState;
 pub use profile::{
-    validate_profile, DomainError, Lane, LaneFailurePolicy, LaneId, Profile, ProfileId,
+    validate_profile, DomainError, InterfaceSelector, Lane, LaneFailurePolicy, LaneId, Profile,
+    ProfileId,
 };
-pub use rule::{DynamicSetId, Rule, RuleAction, RuleId, RuleSource, RuleTarget};
+pub use rule::{
+    ApplicationSelector, Rule, RuleAction, RuleId, RuleSource, RuleTarget, ServicePackId,
+};
