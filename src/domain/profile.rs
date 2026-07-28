@@ -20,18 +20,25 @@ macro_rules! string_id {
 
 string_id!(ProfileId);
 string_id!(LaneId);
+string_id!(InterfaceSelector);
+
+impl InterfaceSelector {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LaneFailurePolicy {
-    FailOpen,
-    FailClosed,
-    Fallback,
+    Block,
+    Direct,
+    Inactive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lane {
     pub id: LaneId,
-    pub interface: String,
+    pub interface: InterfaceSelector,
     pub fallback_lane: Option<LaneId>,
     pub failure_policy: LaneFailurePolicy,
 }
@@ -40,6 +47,7 @@ pub struct Lane {
 pub struct Profile {
     pub id: ProfileId,
     pub name: String,
+    pub enabled: bool,
     pub lanes: Vec<Lane>,
     pub rules: Vec<Rule>,
 }
@@ -125,16 +133,17 @@ pub fn validate_profile(profile: &Profile) -> Result<(), DomainError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_profile, DomainError, Lane, LaneFailurePolicy, LaneId, Profile, ProfileId,
+        validate_profile, DomainError, InterfaceSelector, Lane, LaneFailurePolicy, LaneId, Profile,
+        ProfileId,
     };
     use crate::domain::{Rule, RuleAction, RuleId, RuleSource, RuleTarget};
 
     fn fixture_lane(id: &str, interface: &str) -> Lane {
         Lane {
             id: LaneId::from(id),
-            interface: interface.to_owned(),
+            interface: InterfaceSelector::from(interface),
             fallback_lane: None,
-            failure_policy: LaneFailurePolicy::FailClosed,
+            failure_policy: LaneFailurePolicy::Inactive,
         }
     }
 
@@ -153,9 +162,22 @@ mod tests {
         Profile {
             id: ProfileId::from("default"),
             name: "Default".to_owned(),
+            enabled: true,
             lanes,
             rules,
         }
+    }
+
+    #[test]
+    fn profile_exposes_enabled_state_and_transparent_interface_selector() {
+        let profile = fixture_profile(vec![fixture_lane("work", "wg0")], vec![]);
+
+        assert!(profile.enabled);
+        assert_eq!(profile.lanes[0].interface.as_str(), "wg0");
+        assert_eq!(
+            serde_json::to_string(&profile.lanes[0].interface).unwrap(),
+            "\"wg0\""
+        );
     }
 
     #[test]

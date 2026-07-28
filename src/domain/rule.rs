@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::net::IpAddr;
+use std::path::PathBuf;
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -21,20 +22,29 @@ macro_rules! string_id {
 }
 
 string_id!(RuleId);
-string_id!(DynamicSetId);
+string_id!(ServicePackId);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationSelector {
+    pub desktop_id: Option<String>,
+    pub executable_path: PathBuf,
+    pub include_children: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuleSource {
     Any,
-    Cidr(IpNet),
+    Application(ApplicationSelector),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuleTarget {
+    Any,
+    Domain(String),
+    WildcardDomain(String),
     Ip(IpAddr),
     Cidr(IpNet),
-    Domain(String),
-    DynamicSet(DynamicSetId),
+    ServicePack(ServicePackId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,5 +97,40 @@ mod tests {
             rules.into_iter().map(|rule| rule.id).collect::<Vec<_>>(),
             vec![RuleId::from("a"), RuleId::from("b"), RuleId::from("z")]
         );
+    }
+
+    #[test]
+    fn serializes_application_source_and_profile_targets() {
+        let selector = ApplicationSelector {
+            desktop_id: Some("org.example.App".to_owned()),
+            executable_path: "/usr/bin/example".into(),
+            include_children: true,
+        };
+        let source = RuleSource::Application(selector.clone());
+
+        assert_eq!(
+            serde_json::to_value(&source).unwrap(),
+            serde_json::json!({
+                "Application": {
+                    "desktop_id": "org.example.App",
+                    "executable_path": "/usr/bin/example",
+                    "include_children": true
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(RuleTarget::Any).unwrap(),
+            serde_json::json!("Any")
+        );
+        assert_eq!(
+            serde_json::to_value(RuleTarget::WildcardDomain("*.example.com".to_owned())).unwrap(),
+            serde_json::json!({ "WildcardDomain": "*.example.com" })
+        );
+        assert_eq!(
+            serde_json::to_value(RuleTarget::ServicePack(ServicePackId::from("streaming")))
+                .unwrap(),
+            serde_json::json!({ "ServicePack": "streaming" })
+        );
+        assert_eq!(source, RuleSource::Application(selector));
     }
 }
