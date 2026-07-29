@@ -22,6 +22,12 @@ string_id!(ProfileId);
 string_id!(LaneId);
 string_id!(InterfaceSelector);
 
+impl LaneId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl InterfaceSelector {
     pub fn as_str(&self) -> &str {
         &self.0

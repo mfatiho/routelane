@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod daemon;
 pub mod domain;
+pub mod health;
 pub mod ipc;
 
 #[allow(dead_code)]

@@ -2,9 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use super::{CommandSpec, IpFamily, KernelPlan, LaneAvailability, Program};
+use super::{
+    CommandSpec, IpFamily, KernelPlan, LaneAvailability, PlanHash, Program, TopologySnapshot,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SnapshotInput<'a> {
@@ -82,11 +84,14 @@ impl fmt::Display for SnapshotSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct KernelSnapshot {
     routes: Vec<RouteEntry>,
     rules: Vec<RuleEntry>,
     nft_tables: BTreeSet<(String, String)>,
+    topology: TopologySnapshot,
+    nft_generation: Option<u64>,
+    nft_plan_hash: Option<PlanHash>,
 }
 
 impl KernelSnapshot {
@@ -109,16 +114,90 @@ impl KernelSnapshot {
             routes,
             rules,
             nft_tables: parse_nft_tables(input.nft)?,
+            topology: TopologySnapshot::empty(),
+            nft_generation: None,
+            nft_plan_hash: None,
         })
+    }
+
+    pub fn with_topology(mut self, topology: &TopologySnapshot) -> Self {
+        self.topology = topology.clone();
+        self
+    }
+
+    pub fn with_nft_ownership(mut self, generation: u64, plan_hash: PlanHash) -> Self {
+        self.nft_generation = Some(generation);
+        self.nft_plan_hash = Some(plan_hash);
+        self
     }
 
     pub fn has_nft_table(&self, family: &str, name: &str) -> bool {
         self.nft_tables
             .contains(&(family.to_owned(), name.to_owned()))
     }
+
+    pub fn has_interface(&self, interface: &str) -> bool {
+        self.topology.interface(interface).is_some()
+    }
+
+    pub fn gateway_reachable(&self, interface: &str, gateway: IpAddr) -> bool {
+        let Some(topology) = self.topology.interface(interface) else {
+            return false;
+        };
+        match gateway {
+            IpAddr::V4(address) => topology.gateway_v4 == Some(address),
+            IpAddr::V6(address) => topology.gateway_v6 == Some(address),
+        }
+    }
+
+    pub fn nft_is_owned_by(&self, plan: &KernelPlan) -> bool {
+        self.has_nft_table("inet", "routelane")
+            && self.nft_generation == Some(plan.generation)
+            && self.nft_plan_hash == Some(plan.content_hash())
+    }
+
+    pub fn route_state(
+        &self,
+        family: IpFamily,
+        table: u32,
+        gateway: IpAddr,
+        interface: &str,
+    ) -> ResourceState {
+        let mut entries = self
+            .routes
+            .iter()
+            .filter(|route| route.family == family && route.table == table);
+        match (entries.next(), entries.next()) {
+            (None, None) => ResourceState::Missing,
+            (Some(route), None) if route.matches_default(family, table, gateway, interface) => {
+                ResourceState::Exact
+            }
+            _ => ResourceState::Foreign,
+        }
+    }
+
+    pub fn rule_state(
+        &self,
+        family: IpFamily,
+        priority: u32,
+        table: u32,
+        mark: u32,
+    ) -> ResourceState {
+        let mut entries = self
+            .rules
+            .iter()
+            .filter(|rule| rule.family == family && rule.priority == priority);
+        match (entries.next(), entries.next()) {
+            (None, None) => ResourceState::Missing,
+            (Some(rule), None) if rule.matches_policy(family, priority, table, mark) => {
+                ResourceState::Exact
+            }
+            _ => ResourceState::Foreign,
+        }
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RouteEntry {
     family: IpFamily,
     table: u32,
@@ -175,7 +254,7 @@ impl RouteEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RuleEntry {
     family: IpFamily,
     priority: u32,
@@ -233,7 +312,7 @@ impl TableRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct Mark {
     value: u32,
     mask: Option<u32>,
@@ -462,6 +541,13 @@ fn parse_error(source: SnapshotSource, message: impl Into<String>) -> SnapshotPa
 pub enum ResourceConflict {
     RoutingTableInUse(u32),
     RulePriorityInUse(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceState {
+    Missing,
+    Exact,
+    Foreign,
 }
 
 pub fn detect_resource_conflicts(

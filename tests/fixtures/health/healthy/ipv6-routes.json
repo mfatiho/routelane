@@ -1,0 +1,13 @@
+[
+  {
+    "dst": "default",
+    "gateway": "2001:db8::1",
+    "dev": "wg0",
+    "table": 20001,
+    "metric": 1024,
+    "protocol": "boot",
+    "scope": "global",
+    "flags": [],
+    "pref": "medium"
+  }
+]

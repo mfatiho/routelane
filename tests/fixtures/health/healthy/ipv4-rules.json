@@ -1,0 +1,14 @@
+[
+  {
+    "priority": 10000,
+    "src": "all",
+    "fwmark": "0x524c0001",
+    "table": 20000
+  },
+  {
+    "priority": 10001,
+    "src": "all",
+    "fwmark": "0x524c0002",
+    "table": 20001
+  }
+]

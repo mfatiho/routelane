@@ -1,0 +1,8 @@
+{
+  "interfaces": {
+    "enp1s0": {
+      "gateway_v4": "192.0.2.1",
+      "gateway_v6": null
+    }
+  }
+}

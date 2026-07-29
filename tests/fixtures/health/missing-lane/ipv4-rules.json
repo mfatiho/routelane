@@ -1,0 +1,8 @@
+[
+  {
+    "priority": 10000,
+    "src": "all",
+    "fwmark": "0x524c0001",
+    "table": 20000
+  }
+]
