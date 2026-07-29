@@ -3,6 +3,7 @@ mod nftables;
 mod plan;
 mod planner;
 mod policy_route;
+mod transaction;
 
 pub use inspect::{
     build_snapshot_commands, detect_resource_conflicts, KernelSnapshot, ResourceConflict,
@@ -16,3 +17,7 @@ pub use plan::{
 };
 pub use planner::{compile_profile, Capability, PlanError};
 pub use policy_route::{build_policy_commands, CommandSpec, IpFamily, Program};
+pub use transaction::{
+    apply_plan, AppliedKernelState, ApplyError, ApplyStage, KernelRunner, MutationFailure,
+    RunnerError,
+};
