@@ -15,14 +15,53 @@ pub enum DiagnosticCode {
     RoutingResourceConflict,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Severity {
+    Info,
+    Warning,
+    Error,
+}
+
+impl Severity {
+    pub(crate) fn health_state(self) -> HealthState {
+        match self {
+            Self::Info => HealthState::Healthy,
+            Self::Warning => HealthState::Degraded,
+            Self::Error => HealthState::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value")]
+pub enum DiagnosticSubject {
+    Lane(LaneId),
+    NftablesTable,
+    Policy,
+    HealthInspection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuggestedAction {
+    pub description: String,
+}
+
+impl SuggestedAction {
+    pub fn new(description: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub code: DiagnosticCode,
     pub summary: String,
     pub technical_detail: String,
-    pub severity: HealthState,
-    pub subject: String,
-    pub suggested_action: String,
+    pub severity: Severity,
+    pub subject: DiagnosticSubject,
+    pub suggested_action: Option<SuggestedAction>,
 }
 
 impl Diagnostic {
@@ -30,17 +69,17 @@ impl Diagnostic {
         code: DiagnosticCode,
         summary: impl Into<String>,
         technical_detail: impl Into<String>,
-        severity: HealthState,
-        subject: impl Into<String>,
-        suggested_action: impl Into<String>,
+        severity: Severity,
+        subject: DiagnosticSubject,
+        suggested_action: Option<SuggestedAction>,
     ) -> Self {
         Self {
             code,
             summary: summary.into(),
             technical_detail: technical_detail.into(),
             severity,
-            subject: subject.into(),
-            suggested_action: suggested_action.into(),
+            subject,
+            suggested_action,
         }
     }
 }
@@ -67,16 +106,11 @@ impl HealthReport {
         mut diagnostics: Vec<Diagnostic>,
     ) -> Self {
         diagnostics.sort_by(|left, right| {
-            (
-                left.code,
-                left.subject.as_str(),
-                left.technical_detail.as_str(),
-            )
-                .cmp(&(
-                    right.code,
-                    right.subject.as_str(),
-                    right.technical_detail.as_str(),
-                ))
+            (left.code, &left.subject, left.technical_detail.as_str()).cmp(&(
+                right.code,
+                &right.subject,
+                right.technical_detail.as_str(),
+            ))
         });
         Self {
             state,
@@ -88,10 +122,10 @@ impl HealthReport {
     pub fn failure(
         state: HealthState,
         code: DiagnosticCode,
-        subject: impl Into<String>,
+        subject: DiagnosticSubject,
         summary: impl Into<String>,
         technical_detail: impl Into<String>,
-        suggested_action: impl Into<String>,
+        suggested_action: Option<SuggestedAction>,
     ) -> Self {
         Self::from_parts(
             state,
@@ -100,7 +134,11 @@ impl HealthReport {
                 code,
                 summary,
                 technical_detail,
-                state,
+                if matches!(state, HealthState::Failed | HealthState::NeedsAuthorization) {
+                    Severity::Error
+                } else {
+                    Severity::Warning
+                },
                 subject,
                 suggested_action,
             )],

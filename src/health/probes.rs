@@ -1,10 +1,15 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-use crate::backend::{IpFamily, KernelPlan, KernelSnapshot, LanePlan, ResourceState};
+use crate::backend::{
+    IpFamily, KernelPlan, KernelSnapshot, LaneAvailability, LanePlan, ResourceState,
+};
 use crate::domain::HealthState;
 
-use super::report::{aggregate_health, Diagnostic, DiagnosticCode, HealthReport, LaneHealth};
+use super::report::{
+    aggregate_health, Diagnostic, DiagnosticCode, DiagnosticSubject, HealthReport, LaneHealth,
+    Severity, SuggestedAction,
+};
 
 pub fn evaluate_health(plan: Option<&KernelPlan>, snapshot: &KernelSnapshot) -> HealthReport {
     let Some(plan) = plan else {
@@ -26,9 +31,9 @@ pub fn evaluate_health(plan: Option<&KernelPlan>, snapshot: &KernelSnapshot) -> 
                 "inet/routelane does not exactly match generation {} and its plan hash",
                 plan.generation
             ),
-            HealthState::Degraded,
-            "inet/routelane",
-            "Reapply the active profile.",
+            Severity::Warning,
+            DiagnosticSubject::NftablesTable,
+            Some(SuggestedAction::new("Reapply the active profile.")),
         ));
         for state in lanes.values_mut() {
             *state = HealthState::Degraded;
@@ -43,7 +48,11 @@ pub fn evaluate_health(plan: Option<&KernelPlan>, snapshot: &KernelSnapshot) -> 
         lanes
             .values()
             .copied()
-            .chain(diagnostics.iter().map(|diagnostic| diagnostic.severity))
+            .chain(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.severity.health_state()),
+            )
             .chain(std::iter::once(HealthState::Healthy)),
     );
     HealthReport::from_parts(state, lanes, diagnostics)
@@ -61,10 +70,45 @@ fn inspect_lane(
             DiagnosticCode::LaneInterfaceMissing,
             format!("Lane {} interface is missing", lane.id.as_str()),
             format!("interface {:?} is not present", lane.interface),
-            HealthState::Degraded,
-            lane.id.as_str(),
-            "Restore the interface, then reapply the active profile.",
+            Severity::Warning,
+            DiagnosticSubject::Lane(lane.id.clone()),
+            Some(SuggestedAction::new(
+                "Restore the interface, then reapply the active profile.",
+            )),
         ));
+    }
+
+    if lane.availability == LaneAvailability::Unavailable {
+        degrade(lane, lanes);
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::LaneGatewayUnreachable,
+            format!(
+                "Lane {} is unavailable in the active plan",
+                lane.id.as_str()
+            ),
+            "the compiled lane availability is Unavailable",
+            Severity::Warning,
+            DiagnosticSubject::Lane(lane.id.clone()),
+            Some(SuggestedAction::new(
+                "Refresh topology and reapply the active profile.",
+            )),
+        ));
+        return;
+    }
+
+    if lane.gateway_v4.is_none() && lane.gateway_v6.is_none() {
+        degrade(lane, lanes);
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::LaneGatewayUnreachable,
+            format!("Lane {} has no supported gateway", lane.id.as_str()),
+            "the available lane has neither an IPv4 nor an IPv6 gateway",
+            Severity::Warning,
+            DiagnosticSubject::Lane(lane.id.clone()),
+            Some(SuggestedAction::new(
+                "Configure a supported gateway and reapply the active profile.",
+            )),
+        ));
+        return;
     }
 
     if let Some(gateway) = lane.gateway_v4 {
@@ -113,9 +157,11 @@ fn inspect_family(
                 "gateway {gateway} is not reachable through interface {:?}",
                 lane.interface
             ),
-            HealthState::Degraded,
-            lane.id.as_str(),
-            "Restore the gateway route or select another lane.",
+            Severity::Warning,
+            DiagnosticSubject::Lane(lane.id.clone()),
+            Some(SuggestedAction::new(
+                "Restore the gateway route or select another lane.",
+            )),
         ));
     }
 
@@ -161,9 +207,11 @@ fn diagnose_resource(
         DiagnosticCode::RoutingResourceConflict,
         format!("Lane {} routing state does not match", lane.id.as_str()),
         detail,
-        HealthState::Degraded,
-        lane.id.as_str(),
-        "Remove the foreign resource or reapply the active profile.",
+        Severity::Warning,
+        DiagnosticSubject::Lane(lane.id.clone()),
+        Some(SuggestedAction::new(
+            "Remove the foreign resource or reapply the active profile.",
+        )),
     ));
 }
 

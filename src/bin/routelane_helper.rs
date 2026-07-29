@@ -47,6 +47,24 @@ impl DbusHelper {
         serialize_response(&response)
     }
 
+    async fn restore_plan(
+        &self,
+        failed_candidate_json: &str,
+        previous_json: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let response = self
+            .core
+            .restore_plan(
+                header.sender().map(|sender| sender.as_str()),
+                failed_candidate_json,
+                (!previous_json.is_empty()).then_some(previous_json),
+            )
+            .await
+            .map_err(to_fdo_error)?;
+        serialize_response(&response)
+    }
+
     async fn cleanup(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,

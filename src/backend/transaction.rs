@@ -220,6 +220,22 @@ pub fn apply_plan(
         }
     }
 
+    transition_plan(runner, current, next)
+}
+
+pub(crate) fn restore_plan(
+    runner: &mut impl KernelRunner,
+    current: &AppliedKernelState,
+    previous: &KernelPlan,
+) -> Result<AppliedKernelState, ApplyError> {
+    transition_plan(runner, Some(current), previous)
+}
+
+fn transition_plan(
+    runner: &mut impl KernelRunner,
+    current: Option<&AppliedKernelState>,
+    next: &KernelPlan,
+) -> Result<AppliedKernelState, ApplyError> {
     let snapshot = runner.snapshot().map_err(ApplyError::Snapshot)?;
     match current {
         Some(current) => detect_resource_conflicts_for_update(next, current.plan(), &snapshot),

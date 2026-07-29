@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::LaneId;
 
+use super::transaction::restore_plan as restore_kernel_plan;
 use super::{
     apply_plan as apply_kernel_plan, build_policy_commands, build_snapshot_commands,
     detect_resource_conflicts, detect_resource_conflicts_for_update, AppliedKernelState,
@@ -390,9 +391,7 @@ where
     fn apply(&mut self, plan: &KernelPlan) -> Result<ApplyResponse, PrivilegedError> {
         self.ensure_reconciled()?;
         self.revalidate_current_ownership()?;
-        let previous = self.current.clone();
-        let previous_nft_fingerprint = self.current_nft_fingerprint.clone();
-        if let Some(current) = previous.as_ref() {
+        if let Some(current) = self.current.as_ref() {
             if plan.generation < current.generation {
                 return Err(PrivilegedError::new(format!(
                     "requested generation {} is older than applied generation {}",
@@ -409,6 +408,148 @@ where
                 return Ok(ApplyResponse::from_plan(plan, vec![]));
             }
         }
+        self.transition_to(plan, false)
+    }
+
+    fn restore(
+        &mut self,
+        failed_candidate: &KernelPlan,
+        previous: Option<&KernelPlan>,
+    ) -> Result<RestoreResponse, PrivilegedError> {
+        self.ensure_reconciled()?;
+        self.revalidate_current_ownership()?;
+        if previous.is_some_and(|plan| plan.generation >= failed_candidate.generation) {
+            return Err(PrivilegedError::new(
+                "restore target must be older than the failed candidate",
+            ));
+        }
+        let current = self.current.as_ref().ok_or_else(|| {
+            PrivilegedError::new("cannot restore because no candidate plan is currently applied")
+        })?;
+        if current.generation != failed_candidate.generation
+            || current.plan_hash != failed_candidate.content_hash()
+        {
+            return Err(PrivilegedError::new(
+                "cannot restore because the live committed plan is not the failed candidate",
+            ));
+        }
+        match previous {
+            Some(plan) => {
+                self.transition_to(plan, true)?;
+                Ok(RestoreResponse::from_plan(Some(plan)))
+            }
+            None => {
+                self.cleanup()?;
+                Ok(RestoreResponse::from_plan(None))
+            }
+        }
+    }
+
+    fn inspect(&mut self) -> Result<InspectResponse, PrivilegedError> {
+        self.ensure_inspection_ready()?;
+        let captured = capture_snapshot(&mut self.executor)
+            .map_err(|error| PrivilegedError::new(error.to_string()))?;
+        let nft_is_exact = match (
+            self.current.as_ref(),
+            self.current_nft_fingerprint.as_deref(),
+        ) {
+            (Some(current), Some(fingerprint)) => {
+                captured.snapshot.has_nft_table("inet", "routelane")
+                    && nft_marker_present(&mut self.executor, current.plan())
+                        .map_err(|error| PrivilegedError::new(error.to_string()))?
+                    && live_nft_fingerprint(&mut self.executor)
+                        .map_err(|error| PrivilegedError::new(error.to_string()))?
+                        == fingerprint
+            }
+            _ => false,
+        };
+        let snapshot = match (self.current.as_ref(), nft_is_exact) {
+            (Some(current), true) => captured
+                .snapshot
+                .with_nft_ownership(current.generation, current.plan_hash),
+            _ => captured.snapshot,
+        };
+        Ok(InspectResponse {
+            generation: self.current.as_ref().map(|state| state.generation),
+            plan_hash: self.current.as_ref().map(|state| state.plan_hash),
+            routelane_table_present: snapshot.has_nft_table("inet", "routelane"),
+            snapshot,
+            diagnostics: vec![],
+        })
+    }
+
+    fn cleanup(&mut self) -> Result<CleanupResponse, PrivilegedError> {
+        self.ensure_reconciled()?;
+        let Some(current) = self.current.clone() else {
+            self.store.clear()?;
+            return Ok(CleanupResponse {
+                cleaned: false,
+                diagnostics: vec!["no persisted RouteLane ownership to clean".to_owned()],
+            });
+        };
+        verify_cleanup_table_ownership(
+            &mut self.executor,
+            Some(&current),
+            self.current_nft_fingerprint.as_deref(),
+            false,
+        )?;
+
+        self.store.save(&StoredAppliedState {
+            active: Some(current.plan().clone()),
+            active_nft_fingerprint: self.current_nft_fingerprint.clone(),
+            pending: None,
+            pending_expectations: None,
+            cleanup_pending: true,
+        })?;
+        let mut runner = CommandKernelRunner::new(&mut self.executor, Some(current));
+        runner
+            .snapshot()
+            .and_then(|_| runner.restore(None))
+            .map_err(|error| PrivilegedError::new(error.to_string()))?;
+        self.store.clear()?;
+        self.current = None;
+        self.current_nft_fingerprint = None;
+        Ok(CleanupResponse {
+            cleaned: true,
+            diagnostics: vec![],
+        })
+    }
+}
+
+impl<E, S> CommandPrivilegedBackend<E, S>
+where
+    E: CommandExecutor,
+    S: AppliedStateStore,
+{
+    fn ensure_inspection_ready(&mut self) -> Result<(), PrivilegedError> {
+        if self.initialized {
+            return self.ensure_reconciled();
+        }
+        let Some(record) = self.store.load()? else {
+            self.initialized = true;
+            return Ok(());
+        };
+        if record.pending.is_some() || record.cleanup_pending {
+            return self.ensure_reconciled();
+        }
+        validate_stored_plan(record.active.as_ref(), "active")?;
+        validate_stored_fingerprint_pair(
+            record.active.as_ref(),
+            record.active_nft_fingerprint.as_deref(),
+        )?;
+        self.current = record.active.as_ref().map(AppliedKernelState::from_plan);
+        self.current_nft_fingerprint = record.active_nft_fingerprint;
+        self.initialized = true;
+        Ok(())
+    }
+
+    fn transition_to(
+        &mut self,
+        plan: &KernelPlan,
+        restoring: bool,
+    ) -> Result<ApplyResponse, PrivilegedError> {
+        let previous = self.current.clone();
+        let previous_nft_fingerprint = self.current_nft_fingerprint.clone();
         preflight_plan(&mut self.executor, previous.as_ref(), plan)?;
         let pending_expectations =
             build_pending_expectations(previous.as_ref().map(AppliedKernelState::plan), plan)?;
@@ -421,7 +562,18 @@ where
         })?;
 
         let mut runner = CommandKernelRunner::new(&mut self.executor, previous.clone());
-        let applied = match apply_kernel_plan(&mut runner, previous.as_ref(), plan) {
+        let transition = if restoring {
+            restore_kernel_plan(
+                &mut runner,
+                previous
+                    .as_ref()
+                    .expect("restore transition has a failed candidate"),
+                plan,
+            )
+        } else {
+            apply_kernel_plan(&mut runner, previous.as_ref(), plan)
+        };
+        let applied = match transition {
             Ok(applied) => applied,
             Err(error) => {
                 let rollback_succeeded =
@@ -514,70 +666,6 @@ where
         self.current_nft_fingerprint = Some(applied_nft_fingerprint);
         Ok(ApplyResponse::from_plan(plan, vec![]))
     }
-
-    fn inspect(&mut self) -> Result<InspectResponse, PrivilegedError> {
-        self.ensure_reconciled()?;
-        self.revalidate_current_ownership()?;
-        let captured = capture_snapshot(&mut self.executor)
-            .map_err(|error| PrivilegedError::new(error.to_string()))?;
-        let snapshot = match self.current.as_ref() {
-            Some(current) => captured
-                .snapshot
-                .with_nft_ownership(current.generation, current.plan_hash),
-            None => captured.snapshot,
-        };
-        Ok(InspectResponse {
-            generation: self.current.as_ref().map(|state| state.generation),
-            plan_hash: self.current.as_ref().map(|state| state.plan_hash),
-            routelane_table_present: snapshot.has_nft_table("inet", "routelane"),
-            snapshot,
-            diagnostics: vec![],
-        })
-    }
-
-    fn cleanup(&mut self) -> Result<CleanupResponse, PrivilegedError> {
-        self.ensure_reconciled()?;
-        let Some(current) = self.current.clone() else {
-            self.store.clear()?;
-            return Ok(CleanupResponse {
-                cleaned: false,
-                diagnostics: vec!["no persisted RouteLane ownership to clean".to_owned()],
-            });
-        };
-        verify_cleanup_table_ownership(
-            &mut self.executor,
-            Some(&current),
-            self.current_nft_fingerprint.as_deref(),
-            false,
-        )?;
-
-        self.store.save(&StoredAppliedState {
-            active: Some(current.plan().clone()),
-            active_nft_fingerprint: self.current_nft_fingerprint.clone(),
-            pending: None,
-            pending_expectations: None,
-            cleanup_pending: true,
-        })?;
-        let mut runner = CommandKernelRunner::new(&mut self.executor, Some(current));
-        runner
-            .snapshot()
-            .and_then(|_| runner.restore(None))
-            .map_err(|error| PrivilegedError::new(error.to_string()))?;
-        self.store.clear()?;
-        self.current = None;
-        self.current_nft_fingerprint = None;
-        Ok(CleanupResponse {
-            cleaned: true,
-            diagnostics: vec![],
-        })
-    }
-}
-
-impl<E, S> CommandPrivilegedBackend<E, S>
-where
-    E: CommandExecutor,
-    S: AppliedStateStore,
-{
     fn revalidate_current_ownership(&mut self) -> Result<(), PrivilegedError> {
         let Some(current) = self.current.as_ref() else {
             return Ok(());
@@ -2737,6 +2825,21 @@ pub struct ApplyResponse {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreResponse {
+    pub generation: Option<u64>,
+    pub plan_hash: Option<PlanHash>,
+}
+
+impl RestoreResponse {
+    pub fn from_plan(plan: Option<&KernelPlan>) -> Self {
+        Self {
+            generation: plan.map(|plan| plan.generation),
+            plan_hash: plan.map(KernelPlan::content_hash),
+        }
+    }
+}
+
 impl ApplyResponse {
     pub fn from_plan(plan: &KernelPlan, diagnostics: Vec<String>) -> Self {
         Self {
@@ -2797,6 +2900,11 @@ impl std::error::Error for PrivilegedError {}
 
 pub trait PrivilegedBackend: Send {
     fn apply(&mut self, plan: &KernelPlan) -> Result<ApplyResponse, PrivilegedError>;
+    fn restore(
+        &mut self,
+        failed_candidate: &KernelPlan,
+        previous: Option<&KernelPlan>,
+    ) -> Result<RestoreResponse, PrivilegedError>;
     fn inspect(&mut self) -> Result<InspectResponse, PrivilegedError>;
     fn cleanup(&mut self) -> Result<CleanupResponse, PrivilegedError>;
 }
@@ -2883,6 +2991,22 @@ where
             .map_err(|error| ServiceError::Backend(error.to_string()))
     }
 
+    pub async fn restore_plan(
+        &self,
+        sender: Option<&str>,
+        failed_candidate_json: &str,
+        previous_json: Option<&str>,
+    ) -> Result<RestoreResponse, ServiceError> {
+        self.authorize(sender).await?;
+        let failed_candidate = decode_plan(failed_candidate_json)?;
+        let previous = previous_json.map(decode_plan).transpose()?;
+        self.backend
+            .lock()
+            .map_err(|_| ServiceError::StatePoisoned)?
+            .restore(&failed_candidate, previous.as_ref())
+            .map_err(|error| ServiceError::Backend(error.to_string()))
+    }
+
     pub async fn cleanup(&self, sender: Option<&str>) -> Result<CleanupResponse, ServiceError> {
         self.authorize(sender).await?;
         self.backend
@@ -2902,6 +3026,19 @@ where
     }
 }
 
+fn decode_plan(plan_json: &str) -> Result<KernelPlan, ServiceError> {
+    if plan_json.len() > MAX_PLAN_JSON_BYTES {
+        return Err(ServiceError::PlanTooLarge {
+            actual: plan_json.len(),
+            maximum: MAX_PLAN_JSON_BYTES,
+        });
+    }
+    let plan: KernelPlan = serde_json::from_str(plan_json)
+        .map_err(|error| ServiceError::InvalidPlanJson(error.to_string()))?;
+    validate_privileged_plan(&plan).map_err(ServiceError::Validation)?;
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::{ready, Ready};
@@ -2914,12 +3051,13 @@ mod tests {
         render_guarded_ruleset, render_owned_ruleset, render_transaction_ruleset, run_nft_batch,
         validate_privileged_plan, AppliedStateStore, ApplyResponse, AuthorizationError, Authorizer,
         CleanupResponse, CommandExecutor, CommandOutput, CommandPrivilegedBackend, InspectResponse,
-        PrivilegedBackend, PrivilegedError, PrivilegedService, ServiceError, StoredAppliedState,
-        ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES, NFT_BINARY,
+        PrivilegedBackend, PrivilegedError, PrivilegedService, RestoreResponse, ServiceError,
+        StoredAppliedState, ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES, NFT_BINARY,
     };
     use crate::backend::{
         CommandSpec, CompiledAction, CompiledRule, CompiledTarget, IpFamily, KernelPlan,
-        LaneAvailability, LanePlan, Program, TableMode, MARK_BASE, RULE_PRIORITY_BASE, TABLE_BASE,
+        LaneAvailability, LanePlan, Program, ResourceState, TableMode, MARK_BASE,
+        RULE_PRIORITY_BASE, TABLE_BASE,
     };
 
     fn fixture_lane(id: &str, offset: u32) -> LanePlan {
@@ -3560,6 +3698,67 @@ mod tests {
                         })
                     })
         }));
+    }
+
+    #[test]
+    fn restore_reinstates_exact_previous_journal_and_accepts_a_different_next_generation() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let first = fixture_valid_plan();
+        let mut failed_candidate = first.clone();
+        failed_candidate.generation = 2;
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        backend.apply(&first).unwrap();
+        backend.apply(&failed_candidate).unwrap();
+
+        let restored = backend.restore(&failed_candidate, Some(&first)).unwrap();
+
+        assert_eq!(restored, RestoreResponse::from_plan(Some(&first)));
+        assert_eq!(backend.inspect().unwrap().generation, Some(1));
+        {
+            let persisted = store.state.lock().unwrap();
+            let persisted = persisted.as_ref().unwrap();
+            assert_eq!(persisted.active.as_ref(), Some(&first));
+            assert!(persisted.pending.is_none());
+            assert!(persisted.pending_expectations.is_none());
+        }
+
+        let mut different_next = first.clone();
+        different_next.generation = 2;
+        different_next.rules[0].action = CompiledAction::Block;
+        assert_eq!(
+            backend.apply(&different_next).unwrap().generation,
+            different_next.generation
+        );
+    }
+
+    #[test]
+    fn restore_rejects_a_noncurrent_candidate_before_journal_or_kernel_mutation() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let current = fixture_valid_plan();
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        backend.apply(&current).unwrap();
+        let journal_before = store.state.lock().unwrap().clone();
+        let mutations_before = mutation_count(&kernel.lock().unwrap());
+        let mut other = current.clone();
+        other.generation = 2;
+
+        let error = backend.restore(&other, Some(&current)).unwrap_err();
+
+        assert!(error.to_string().contains("not the failed candidate"));
+        assert_eq!(*store.state.lock().unwrap(), journal_before);
+        assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
     }
 
     #[test]
@@ -4455,7 +4654,7 @@ mod tests {
     }
 
     #[test]
-    fn restarted_backend_rejects_marker_present_but_tampered_nft_output() {
+    fn read_only_inspect_returns_tampered_nft_evidence_but_next_apply_stays_fail_closed() {
         let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
         let store = FakeAppliedStateStore::default();
         {
@@ -4488,8 +4687,13 @@ mod tests {
             },
             store,
         );
-        let error = restarted.inspect().unwrap_err();
+        let inspection = restarted.inspect().unwrap();
 
+        assert_eq!(inspection.generation, Some(1));
+        assert!(!inspection.snapshot.nft_is_owned_by(&fixture_valid_plan()));
+        let mut next = fixture_valid_plan();
+        next.generation = 2;
+        let error = restarted.apply(&next).unwrap_err();
         assert!(error
             .to_string()
             .contains("differs from the exact committed state"));
@@ -4506,7 +4710,7 @@ mod tests {
     }
 
     #[test]
-    fn restarted_backend_rejects_missing_committed_nft_table_without_repair() {
+    fn read_only_inspect_returns_missing_table_evidence_without_repair() {
         let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
         let store = FakeAppliedStateStore::default();
         {
@@ -4533,9 +4737,42 @@ mod tests {
             },
             store.clone(),
         );
-        let error = restarted.inspect().unwrap_err();
+        let inspection = restarted.inspect().unwrap();
 
-        assert!(error.to_string().contains("incomplete"));
+        assert_eq!(inspection.generation, Some(1));
+        assert!(!inspection.routelane_table_present);
+        assert!(!inspection.snapshot.nft_is_owned_by(&fixture_valid_plan()));
+        assert_eq!(*store.state.lock().unwrap(), journal_before);
+        assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
+    }
+
+    #[test]
+    fn read_only_inspect_returns_missing_rule_evidence_but_mutation_revalidates_exactly() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let plan = fixture_valid_plan();
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        backend.apply(&plan).unwrap();
+        kernel.lock().unwrap().has_rule = false;
+        let journal_before = store.state.lock().unwrap().clone();
+        let mutations_before = mutation_count(&kernel.lock().unwrap());
+
+        let inspection = backend.inspect().unwrap();
+
+        assert_eq!(
+            inspection
+                .snapshot
+                .rule_state(IpFamily::V4, RULE_PRIORITY_BASE, TABLE_BASE, MARK_BASE,),
+            ResourceState::Missing
+        );
+        let mut next = plan;
+        next.generation = 2;
+        assert!(backend.apply(&next).is_err());
         assert_eq!(*store.state.lock().unwrap(), journal_before);
         assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
     }
@@ -4684,6 +4921,15 @@ mod tests {
             Ok(ApplyResponse::from_plan(plan, vec![]))
         }
 
+        fn restore(
+            &mut self,
+            _failed_candidate: &KernelPlan,
+            previous: Option<&KernelPlan>,
+        ) -> Result<RestoreResponse, PrivilegedError> {
+            self.events.lock().unwrap().push("restore");
+            Ok(RestoreResponse::from_plan(previous))
+        }
+
         fn inspect(&mut self) -> Result<InspectResponse, PrivilegedError> {
             self.events.lock().unwrap().push("inspect");
             Ok(InspectResponse::empty())
@@ -4803,6 +5049,12 @@ mod tests {
     #[tokio::test]
     async fn inspect_and_cleanup_are_authorized_before_backend_access() {
         let (denied, denied_events) = fixture_service(Err(AuthorizationError::Challenge));
+        let failed_candidate = {
+            let mut plan = fixture_valid_plan();
+            plan.generation = 2;
+            serde_json::to_string(&plan).unwrap()
+        };
+        let previous = serde_json::to_string(&fixture_valid_plan()).unwrap();
         assert_eq!(
             denied.inspect(Some(":1.42")).await,
             Err(ServiceError::Authorization(AuthorizationError::Challenge))
@@ -4812,16 +5064,36 @@ mod tests {
             Err(ServiceError::Authorization(AuthorizationError::Challenge))
         );
         assert_eq!(
+            denied
+                .restore_plan(Some(":1.42"), &failed_candidate, Some(&previous))
+                .await,
+            Err(ServiceError::Authorization(AuthorizationError::Challenge))
+        );
+        assert_eq!(
             *denied_events.lock().unwrap(),
-            vec!["authorize", "authorize"]
+            vec!["authorize", "authorize", "authorize"]
         );
 
         let (allowed, allowed_events) = fixture_service(Ok(()));
         allowed.inspect(Some(":1.42")).await.unwrap();
         allowed.cleanup(Some(":1.42")).await.unwrap();
         assert_eq!(
+            allowed
+                .restore_plan(Some(":1.42"), &failed_candidate, Some(&previous))
+                .await
+                .unwrap(),
+            RestoreResponse::from_plan(Some(&fixture_valid_plan()))
+        );
+        assert_eq!(
             *allowed_events.lock().unwrap(),
-            vec!["authorize", "inspect", "authorize", "cleanup"]
+            vec![
+                "authorize",
+                "inspect",
+                "authorize",
+                "cleanup",
+                "authorize",
+                "restore"
+            ]
         );
     }
 }

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use routelane::backend::{
     ApplyResponse, CleanupResponse, InspectResponse, KernelPlan, KernelSnapshot,
-    ResolutionSnapshot, SnapshotInput, TopologySnapshot,
+    ResolutionSnapshot, RestoreResponse, SnapshotInput, TopologySnapshot,
 };
 use routelane::daemon::{
     AtomicJsonConfigRepository, ConfigRepository, DaemonError, DaemonService,
@@ -48,6 +48,8 @@ impl ResolutionProvider for FakeResolution {
 struct FakeHelper {
     behavior: Arc<Mutex<HelperBehavior>>,
     applied: Arc<Mutex<Vec<KernelPlan>>>,
+    live: Arc<Mutex<Option<KernelPlan>>>,
+    restore_fails: Arc<Mutex<bool>>,
     cleanup_calls: Arc<Mutex<usize>>,
     inspect_calls: Arc<Mutex<usize>>,
 }
@@ -82,25 +84,68 @@ impl FakeHelper {
     fn deny_authorization(&self) {
         *self.behavior.lock().unwrap() = HelperBehavior::AuthorizationDenied;
     }
+
+    fn live_plan(&self) -> Option<KernelPlan> {
+        self.live.lock().unwrap().clone()
+    }
+
+    fn fail_restore(&self) {
+        *self.restore_fails.lock().unwrap() = true;
+    }
 }
 
 #[async_trait]
 impl PrivilegedHelperClient for FakeHelper {
     async fn apply(&self, plan: &KernelPlan) -> Result<ApplyResponse, DaemonError> {
         self.applied.lock().unwrap().push(plan.clone());
-        match self.behavior.lock().unwrap().clone() {
-            HelperBehavior::Success => Ok(ApplyResponse::from_plan(plan, vec![])),
+        let behavior = self.behavior.lock().unwrap().clone();
+        match behavior {
             HelperBehavior::Fail => Err(DaemonError::helper("injected apply failure")),
-            HelperBehavior::Mismatch => {
-                let mut mismatched = plan.clone();
-                mismatched.generation += 1;
-                Ok(ApplyResponse::from_plan(&mismatched, vec![]))
-            }
-            HelperBehavior::InspectFail => Ok(ApplyResponse::from_plan(plan, vec![])),
             HelperBehavior::AuthorizationDenied => {
                 Err(DaemonError::authorization("injected authorization denial"))
             }
+            behavior => {
+                if let Some(current) = self.live.lock().unwrap().as_ref() {
+                    if plan.generation < current.generation
+                        || (plan.generation == current.generation
+                            && plan.content_hash() != current.content_hash())
+                    {
+                        return Err(DaemonError::helper("injected helper generation conflict"));
+                    }
+                }
+                *self.live.lock().unwrap() = Some(plan.clone());
+                if matches!(behavior, HelperBehavior::Mismatch) {
+                    let mut mismatched = plan.clone();
+                    mismatched.generation += 1;
+                    Ok(ApplyResponse::from_plan(&mismatched, vec![]))
+                } else {
+                    Ok(ApplyResponse::from_plan(plan, vec![]))
+                }
+            }
         }
+    }
+
+    async fn restore(
+        &self,
+        failed_candidate: &KernelPlan,
+        previous: Option<&KernelPlan>,
+    ) -> Result<RestoreResponse, DaemonError> {
+        if *self.restore_fails.lock().unwrap() {
+            return Err(DaemonError::helper("injected restore failure"));
+        }
+        let mut live = self.live.lock().unwrap();
+        let Some(current) = live.as_ref() else {
+            return Err(DaemonError::helper("no live candidate to restore"));
+        };
+        if current.generation != failed_candidate.generation
+            || current.content_hash() != failed_candidate.content_hash()
+        {
+            return Err(DaemonError::helper(
+                "live plan does not match failed candidate",
+            ));
+        }
+        *live = previous.cloned();
+        Ok(RestoreResponse::from_plan(previous))
     }
 
     async fn inspect(&self) -> Result<InspectResponse, DaemonError> {
@@ -108,7 +153,7 @@ impl PrivilegedHelperClient for FakeHelper {
         if matches!(*self.behavior.lock().unwrap(), HelperBehavior::InspectFail) {
             return Err(DaemonError::helper("injected inspect failure"));
         }
-        let plan = self.applied.lock().unwrap().last().cloned();
+        let plan = self.live.lock().unwrap().clone();
         let nft = if plan.is_some() {
             br#"{"nftables":[{"table":{"family":"inet","name":"routelane"}}]}"#.as_slice()
         } else {
@@ -142,10 +187,13 @@ impl PrivilegedHelperClient for FakeHelper {
             HelperBehavior::AuthorizationDenied => {
                 Err(DaemonError::authorization("injected authorization denial"))
             }
-            _ => Ok(CleanupResponse {
-                cleaned: true,
-                diagnostics: vec![],
-            }),
+            _ => {
+                let cleaned = self.live.lock().unwrap().take().is_some();
+                Ok(CleanupResponse {
+                    cleaned,
+                    diagnostics: vec![],
+                })
+            }
         }
     }
 }
@@ -154,6 +202,7 @@ impl PrivilegedHelperClient for FakeHelper {
 struct MemoryConfig {
     desired: Arc<Mutex<Option<Profile>>>,
     saves: Arc<Mutex<Vec<Option<Profile>>>>,
+    fail_saves: Arc<Mutex<bool>>,
 }
 
 impl ConfigRepository for MemoryConfig {
@@ -162,6 +211,12 @@ impl ConfigRepository for MemoryConfig {
     }
 
     fn save(&self, desired: Option<&Profile>) -> Result<(), DaemonError> {
+        if *self.fail_saves.lock().unwrap() {
+            return Err(DaemonError::new(
+                "DAEMON_CONFIG_FAILED",
+                "injected config failure",
+            ));
+        }
         let desired = desired.cloned();
         *self.desired.lock().unwrap() = desired.clone();
         self.saves.lock().unwrap().push(desired);
@@ -273,10 +328,7 @@ async fn failed_apply_keeps_persisted_desired_and_last_successful_generation() {
     assert_eq!(state.applied.unwrap().generation, 1);
     assert_eq!(state.applied_profile.unwrap().name, "Default");
     assert_eq!(state.health.state, HealthState::Degraded);
-    assert_eq!(
-        state.health.diagnostics[0].code,
-        DiagnosticCode::PolicyApplyRolledBack
-    );
+    assert!(state.health.diagnostics.is_empty());
     assert_eq!(*config.desired.lock().unwrap(), Some(changed));
     assert!(matches!(
         event,
@@ -301,6 +353,11 @@ async fn mismatched_helper_response_is_not_committed_as_applied() {
     assert_eq!(state.generation, 0);
     assert!(state.applied.is_none());
     assert_eq!(state.health.state, HealthState::Failed);
+    assert_eq!(
+        state.health.diagnostics[0].code,
+        DiagnosticCode::PolicyApplyRolledBack
+    );
+    assert!(helper.live_plan().is_none());
 }
 
 #[tokio::test]
@@ -318,6 +375,7 @@ async fn invalid_profile_emits_failure_without_persisting_or_advancing_generatio
     assert!(state.desired.is_none());
     assert!(state.applied.is_none());
     assert_eq!(state.health.state, HealthState::Failed);
+    assert!(state.health.diagnostics.is_empty());
     assert!(config.saves.lock().unwrap().is_empty());
     assert!(matches!(
         events.recv().await.unwrap(),
@@ -327,6 +385,20 @@ async fn invalid_profile_emits_failure_without_persisting_or_advancing_generatio
             ..
         } if health.state == HealthState::Failed
     ));
+}
+
+#[tokio::test]
+async fn config_failure_without_kernel_mutation_has_no_rollback_diagnostic() {
+    let (service, helper, config) = service();
+    *config.fail_saves.lock().unwrap() = true;
+
+    let error = service.apply_profile(fixture_profile()).await.unwrap_err();
+
+    assert_eq!(error.code(), "DAEMON_CONFIG_FAILED");
+    assert!(helper.live_plan().is_none());
+    let state = service.state().await;
+    assert_eq!(state.health.state, HealthState::Failed);
+    assert!(state.health.diagnostics.is_empty());
 }
 
 #[tokio::test]
@@ -459,9 +531,10 @@ async fn unix_socket_round_trip_uses_secure_permissions() {
 }
 
 #[tokio::test]
-async fn inspect_failure_keeps_previous_applied_generation_and_reports_rollback() {
+async fn inspect_failure_restores_helper_state_and_allows_a_different_next_generation() {
     let (service, helper, _) = service();
     service.apply_profile(fixture_profile()).await.unwrap();
+    let previous = helper.live_plan().unwrap();
     let mut changed = fixture_profile();
     changed.name = "Changed".to_owned();
     helper.fail_inspect();
@@ -469,6 +542,7 @@ async fn inspect_failure_keeps_previous_applied_generation_and_reports_rollback(
     let error = service.apply_profile(changed).await.unwrap_err();
 
     assert_eq!(error.code(), "DAEMON_HEALTH_INSPECTION_FAILED");
+    assert_eq!(helper.live_plan(), Some(previous));
     let state = service.state().await;
     assert_eq!(state.generation, 1);
     assert_eq!(state.applied.unwrap().generation, 1);
@@ -477,6 +551,37 @@ async fn inspect_failure_keeps_previous_applied_generation_and_reports_rollback(
         state.health.diagnostics[0].code,
         DiagnosticCode::PolicyApplyRolledBack
     );
+
+    helper.succeed();
+    let mut next = fixture_profile();
+    next.name = "Different next generation".to_owned();
+    let response = service.apply_profile(next).await.unwrap();
+    assert_eq!(response.generation, 2);
+    assert_eq!(helper.live_plan().unwrap().generation, 2);
+}
+
+#[tokio::test]
+async fn failed_kernel_restore_is_failed_without_claiming_policy_rollback() {
+    let (service, helper, _) = service();
+    service.apply_profile(fixture_profile()).await.unwrap();
+    helper.fail_inspect();
+    helper.fail_restore();
+    let mut changed = fixture_profile();
+    changed.name = "Changed".to_owned();
+
+    let error = service.apply_profile(changed).await.unwrap_err();
+
+    assert_eq!(error.code(), "DAEMON_KERNEL_ROLLBACK_FAILED");
+    assert_eq!(helper.live_plan().unwrap().generation, 2);
+    let state = service.state().await;
+    assert_eq!(state.generation, 1);
+    assert_eq!(state.applied.unwrap().generation, 1);
+    assert_eq!(state.health.state, HealthState::Failed);
+    assert!(state
+        .health
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.code != DiagnosticCode::PolicyApplyRolledBack));
 }
 
 #[tokio::test]
