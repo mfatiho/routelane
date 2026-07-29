@@ -1,5 +1,6 @@
 use std::fs;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -409,6 +410,89 @@ async fn slow_event_subscriber_does_not_block_mutations() {
         let response = service.apply_profile(profile).await.unwrap();
         assert_eq!(response.generation, generation);
     }
+}
+
+#[tokio::test]
+async fn second_bind_preserves_active_socket_and_reports_already_running() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("runtime/routelane/routelane.sock");
+    let (service, _, _) = service();
+    let first = UnixSocketServer::bind_at(path.clone(), service.clone())
+        .await
+        .unwrap();
+    let original_metadata = fs::symlink_metadata(&path).unwrap();
+
+    let error = UnixSocketServer::bind_at(path.clone(), service)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, "IPC_ALREADY_RUNNING");
+    let current_metadata = fs::symlink_metadata(&path).unwrap();
+    assert!(current_metadata.file_type().is_socket());
+    assert_eq!(current_metadata.dev(), original_metadata.dev());
+    assert_eq!(current_metadata.ino(), original_metadata.ino());
+    assert_eq!(
+        fs::metadata(path.parent().unwrap().join("routelane.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    drop(first);
+}
+
+#[tokio::test]
+async fn active_owned_socket_without_lock_is_detected_by_liveness_probe() {
+    let temp = TempDir::new().unwrap();
+    let parent = temp.path().join("runtime/routelane");
+    fs::create_dir_all(&parent).unwrap();
+    let path = parent.join("routelane.sock");
+    let active_listener = StdUnixListener::bind(&path).unwrap();
+    let (service, _, _) = service();
+
+    let error = UnixSocketServer::bind_at(path.clone(), service)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, "IPC_ALREADY_RUNNING");
+    assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+    drop(active_listener);
+}
+
+#[tokio::test]
+async fn refused_owned_stale_socket_is_removed_and_rebound() {
+    let temp = TempDir::new().unwrap();
+    let parent = temp.path().join("runtime/routelane");
+    fs::create_dir_all(&parent).unwrap();
+    let path = parent.join("routelane.sock");
+    let stale_listener = StdUnixListener::bind(&path).unwrap();
+    drop(stale_listener);
+    let (service, _, _) = service();
+
+    let server = UnixSocketServer::bind_at(path.clone(), service)
+        .await
+        .unwrap();
+
+    assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+    drop(server);
+}
+
+#[tokio::test]
+async fn lock_file_symlink_is_rejected_without_touching_target() {
+    let temp = TempDir::new().unwrap();
+    let parent = temp.path().join("runtime/routelane");
+    fs::create_dir_all(&parent).unwrap();
+    let target = parent.join("lock-target");
+    fs::write(&target, b"keep").unwrap();
+    std::os::unix::fs::symlink(&target, parent.join("routelane.lock")).unwrap();
+    let path = parent.join("routelane.sock");
+    let (service, _, _) = service();
+
+    let error = UnixSocketServer::bind_at(path, service).await.unwrap_err();
+
+    assert_eq!(error.code, "IPC_UNSAFE_LOCK_FILE");
+    assert_eq!(fs::read(target).unwrap(), b"keep");
 }
 
 #[tokio::test]

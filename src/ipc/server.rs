@@ -1,5 +1,7 @@
-use std::fs;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::fs::{self, File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -52,6 +54,7 @@ pub struct UnixSocketServer<S> {
     listener: UnixListener,
     service: Arc<S>,
     daemon_uid: u32,
+    _instance_lock: File,
 }
 
 impl<S> std::fmt::Debug for UnixSocketServer<S> {
@@ -70,7 +73,8 @@ where
     pub async fn bind_at(path: PathBuf, service: Arc<S>) -> Result<Self, IpcError> {
         let daemon_uid = effective_uid();
         prepare_parent(&path, daemon_uid)?;
-        remove_owned_stale_socket(&path, daemon_uid)?;
+        let instance_lock = acquire_instance_lock(&path, daemon_uid)?;
+        remove_verified_stale_socket(&path, daemon_uid)?;
         let listener = UnixListener::bind(&path).map_err(|error| {
             IpcError::new(
                 "IPC_SOCKET_BIND_FAILED",
@@ -87,6 +91,7 @@ where
             listener,
             service,
             daemon_uid,
+            _instance_lock: instance_lock,
         })
     }
 
@@ -172,7 +177,67 @@ fn prepare_parent(path: &Path, daemon_uid: u32) -> Result<(), IpcError> {
     })
 }
 
-fn remove_owned_stale_socket(path: &Path, daemon_uid: u32) -> Result<(), IpcError> {
+fn acquire_instance_lock(path: &Path, daemon_uid: u32) -> Result<File, IpcError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| IpcError::new("IPC_INVALID_SOCKET_PATH", "socket path has no parent"))?;
+    let lock_path = parent.join("routelane.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .map_err(|error| {
+            let code = if error.raw_os_error() == Some(libc::ELOOP) {
+                "IPC_UNSAFE_LOCK_FILE"
+            } else {
+                "IPC_LOCK_OPEN_FAILED"
+            };
+            IpcError::new(
+                code,
+                format!("could not securely open {}: {error}", lock_path.display()),
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        IpcError::new(
+            "IPC_LOCK_INSPECTION_FAILED",
+            format!("could not inspect {}: {error}", lock_path.display()),
+        )
+    })?;
+    if !metadata.is_file() || metadata.uid() != daemon_uid {
+        return Err(IpcError::new(
+            "IPC_UNSAFE_LOCK_FILE",
+            "daemon lock must be a regular file owned by the daemon user",
+        ));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| {
+            IpcError::new(
+                "IPC_LOCK_PERMISSION_FAILED",
+                format!("could not secure {}: {error}", lock_path.display()),
+            )
+        })?;
+
+    // SAFETY: flock only reads the valid file descriptor and the flags are a
+    // supported nonblocking exclusive-lock combination.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        let raw_error = error.raw_os_error();
+        if raw_error == Some(libc::EAGAIN) || raw_error == Some(libc::EWOULDBLOCK) {
+            return Err(already_running_error());
+        }
+        return Err(IpcError::new(
+            "IPC_LOCK_FAILED",
+            format!("could not acquire {}: {error}", lock_path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+fn remove_verified_stale_socket(path: &Path, daemon_uid: u32) -> Result<(), IpcError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -189,6 +254,19 @@ fn remove_owned_stale_socket(path: &Path, daemon_uid: u32) -> Result<(), IpcErro
             "existing socket path is not an owned Unix socket",
         ));
     }
+    match StdUnixStream::connect(path) {
+        Ok(_) => return Err(already_running_error()),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+        Err(error) => {
+            return Err(IpcError::new(
+                "IPC_SOCKET_LIVENESS_UNCERTAIN",
+                format!(
+                    "could not prove that owned socket {} is stale: {error}",
+                    path.display()
+                ),
+            ));
+        }
+    }
     fs::remove_file(path).map_err(|error| {
         IpcError::new(
             "IPC_STALE_SOCKET_REMOVAL_FAILED",
@@ -198,6 +276,13 @@ fn remove_owned_stale_socket(path: &Path, daemon_uid: u32) -> Result<(), IpcErro
             ),
         )
     })
+}
+
+fn already_running_error() -> IpcError {
+    IpcError::new(
+        "IPC_ALREADY_RUNNING",
+        "another RouteLane daemon instance is already running",
+    )
 }
 
 fn same_user_peer(stream: &UnixStream, daemon_uid: u32) -> Result<bool, IpcError> {
