@@ -13,11 +13,12 @@ use tokio::process::Command;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::backend::{
-    compile_profile, AppliedKernelState, ApplyResponse, CleanupResponse, KernelPlan,
-    ResolutionSnapshot, TopologySnapshot,
+    compile_profile, AppliedKernelState, ApplyResponse, CleanupResponse, InspectResponse,
+    KernelPlan, ResolutionSnapshot, TopologySnapshot,
 };
 use crate::domain::{validate_profile, HealthState, Profile, ProfileId, RuleId, RuleTarget};
 use crate::exact_domain_resolver::resolve_domain;
+use crate::health::{evaluate_health, Diagnostic, DiagnosticCode, HealthReport};
 use crate::ipc::{
     ApplyProfileResult, DaemonEnvelope, DaemonEvent, DaemonRequest, DaemonResponse, DaemonResult,
     IpcError, IPC_PROTOCOL_VERSION,
@@ -48,6 +49,10 @@ impl DaemonError {
 
     pub fn helper(message: impl Into<String>) -> Self {
         Self::new("DAEMON_HELPER_FAILED", message)
+    }
+
+    pub fn authorization(message: impl Into<String>) -> Self {
+        Self::new("DAEMON_NEEDS_AUTHORIZATION", message)
     }
 
     pub fn code(&self) -> &str {
@@ -106,6 +111,7 @@ pub trait ResolutionProvider: Send + Sync {
 #[async_trait]
 pub trait PrivilegedHelperClient: Send + Sync {
     async fn apply(&self, plan: &KernelPlan) -> Result<ApplyResponse, DaemonError>;
+    async fn inspect(&self) -> Result<InspectResponse, DaemonError>;
     async fn cleanup(&self) -> Result<CleanupResponse, DaemonError>;
 }
 
@@ -181,7 +187,7 @@ where
         }
 
         let result = match envelope.request {
-            DaemonRequest::GetStatus => Ok(DaemonResult::Status(self.state.lock().await.status())),
+            DaemonRequest::GetStatus => Ok(DaemonResult::Status(self.current_status().await)),
             DaemonRequest::ListProfiles => {
                 let profiles = self
                     .state
@@ -238,7 +244,7 @@ where
         let candidate_generation = {
             let mut state = self.state.lock().await;
             state.desired = Some(profile.clone());
-            state.health = HealthState::Applying;
+            state.health = HealthReport::applying();
             state.generation + 1
         };
         let topology = match self.topology.snapshot(&profile).await {
@@ -279,6 +285,31 @@ where
             return Err(error);
         }
 
+        let health = match self.inspect_plan_health(&profile, &plan).await {
+            Ok(report) if report.state == HealthState::Healthy => report,
+            Ok(report) => {
+                let error = DaemonError::new(
+                    "DAEMON_HEALTH_VERIFICATION_FAILED",
+                    "live kernel state did not match the applied plan",
+                );
+                self.record_verification_failure(error.clone(), report)
+                    .await;
+                return Err(error);
+            }
+            Err(error) => {
+                let error = if error.code() == "DAEMON_NEEDS_AUTHORIZATION" {
+                    error
+                } else {
+                    DaemonError::new(
+                        "DAEMON_HEALTH_INSPECTION_FAILED",
+                        format!("could not inspect live kernel health: {}", error.message()),
+                    )
+                };
+                self.record_failure(error.clone()).await;
+                return Err(error);
+            }
+        };
+
         let result = ApplyProfileResult {
             generation: plan.generation,
             plan_hash: plan.content_hash(),
@@ -286,13 +317,14 @@ where
         {
             let mut state = self.state.lock().await;
             state.applied = Some(AppliedKernelState::from_plan(&plan));
+            state.applied_profile = Some(profile);
             state.generation = plan.generation;
-            state.health = HealthState::Healthy;
+            state.health = health.clone();
             state.last_error = None;
         }
         let _ = self.events.send(DaemonEvent::StateChanged {
             generation: plan.generation,
-            health: HealthState::Healthy,
+            health,
         });
         Ok(result)
     }
@@ -334,27 +366,42 @@ where
         let generation = {
             let mut state = self.state.lock().await;
             state.applied = None;
-            state.health = HealthState::Inactive;
+            state.applied_profile = None;
+            state.health = HealthReport::inactive();
             state.last_error = None;
             state.generation
         };
         let _ = self.events.send(DaemonEvent::StateChanged {
             generation,
-            health: HealthState::Inactive,
+            health: HealthReport::inactive(),
         });
         Ok(())
     }
 
     async fn record_failure(&self, error: DaemonError) {
-        let ipc_error = IpcError::from(error);
+        let ipc_error = IpcError::from(error.clone());
         let (generation, health) = {
             let mut state = self.state.lock().await;
-            let health = if state.applied.is_some() {
+            let health_state = if error.code == "DAEMON_NEEDS_AUTHORIZATION" {
+                HealthState::NeedsAuthorization
+            } else if state.applied.is_some() {
                 HealthState::Degraded
             } else {
                 HealthState::Failed
             };
-            state.health = health;
+            let health = HealthReport::failure(
+                health_state,
+                DiagnosticCode::PolicyApplyRolledBack,
+                "active-policy",
+                "RouteLane could not complete the policy operation",
+                format!("{}: {}", error.code, error.message),
+                if health_state == HealthState::NeedsAuthorization {
+                    "Authorize the RouteLane privileged helper and retry."
+                } else {
+                    "Review the technical detail and retry the operation."
+                },
+            );
+            state.health = health.clone();
             state.last_error = Some(ipc_error.clone());
             (state.generation, health)
         };
@@ -363,6 +410,92 @@ where
             health,
             error: ipc_error,
         });
+    }
+
+    async fn record_verification_failure(&self, error: DaemonError, mut report: HealthReport) {
+        let ipc_error = IpcError::from(error);
+        let (generation, health) = {
+            let mut state = self.state.lock().await;
+            let health_state = if state.applied.is_some() {
+                HealthState::Degraded
+            } else {
+                HealthState::Failed
+            };
+            report.state = health_state;
+            report.diagnostics.push(Diagnostic::new(
+                DiagnosticCode::PolicyApplyRolledBack,
+                "Applied policy failed live verification",
+                ipc_error.message.clone(),
+                health_state,
+                "active-policy",
+                "Reapply the profile after resolving the reported health diagnostics.",
+            ));
+            report = HealthReport::from_parts(report.state, report.lanes, report.diagnostics);
+            state.health = report.clone();
+            state.last_error = Some(ipc_error.clone());
+            (state.generation, report)
+        };
+        let _ = self.events.send(DaemonEvent::OperationFailed {
+            generation,
+            health,
+            error: ipc_error,
+        });
+    }
+
+    async fn inspect_plan_health(
+        &self,
+        profile: &Profile,
+        plan: &KernelPlan,
+    ) -> Result<HealthReport, DaemonError> {
+        let topology = self.topology.snapshot(profile).await?;
+        let inspected = self.helper.inspect().await?;
+        Ok(evaluate_health(
+            Some(plan),
+            &inspected.snapshot.with_topology(&topology),
+        ))
+    }
+
+    async fn current_status(&self) -> crate::ipc::DaemonStatus {
+        let (base, profile, plan) = {
+            let state = self.state.lock().await;
+            (
+                state.clone(),
+                state.applied_profile.clone(),
+                state.applied.as_ref().map(|applied| applied.plan().clone()),
+            )
+        };
+        let health = match (profile.as_ref(), plan.as_ref()) {
+            (_, None) => HealthReport::inactive(),
+            (Some(profile), Some(plan)) => match self.inspect_plan_health(profile, plan).await {
+                Ok(report) => report,
+                Err(error) => {
+                    let state = if error.code() == "DAEMON_NEEDS_AUTHORIZATION" {
+                        HealthState::NeedsAuthorization
+                    } else {
+                        HealthState::Degraded
+                    };
+                    HealthReport::failure(
+                        state,
+                        DiagnosticCode::PolicyApplyRolledBack,
+                        "health-inspection",
+                        "RouteLane could not inspect live policy health",
+                        error.to_string(),
+                        "Authorize or restore the privileged helper, then retry.",
+                    )
+                }
+            },
+            (None, Some(_)) => HealthReport::failure(
+                HealthState::Failed,
+                DiagnosticCode::PolicyApplyRolledBack,
+                "health-inspection",
+                "Applied policy has no corresponding profile",
+                "daemon state is missing the profile required for topology inspection",
+                "Reapply a saved profile.",
+            ),
+        };
+        let mut status = base.status();
+        status.health = health;
+        status
     }
 }
 
@@ -497,9 +630,19 @@ impl PrivilegedHelperClient for SystemPrivilegedHelperClient {
         let response_json: String = proxy
             .call("ApplyPlan", &(plan_json.as_str(),))
             .await
-            .map_err(|error| DaemonError::helper(format!("helper ApplyPlan call: {error}")))?;
+            .map_err(|error| helper_call_error("ApplyPlan", error))?;
         serde_json::from_str(&response_json)
             .map_err(|error| DaemonError::helper(format!("decode ApplyPlan response: {error}")))
+    }
+
+    async fn inspect(&self) -> Result<InspectResponse, DaemonError> {
+        let proxy = self.proxy().await?;
+        let response_json: String = proxy
+            .call("Inspect", &())
+            .await
+            .map_err(|error| helper_call_error("Inspect", error))?;
+        serde_json::from_str(&response_json)
+            .map_err(|error| DaemonError::helper(format!("decode Inspect response: {error}")))
     }
 
     async fn cleanup(&self) -> Result<CleanupResponse, DaemonError> {
@@ -507,9 +650,27 @@ impl PrivilegedHelperClient for SystemPrivilegedHelperClient {
         let response_json: String = proxy
             .call("Cleanup", &())
             .await
-            .map_err(|error| DaemonError::helper(format!("helper Cleanup call: {error}")))?;
+            .map_err(|error| helper_call_error("Cleanup", error))?;
         serde_json::from_str(&response_json)
             .map_err(|error| DaemonError::helper(format!("decode Cleanup response: {error}")))
+    }
+}
+
+fn helper_call_error(operation: &str, error: zbus::Error) -> DaemonError {
+    let authorization_denied = match &error {
+        zbus::Error::MethodError(name, _, _) => {
+            name.as_str() == "org.freedesktop.DBus.Error.AccessDenied"
+        }
+        zbus::Error::FDO(error) => {
+            matches!(error.as_ref(), zbus::fdo::Error::AccessDenied(_))
+        }
+        _ => false,
+    };
+    let message = format!("helper {operation} call: {error}");
+    if authorization_denied {
+        DaemonError::authorization(message)
+    } else {
+        DaemonError::helper(message)
     }
 }
 

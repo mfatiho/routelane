@@ -1,0 +1,29 @@
+{
+  "generation": 7,
+  "profile_id": "default",
+  "lanes": [
+    {
+      "id": "direct",
+      "interface": "enp1s0",
+      "gateway_v4": "192.0.2.1",
+      "gateway_v6": null,
+      "availability": "Available",
+      "table": 20000,
+      "mark": 1380712449,
+      "rule_priority": 10000,
+      "failure_policy": "Inactive"
+    },
+    {
+      "id": "work",
+      "interface": "wg0",
+      "gateway_v4": "10.0.0.1",
+      "gateway_v6": "2001:db8::1",
+      "availability": "Available",
+      "table": 20001,
+      "mark": 1380712450,
+      "rule_priority": 10001,
+      "failure_policy": "Block"
+    }
+  ],
+  "rules": []
+}

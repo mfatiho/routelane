@@ -1,0 +1,11 @@
+[
+  {
+    "dst": "default",
+    "gateway": "192.0.2.1",
+    "dev": "enp1s0",
+    "table": 20000,
+    "protocol": "boot",
+    "scope": "global",
+    "flags": []
+  }
+]

@@ -1,13 +1,15 @@
 use crate::backend::AppliedKernelState;
-use crate::domain::{HealthState, Profile};
+use crate::domain::Profile;
+use crate::health::HealthReport;
 use crate::ipc::{DaemonStatus, IpcError};
 
 #[derive(Debug, Clone)]
 pub struct DaemonState {
     pub desired: Option<Profile>,
     pub applied: Option<AppliedKernelState>,
+    pub applied_profile: Option<Profile>,
     pub generation: u64,
-    pub health: HealthState,
+    pub health: HealthReport,
     pub last_error: Option<IpcError>,
 }
 
@@ -16,8 +18,9 @@ impl DaemonState {
         Self {
             desired,
             applied: None,
+            applied_profile: None,
             generation: 0,
-            health: HealthState::Inactive,
+            health: HealthReport::inactive(),
             last_error: None,
         }
     }
@@ -25,7 +28,7 @@ impl DaemonState {
     pub fn status(&self) -> DaemonStatus {
         DaemonStatus {
             generation: self.generation,
-            health: self.health,
+            health: self.health.clone(),
             desired_profile_id: self.desired.as_ref().map(|profile| profile.id.clone()),
             applied_profile_id: self
                 .applied

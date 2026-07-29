@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use routelane::backend::{
-    ApplyResponse, CleanupResponse, KernelPlan, ResolutionSnapshot, TopologySnapshot,
+    ApplyResponse, CleanupResponse, InspectResponse, KernelPlan, KernelSnapshot,
+    ResolutionSnapshot, SnapshotInput, TopologySnapshot,
 };
 use routelane::daemon::{
     AtomicJsonConfigRepository, ConfigRepository, DaemonError, DaemonService,
@@ -15,6 +16,7 @@ use routelane::daemon::{
 use routelane::domain::{
     HealthState, Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource, RuleTarget,
 };
+use routelane::health::DiagnosticCode;
 use routelane::ipc::{
     read_frame, write_frame, DaemonClient, DaemonEnvelope, DaemonEvent, DaemonRequest,
     DaemonResult, IpcError, UnixSocketServer, IPC_PROTOCOL_VERSION, MAX_FRAME_BYTES,
@@ -47,6 +49,7 @@ struct FakeHelper {
     behavior: Arc<Mutex<HelperBehavior>>,
     applied: Arc<Mutex<Vec<KernelPlan>>>,
     cleanup_calls: Arc<Mutex<usize>>,
+    inspect_calls: Arc<Mutex<usize>>,
 }
 
 #[derive(Clone, Default)]
@@ -55,6 +58,8 @@ enum HelperBehavior {
     Success,
     Fail,
     Mismatch,
+    InspectFail,
+    AuthorizationDenied,
 }
 
 impl FakeHelper {
@@ -68,6 +73,14 @@ impl FakeHelper {
 
     fn succeed(&self) {
         *self.behavior.lock().unwrap() = HelperBehavior::Success;
+    }
+
+    fn fail_inspect(&self) {
+        *self.behavior.lock().unwrap() = HelperBehavior::InspectFail;
+    }
+
+    fn deny_authorization(&self) {
+        *self.behavior.lock().unwrap() = HelperBehavior::AuthorizationDenied;
     }
 }
 
@@ -83,13 +96,52 @@ impl PrivilegedHelperClient for FakeHelper {
                 mismatched.generation += 1;
                 Ok(ApplyResponse::from_plan(&mismatched, vec![]))
             }
+            HelperBehavior::InspectFail => Ok(ApplyResponse::from_plan(plan, vec![])),
+            HelperBehavior::AuthorizationDenied => {
+                Err(DaemonError::authorization("injected authorization denial"))
+            }
         }
+    }
+
+    async fn inspect(&self) -> Result<InspectResponse, DaemonError> {
+        *self.inspect_calls.lock().unwrap() += 1;
+        if matches!(*self.behavior.lock().unwrap(), HelperBehavior::InspectFail) {
+            return Err(DaemonError::helper("injected inspect failure"));
+        }
+        let plan = self.applied.lock().unwrap().last().cloned();
+        let nft = if plan.is_some() {
+            br#"{"nftables":[{"table":{"family":"inet","name":"routelane"}}]}"#.as_slice()
+        } else {
+            br#"{"nftables":[]}"#.as_slice()
+        };
+        let snapshot = KernelSnapshot::parse(SnapshotInput {
+            ipv4_routes: b"[]",
+            ipv6_routes: b"[]",
+            ipv4_rules: b"[]",
+            ipv6_rules: b"[]",
+            nft,
+        })
+        .unwrap();
+        let snapshot = match &plan {
+            Some(plan) => snapshot.with_nft_ownership(plan.generation, plan.content_hash()),
+            None => snapshot,
+        };
+        Ok(InspectResponse {
+            generation: plan.as_ref().map(|plan| plan.generation),
+            plan_hash: plan.as_ref().map(KernelPlan::content_hash),
+            routelane_table_present: plan.is_some(),
+            snapshot,
+            diagnostics: vec![],
+        })
     }
 
     async fn cleanup(&self) -> Result<CleanupResponse, DaemonError> {
         *self.cleanup_calls.lock().unwrap() += 1;
         match self.behavior.lock().unwrap().clone() {
             HelperBehavior::Fail => Err(DaemonError::helper("injected cleanup failure")),
+            HelperBehavior::AuthorizationDenied => {
+                Err(DaemonError::authorization("injected authorization denial"))
+            }
             _ => Ok(CleanupResponse {
                 cleaned: true,
                 diagnostics: vec![],
@@ -189,16 +241,17 @@ async fn apply_profile_returns_generation_and_publishes_event() {
     let event = events.recv().await.unwrap();
 
     assert_eq!(response.generation, 1);
-    assert_eq!(
+    assert!(matches!(
         event,
         DaemonEvent::StateChanged {
             generation: 1,
-            health: HealthState::Healthy,
-        }
-    );
+            health
+        } if health.state == HealthState::Healthy
+    ));
     let state = service.state().await;
     assert_eq!(state.generation, 1);
     assert_eq!(state.applied.unwrap().generation, 1);
+    assert_eq!(state.health.state, HealthState::Healthy);
 }
 
 #[tokio::test]
@@ -218,16 +271,22 @@ async fn failed_apply_keeps_persisted_desired_and_last_successful_generation() {
     assert_eq!(state.desired, Some(changed.clone()));
     assert_eq!(state.generation, 1);
     assert_eq!(state.applied.unwrap().generation, 1);
-    assert_eq!(state.health, HealthState::Degraded);
-    assert_eq!(*config.desired.lock().unwrap(), Some(changed));
+    assert_eq!(state.applied_profile.unwrap().name, "Default");
+    assert_eq!(state.health.state, HealthState::Degraded);
     assert_eq!(
+        state.health.diagnostics[0].code,
+        DiagnosticCode::PolicyApplyRolledBack
+    );
+    assert_eq!(*config.desired.lock().unwrap(), Some(changed));
+    assert!(matches!(
         event,
         DaemonEvent::OperationFailed {
             generation: 1,
-            health: HealthState::Degraded,
-            error: IpcError::new("DAEMON_HELPER_FAILED", "injected apply failure"),
-        }
-    );
+            health,
+            error
+        } if health.state == HealthState::Degraded
+            && error == IpcError::new("DAEMON_HELPER_FAILED", "injected apply failure")
+    ));
 }
 
 #[tokio::test]
@@ -241,7 +300,7 @@ async fn mismatched_helper_response_is_not_committed_as_applied() {
     let state = service.state().await;
     assert_eq!(state.generation, 0);
     assert!(state.applied.is_none());
-    assert_eq!(state.health, HealthState::Failed);
+    assert_eq!(state.health.state, HealthState::Failed);
 }
 
 #[tokio::test]
@@ -258,15 +317,15 @@ async fn invalid_profile_emits_failure_without_persisting_or_advancing_generatio
     assert_eq!(state.generation, 0);
     assert!(state.desired.is_none());
     assert!(state.applied.is_none());
-    assert_eq!(state.health, HealthState::Failed);
+    assert_eq!(state.health.state, HealthState::Failed);
     assert!(config.saves.lock().unwrap().is_empty());
     assert!(matches!(
         events.recv().await.unwrap(),
         DaemonEvent::OperationFailed {
             generation: 0,
-            health: HealthState::Failed,
+            health,
             ..
-        }
+        } if health.state == HealthState::Failed
     ));
 }
 
@@ -300,14 +359,14 @@ async fn deactivate_only_clears_applied_state_after_cleanup_success() {
 
     service.deactivate().await.unwrap_err();
     assert!(service.state().await.applied.is_some());
-    assert_eq!(service.state().await.health, HealthState::Degraded);
+    assert_eq!(service.state().await.health.state, HealthState::Degraded);
 
     helper.succeed();
     service.deactivate().await.unwrap();
     let state = service.state().await;
     assert!(state.applied.is_none());
     assert_eq!(state.generation, 1);
-    assert_eq!(state.health, HealthState::Inactive);
+    assert_eq!(state.health.state, HealthState::Inactive);
 }
 
 #[tokio::test]
@@ -382,7 +441,7 @@ async fn unix_socket_round_trip_uses_secure_permissions() {
         events.recv().await.unwrap(),
         DaemonEvent::StateChanged {
             generation: 1,
-            health: HealthState::Healthy,
+            health: service.state().await.health,
         }
     );
     assert_eq!(
@@ -397,6 +456,42 @@ async fn unix_socket_round_trip_uses_secure_permissions() {
     assert!(socket_metadata.file_type().is_socket());
     assert_eq!(socket_metadata.permissions().mode() & 0o777, 0o600);
     task.abort();
+}
+
+#[tokio::test]
+async fn inspect_failure_keeps_previous_applied_generation_and_reports_rollback() {
+    let (service, helper, _) = service();
+    service.apply_profile(fixture_profile()).await.unwrap();
+    let mut changed = fixture_profile();
+    changed.name = "Changed".to_owned();
+    helper.fail_inspect();
+
+    let error = service.apply_profile(changed).await.unwrap_err();
+
+    assert_eq!(error.code(), "DAEMON_HEALTH_INSPECTION_FAILED");
+    let state = service.state().await;
+    assert_eq!(state.generation, 1);
+    assert_eq!(state.applied.unwrap().generation, 1);
+    assert_eq!(state.health.state, HealthState::Degraded);
+    assert_eq!(
+        state.health.diagnostics[0].code,
+        DiagnosticCode::PolicyApplyRolledBack
+    );
+}
+
+#[tokio::test]
+async fn authorization_denial_reports_needs_authorization_without_replacing_applied_state() {
+    let (service, helper, _) = service();
+    service.apply_profile(fixture_profile()).await.unwrap();
+    helper.deny_authorization();
+
+    let error = service.apply_profile(fixture_profile()).await.unwrap_err();
+
+    assert_eq!(error.code(), "DAEMON_NEEDS_AUTHORIZATION");
+    let state = service.state().await;
+    assert_eq!(state.generation, 1);
+    assert_eq!(state.applied.unwrap().generation, 1);
+    assert_eq!(state.health.state, HealthState::NeedsAuthorization);
 }
 
 #[tokio::test]

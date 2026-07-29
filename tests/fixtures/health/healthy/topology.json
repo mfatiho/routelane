@@ -1,0 +1,12 @@
+{
+  "interfaces": {
+    "enp1s0": {
+      "gateway_v4": "192.0.2.1",
+      "gateway_v6": null
+    },
+    "wg0": {
+      "gateway_v4": "10.0.0.1",
+      "gateway_v6": "2001:db8::1"
+    }
+  }
+}

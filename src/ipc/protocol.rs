@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::backend::PlanHash;
-use crate::domain::{HealthState, Profile, ProfileId, RuleId};
+use crate::domain::{Profile, ProfileId, RuleId};
+use crate::health::HealthReport;
 
 pub const IPC_PROTOCOL_VERSION: u32 = 1;
 
@@ -78,7 +79,7 @@ pub enum DaemonResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub generation: u64,
-    pub health: HealthState,
+    pub health: HealthReport,
     pub desired_profile_id: Option<ProfileId>,
     pub applied_profile_id: Option<ProfileId>,
     pub last_error: Option<IpcError>,
@@ -95,11 +96,11 @@ pub struct ApplyProfileResult {
 pub enum DaemonEvent {
     StateChanged {
         generation: u64,
-        health: HealthState,
+        health: HealthReport,
     },
     OperationFailed {
         generation: u64,
-        health: HealthState,
+        health: HealthReport,
         error: IpcError,
     },
 }

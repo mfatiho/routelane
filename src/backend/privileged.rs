@@ -517,12 +517,20 @@ where
 
     fn inspect(&mut self) -> Result<InspectResponse, PrivilegedError> {
         self.ensure_reconciled()?;
+        self.revalidate_current_ownership()?;
         let captured = capture_snapshot(&mut self.executor)
             .map_err(|error| PrivilegedError::new(error.to_string()))?;
+        let snapshot = match self.current.as_ref() {
+            Some(current) => captured
+                .snapshot
+                .with_nft_ownership(current.generation, current.plan_hash),
+            None => captured.snapshot,
+        };
         Ok(InspectResponse {
             generation: self.current.as_ref().map(|state| state.generation),
             plan_hash: self.current.as_ref().map(|state| state.plan_hash),
-            routelane_table_present: captured.snapshot.has_nft_table("inet", "routelane"),
+            routelane_table_present: snapshot.has_nft_table("inet", "routelane"),
+            snapshot,
             diagnostics: vec![],
         })
     }
@@ -2744,6 +2752,7 @@ pub struct InspectResponse {
     pub generation: Option<u64>,
     pub plan_hash: Option<PlanHash>,
     pub routelane_table_present: bool,
+    pub snapshot: KernelSnapshot,
     pub diagnostics: Vec<String>,
 }
 
@@ -2753,6 +2762,7 @@ impl InspectResponse {
             generation: None,
             plan_hash: None,
             routelane_table_present: false,
+            snapshot: KernelSnapshot::default(),
             diagnostics: vec![],
         }
     }

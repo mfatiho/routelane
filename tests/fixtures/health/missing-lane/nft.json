@@ -1,0 +1,30 @@
+{
+  "nftables": [
+    {
+      "metainfo": {
+        "version": "1.0.9",
+        "release_name": "Old Doc Yak",
+        "json_schema_version": 1
+      }
+    },
+    {
+      "table": {
+        "family": "inet",
+        "name": "routelane",
+        "handle": 7
+      }
+    },
+    {
+      "chain": {
+        "family": "inet",
+        "table": "routelane",
+        "name": "output",
+        "type": "route",
+        "hook": "output",
+        "prio": -150,
+        "policy": "accept",
+        "handle": 8
+      }
+    }
+  ]
+}
