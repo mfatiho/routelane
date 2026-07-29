@@ -6,8 +6,9 @@ mod policy_route;
 mod transaction;
 
 pub use inspect::{
-    build_snapshot_commands, detect_resource_conflicts, KernelSnapshot, ResourceConflict,
-    SnapshotCommands, SnapshotInput, SnapshotParseError, SnapshotSource,
+    build_snapshot_commands, detect_resource_conflicts, detect_resource_conflicts_for_update,
+    KernelSnapshot, ResourceConflict, SnapshotCommands, SnapshotInput, SnapshotParseError,
+    SnapshotSource,
 };
 pub use nftables::{render_ruleset, NftRenderError, TableMode};
 pub use plan::{

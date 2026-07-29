@@ -468,6 +468,22 @@ pub fn detect_resource_conflicts(
     plan: &KernelPlan,
     snapshot: &KernelSnapshot,
 ) -> Result<(), ResourceConflict> {
+    detect_resource_conflicts_with_owner(plan, None, snapshot)
+}
+
+pub fn detect_resource_conflicts_for_update(
+    next: &KernelPlan,
+    current: &KernelPlan,
+    snapshot: &KernelSnapshot,
+) -> Result<(), ResourceConflict> {
+    detect_resource_conflicts_with_owner(next, Some(current), snapshot)
+}
+
+fn detect_resource_conflicts_with_owner(
+    plan: &KernelPlan,
+    current: Option<&KernelPlan>,
+    snapshot: &KernelSnapshot,
+) -> Result<(), ResourceConflict> {
     let lanes = plan
         .lanes
         .iter()
@@ -481,6 +497,7 @@ pub fn detect_resource_conflicts(
                 lane.table,
                 IpAddr::V4(gateway),
                 &lane.interface,
+                current,
             )?;
         }
         if let Some(gateway) = lane.gateway_v6 {
@@ -490,6 +507,7 @@ pub fn detect_resource_conflicts(
                 lane.table,
                 IpAddr::V6(gateway),
                 &lane.interface,
+                current,
             )?;
         }
     }
@@ -502,6 +520,7 @@ pub fn detect_resource_conflicts(
                 lane.rule_priority,
                 lane.table,
                 lane.mark,
+                current,
             )?;
         }
         if lane.gateway_v6.is_some() {
@@ -511,6 +530,7 @@ pub fn detect_resource_conflicts(
                 lane.rule_priority,
                 lane.table,
                 lane.mark,
+                current,
             )?;
         }
     }
@@ -524,7 +544,28 @@ fn check_route(
     table: u32,
     gateway: IpAddr,
     interface: &str,
+    current: Option<&KernelPlan>,
 ) -> Result<(), ResourceConflict> {
+    if let Some(current) = current {
+        if let Some((owned_gateway, owned_interface)) = owned_route(current, family, table)
+            .map_err(|()| ResourceConflict::RoutingTableInUse(table))?
+        {
+            let mut entries = snapshot
+                .routes
+                .iter()
+                .filter(|route| route.family == family && route.table == table);
+            return match (entries.next(), entries.next()) {
+                (None, None) => Ok(()),
+                (Some(route), None)
+                    if route.matches_default(family, table, owned_gateway, &owned_interface) =>
+                {
+                    Ok(())
+                }
+                _ => Err(ResourceConflict::RoutingTableInUse(table)),
+            };
+        }
+    }
+
     let mut entries = snapshot
         .routes
         .iter()
@@ -542,7 +583,28 @@ fn check_rule(
     priority: u32,
     table: u32,
     mark: u32,
+    current: Option<&KernelPlan>,
 ) -> Result<(), ResourceConflict> {
+    if let Some(current) = current {
+        if let Some((owned_table, owned_mark)) = owned_rule(current, family, priority)
+            .map_err(|()| ResourceConflict::RulePriorityInUse(priority))?
+        {
+            let mut entries = snapshot
+                .rules
+                .iter()
+                .filter(|rule| rule.family == family && rule.priority == priority);
+            return match (entries.next(), entries.next()) {
+                (None, None) => Ok(()),
+                (Some(rule), None)
+                    if rule.matches_policy(family, priority, owned_table, owned_mark) =>
+                {
+                    Ok(())
+                }
+                _ => Err(ResourceConflict::RulePriorityInUse(priority)),
+            };
+        }
+    }
+
     let mut entries = snapshot
         .rules
         .iter()
@@ -551,6 +613,49 @@ fn check_rule(
         (None, None) => Ok(()),
         (Some(rule), None) if rule.matches_policy(family, priority, table, mark) => Ok(()),
         _ => Err(ResourceConflict::RulePriorityInUse(priority)),
+    }
+}
+
+fn owned_route(
+    current: &KernelPlan,
+    family: IpFamily,
+    table: u32,
+) -> Result<Option<(IpAddr, String)>, ()> {
+    exactly_one(current.lanes.iter().filter_map(|lane| {
+        if lane.availability != LaneAvailability::Available || lane.table != table {
+            return None;
+        }
+        let gateway = match family {
+            IpFamily::V4 => lane.gateway_v4.map(IpAddr::V4),
+            IpFamily::V6 => lane.gateway_v6.map(IpAddr::V6),
+        }?;
+        Some((gateway, lane.interface.clone()))
+    }))
+}
+
+fn owned_rule(
+    current: &KernelPlan,
+    family: IpFamily,
+    priority: u32,
+) -> Result<Option<(u32, u32)>, ()> {
+    exactly_one(current.lanes.iter().filter_map(|lane| {
+        if lane.availability != LaneAvailability::Available || lane.rule_priority != priority {
+            return None;
+        }
+        let family_is_installed = match family {
+            IpFamily::V4 => lane.gateway_v4.is_some(),
+            IpFamily::V6 => lane.gateway_v6.is_some(),
+        };
+        family_is_installed.then_some((lane.table, lane.mark))
+    }))
+}
+
+fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Result<Option<T>, ()> {
+    let first = values.next();
+    if values.next().is_some() {
+        Err(())
+    } else {
+        Ok(first)
     }
 }
 
