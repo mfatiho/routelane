@@ -5,9 +5,7 @@
 <policyconfig>
 
   <!--
-  RouteLane privileged helper policy.
-
-  routelane-helper is installed under /usr/lib/routelane/ and is executed via pkexec.
+  RouteLane system D-Bus helper policy.
 
   Install:
     sudo mkdir -p /usr/lib/routelane
@@ -20,7 +18,7 @@
   <vendor>RouteLane</vendor>
   <vendor_url>https://github.com/routelane/routelane</vendor_url>
 
-  <action id="io.github.routelane.modify-routing">
+  <action id="io.github.routelane.apply">
     <description>Modify network routing rules</description>
     <description xml:lang="tr">Ağ yönlendirme kurallarını değiştir</description>
     <message>RouteLane needs administrator authentication to modify network routing.</message>
@@ -31,8 +29,6 @@
       <allow_inactive>no</allow_inactive>
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
-
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/routelane/routelane-helper</annotate>
   </action>
 
 </policyconfig>

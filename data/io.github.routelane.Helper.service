@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=io.github.routelane.Helper
+Exec=/usr/lib/routelane/routelane-helper
+User=root
+SystemdService=routelane-helper.service
