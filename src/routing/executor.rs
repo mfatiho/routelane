@@ -39,8 +39,7 @@ impl Executor {
         let request_json =
             serde_json::to_string(&request).context("HelperRequest serileştirme hatası")?;
 
-        let mut child = Command::new("pkexec")
-            .arg(&self.helper_path)
+        let mut child = legacy_helper_command(&self.helper_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -70,6 +69,12 @@ impl Executor {
 
         Ok(())
     }
+}
+
+fn legacy_helper_command(helper_path: &str) -> Command {
+    let mut command = Command::new("pkexec");
+    command.arg(helper_path).arg("--legacy-stdin");
+    command
 }
 
 fn resolve_helper_path() -> String {
@@ -220,7 +225,7 @@ pub fn detect_gateway_v6(interface: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_helper_path_from;
+    use super::{legacy_helper_command, resolve_helper_path_from};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -256,5 +261,22 @@ mod tests {
         });
 
         assert_eq!(result, "/usr/lib/routelane/routelane-helper");
+    }
+
+    #[test]
+    fn transitional_executor_selects_explicit_legacy_stdin_mode() {
+        let command = legacy_helper_command("/usr/lib/routelane/routelane-helper");
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "/usr/lib/routelane/routelane-helper".to_owned(),
+                "--legacy-stdin".to_owned(),
+            ]
+        );
     }
 }

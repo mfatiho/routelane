@@ -46,3 +46,4 @@ ksni = { version = "0.3.5", features = ["blocking"] }
 ipnet = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 blake3 = "1"
+zbus = { version = "5.16", default-features = false, features = ["tokio"] }

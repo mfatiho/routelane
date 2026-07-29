@@ -1,24 +1,122 @@
-// routelane-helper — pkexec tarafından root olarak çalıştırılan ayrıcalıklı yardımcı
+// RouteLane privileged helper.
 //
-// GÜVENLİK İLKELERİ:
-//   1. Başlar başlamaz UID 0 olduğunu doğrular; değilse çıkar.
-//   2. stdin'den gelen JSON'u HelperRequest tipine deserialize eder.
-//   3. Her HelperOp'u katı bir beyaz liste kuralına göre doğrular.
-//   4. Yalnızca sabit tablo numarası (100–199) ve öncelik aralığı
-//      (10000–10999) kabul eder — sabit sınırlar dışındaki değerleri reddeder.
-//   5. Hiçbir şekilde arbitrary shell komutu çalıştırmaz.
-//   6. Sonucu JSON olarak stdout'a yazar; hataları stderr'e basar.
+// No arguments starts the system D-Bus service. The explicit `--legacy-stdin`
+// mode exists only until the GTK caller migrates to the daemon API.
 
 use std::io::{self, Read};
 use std::process::Command;
 
-// Bu dosya ana binary'nin models modülünü paylaşmaz; bağımsız minimaL yapılar kullanır.
-// Amaç: helper'ı mümkün olduğunca küçük ve denetlenebilir tutmak.
-
+use routelane::backend::{
+    PrivilegedService, ServiceError, SystemPolkitAuthorizer, SystemPrivilegedBackend,
+};
 use serde::{Deserialize, Serialize};
 
+const BUS_NAME: &str = "io.github.routelane.Helper";
+const OBJECT_PATH: &str = "/io/github/routelane/Helper";
+
+type HelperCore = PrivilegedService<SystemPolkitAuthorizer, SystemPrivilegedBackend>;
+
+struct DbusHelper {
+    core: HelperCore,
+}
+
+#[zbus::interface(name = "io.github.routelane.Helper1")]
+impl DbusHelper {
+    async fn apply_plan(
+        &self,
+        plan_json: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let response = self
+            .core
+            .apply_plan(header.sender().map(|sender| sender.as_str()), plan_json)
+            .await
+            .map_err(to_fdo_error)?;
+        serialize_response(&response)
+    }
+
+    async fn inspect(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let response = self
+            .core
+            .inspect(header.sender().map(|sender| sender.as_str()))
+            .await
+            .map_err(to_fdo_error)?;
+        serialize_response(&response)
+    }
+
+    async fn cleanup(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let response = self
+            .core
+            .cleanup(header.sender().map(|sender| sender.as_str()))
+            .await
+            .map_err(to_fdo_error)?;
+        serialize_response(&response)
+    }
+}
+
+fn serialize_response(response: &impl Serialize) -> zbus::fdo::Result<String> {
+    serde_json::to_string(response).map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+}
+
+fn to_fdo_error(error: ServiceError) -> zbus::fdo::Error {
+    match error {
+        ServiceError::MissingSender | ServiceError::Authorization(_) => {
+            zbus::fdo::Error::AccessDenied(error.to_string())
+        }
+        ServiceError::PlanTooLarge { .. }
+        | ServiceError::InvalidPlanJson(_)
+        | ServiceError::Validation(_) => zbus::fdo::Error::InvalidArgs(error.to_string()),
+        ServiceError::Backend(_) | ServiceError::StatePoisoned => {
+            zbus::fdo::Error::Failed(error.to_string())
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    if libc_getuid() != 0 {
+        eprintln!("routelane-helper must run as root");
+        std::process::exit(1);
+    }
+
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] => {
+            if let Err(error) = run_dbus_service().await {
+                eprintln!("routelane-helper D-Bus service failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        [argument] if argument == "--legacy-stdin" => legacy_stdin_main(),
+        _ => {
+            eprintln!("usage: routelane-helper [--legacy-stdin]");
+            std::process::exit(2);
+        }
+    }
+}
+
+async fn run_dbus_service() -> zbus::Result<()> {
+    let connection = zbus::Connection::system().await?;
+    let helper = DbusHelper {
+        core: PrivilegedService::new(
+            SystemPolkitAuthorizer::new(connection.clone()),
+            SystemPrivilegedBackend::default(),
+        ),
+    };
+    connection.object_server().at(OBJECT_PATH, helper).await?;
+    connection.request_name(BUS_NAME).await?;
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
-// Paylaşılan IPC tipleri (models.rs'den kopyalanmış — bağımlılık önlemek için)
+// Transitional legacy stdin protocol
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -109,14 +207,7 @@ const TABLE_MAX: u32 = 199;
 const PRIO_MIN: u32 = 10_000;
 const PRIO_MAX: u32 = 10_999;
 
-fn main() {
-    // ── Güvenlik denetimi: root olarak çalışmalıyız ───────────────────────────
-    let uid = libc_getuid();
-    if uid != 0 {
-        eprintln!("HATA: routelane-helper root olarak çalışmalıdır (pkexec ile)");
-        std::process::exit(1);
-    }
-
+fn legacy_stdin_main() {
     // ── stdin'den JSON oku ────────────────────────────────────────────────────
     let mut input = String::new();
     if let Err(e) = io::stdin().read_to_string(&mut input) {
@@ -375,7 +466,7 @@ fn execute_op(op: &HelperOp) -> Result<(), String> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn validate_table(table: u32) -> Result<(), String> {
-    if table < TABLE_MIN || table > TABLE_MAX {
+    if !(TABLE_MIN..=TABLE_MAX).contains(&table) {
         return Err(format!(
             "Tablo {} izin verilen aralık [{},{}] dışında",
             table, TABLE_MIN, TABLE_MAX
@@ -385,7 +476,7 @@ fn validate_table(table: u32) -> Result<(), String> {
 }
 
 fn validate_priority(prio: u32) -> Result<(), String> {
-    if prio < PRIO_MIN || prio > PRIO_MAX {
+    if !(PRIO_MIN..=PRIO_MAX).contains(&prio) {
         return Err(format!(
             "Öncelik {} izin verilen [{},{}] dışında",
             prio, PRIO_MIN, PRIO_MAX
