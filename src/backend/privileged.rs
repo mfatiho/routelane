@@ -31,7 +31,7 @@ const STATE_FILE: &str = "/run/routelane/applied-plan.json";
 const O_NOFOLLOW: i32 = 0o400000;
 const MAX_LANES: usize = 100;
 const MAX_RULES: usize = 10_000;
-const ROUTING_CRASH_MODEL_VERSION: &str = "exact-command-prefix-v1";
+const ROUTING_CRASH_MODEL_VERSION: &str = "exact-command-prefix-v2";
 
 #[derive(Debug, PartialEq, Eq)]
 struct CommandInvocation<'a> {
@@ -160,6 +160,7 @@ pub struct StoredAppliedState {
 #[serde(deny_unknown_fields)]
 pub struct PendingExpectations {
     pub guard_nft_fingerprint: String,
+    pub guardless_transaction_nft_fingerprint: String,
     pub activated_nft_fingerprint: String,
     pub committed_nft_fingerprint: String,
     pub committed_routing_fingerprint: String,
@@ -592,13 +593,18 @@ where
     }
 
     fn ensure_reconciled(&mut self) -> Result<(), PrivilegedError> {
-        if self.initialized {
-            return Ok(());
-        }
-
-        let Some(record) = self.store.load()? else {
-            self.initialized = true;
-            return Ok(());
+        let record = match self.store.load()? {
+            Some(record)
+                if !self.initialized || record.pending.is_some() || record.cleanup_pending =>
+            {
+                record
+            }
+            Some(_) => return Ok(()),
+            None if self.initialized => return Ok(()),
+            None => {
+                self.initialized = true;
+                return Ok(());
+            }
         };
         validate_stored_plan(record.active.as_ref(), "active")?;
         validate_stored_plan(record.pending.as_ref(), "pending")?;
@@ -1577,6 +1583,9 @@ fn verify_pending_table_ownership(
         (Some(_), Some(expected), Some(live)) if live == expected => PendingNftPhase::Untouched,
         (Some(_), Some(_), None) => PendingNftPhase::RollbackAbsent,
         (_, _, Some(live)) if live == expectations.guard_nft_fingerprint => PendingNftPhase::Guard,
+        (_, _, Some(live)) if live == expectations.guardless_transaction_nft_fingerprint => {
+            PendingNftPhase::GuardlessTransaction
+        }
         (_, _, Some(live)) if live == expectations.activated_nft_fingerprint => {
             PendingNftPhase::Activated
         }
@@ -1601,6 +1610,7 @@ fn verify_pending_table_ownership(
 enum PendingNftPhase {
     Untouched,
     Guard,
+    GuardlessTransaction,
     Activated,
     Committed,
     RollbackAbsent,
@@ -1656,6 +1666,24 @@ fn routing_state_reachable_for_phase(
             .iter()
             .any(|state| state == live));
     }
+    if phase == PendingNftPhase::Committed {
+        let committed = build_forward_routing_states(active, pending, PendingNftPhase::Committed)?;
+        if committed
+            .iter()
+            .any(|state| state == live || rollback_prefix_reaches(state, active, pending, live))
+        {
+            return Ok(true);
+        }
+        let activated = build_forward_routing_states(active, pending, PendingNftPhase::Activated)?;
+        return Ok(activated
+            .iter()
+            .any(|state| state == live || rollback_prefix_reaches(state, active, pending, live)));
+    }
+    let phase = if phase == PendingNftPhase::GuardlessTransaction {
+        PendingNftPhase::Guard
+    } else {
+        phase
+    };
     let starting_states = build_forward_routing_states(active, pending, phase)?;
     Ok(starting_states
         .iter()
@@ -1763,7 +1791,9 @@ fn build_forward_routing_states(
     match phase {
         PendingNftPhase::Activated => Ok(activated_states),
         PendingNftPhase::Committed => Ok(vec![committed_state]),
-        PendingNftPhase::Untouched | PendingNftPhase::Guard => unreachable!(),
+        PendingNftPhase::Untouched
+        | PendingNftPhase::Guard
+        | PendingNftPhase::GuardlessTransaction => unreachable!(),
         PendingNftPhase::RollbackAbsent => Err(PrivilegedError::new(
             "rollback-without-nft routing states use the restore-prefix model",
         )),
@@ -2113,6 +2143,9 @@ fn build_pending_expectations(
     let guard_nft_fingerprint =
         nft_document_fingerprint(&expected_nft_document(active, Some(pending), true))
             .map_err(|error| PrivilegedError::new(error.to_string()))?;
+    let guardless_transaction_nft_fingerprint =
+        nft_document_fingerprint(&expected_nft_document(active, Some(pending), false))
+            .map_err(|error| PrivilegedError::new(error.to_string()))?;
     let activated_nft_fingerprint =
         nft_document_fingerprint(&expected_nft_document(Some(pending), None, true))
             .map_err(|error| PrivilegedError::new(error.to_string()))?;
@@ -2124,6 +2157,7 @@ fn build_pending_expectations(
     let routing_model_fingerprint = routing_model_fingerprint(active, pending)?;
     Ok(PendingExpectations {
         guard_nft_fingerprint,
+        guardless_transaction_nft_fingerprint,
         activated_nft_fingerprint,
         committed_nft_fingerprint,
         committed_routing_fingerprint,
@@ -3565,6 +3599,180 @@ mod tests {
     }
 
     #[test]
+    fn restarted_backend_recovers_exact_guardless_transaction_after_failed_rollback() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState {
+            fail_activation: true,
+            fail_rollback: true,
+            ..FakeKernelState::default()
+        }));
+        let store = FakeAppliedStateStore::default();
+        let plan = fixture_valid_plan();
+        {
+            let mut backend = CommandPrivilegedBackend::with_store(
+                FakeCommandExecutor {
+                    state: Arc::clone(&kernel),
+                },
+                store.clone(),
+            );
+            backend.apply(&plan).unwrap_err();
+        }
+        {
+            let mut kernel = kernel.lock().unwrap();
+            assert!(kernel.has_table);
+            assert!(!kernel.has_guard);
+            assert!(kernel.transaction_marker.is_some());
+            kernel.fail_activation = false;
+            kernel.fail_rollback = false;
+        }
+
+        let mut restarted = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        let inspection = restarted.inspect().unwrap();
+
+        assert_eq!(inspection.generation, None);
+        assert!(!inspection.routelane_table_present);
+        assert!(store.state.lock().unwrap().is_none());
+        let kernel = kernel.lock().unwrap();
+        assert!(!kernel.has_table);
+        assert!(kernel.transaction_marker.is_none());
+    }
+
+    #[test]
+    fn same_process_cleanup_reconciles_exact_guardless_transaction_before_clearing_journal() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState {
+            fail_activation: true,
+            fail_rollback: true,
+            ..FakeKernelState::default()
+        }));
+        let store = FakeAppliedStateStore::default();
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        backend.apply(&fixture_valid_plan()).unwrap_err();
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.fail_activation = false;
+            kernel.fail_rollback = false;
+        }
+
+        let response = backend.cleanup().unwrap();
+
+        assert!(!response.cleaned);
+        assert!(store.state.lock().unwrap().is_none());
+        let kernel = kernel.lock().unwrap();
+        assert!(!kernel.has_table);
+        assert!(kernel.transaction_marker.is_none());
+    }
+
+    #[test]
+    fn same_process_cleanup_rejects_inexact_failed_rollback_without_clearing_journal() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState {
+            fail_activation: true,
+            fail_rollback: true,
+            ..FakeKernelState::default()
+        }));
+        let store = FakeAppliedStateStore::default();
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        backend.apply(&fixture_valid_plan()).unwrap_err();
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.fail_activation = false;
+            kernel.fail_rollback = false;
+            kernel.extra_nft_rule = true;
+        }
+        let journal_before = store.state.lock().unwrap().clone();
+        let mutations_before = mutation_count(&kernel.lock().unwrap());
+
+        let error = backend.cleanup().unwrap_err();
+
+        assert!(error.to_string().contains("pending"));
+        assert_eq!(*store.state.lock().unwrap(), journal_before);
+        let kernel = kernel.lock().unwrap();
+        assert_eq!(mutation_count(&kernel), mutations_before);
+        assert!(kernel.has_table);
+        assert!(kernel.extra_nft_rule);
+    }
+
+    #[test]
+    fn same_process_apply_checks_inexact_pending_journal_before_preflight() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState {
+            fail_activation: true,
+            fail_rollback: true,
+            ..FakeKernelState::default()
+        }));
+        let store = FakeAppliedStateStore::default();
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        let mut next = fixture_valid_plan();
+        backend.apply(&next).unwrap_err();
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.fail_activation = false;
+            kernel.fail_rollback = false;
+            kernel.extra_nft_rule = true;
+        }
+        let journal_before = store.state.lock().unwrap().clone();
+        let mutations_before = mutation_count(&kernel.lock().unwrap());
+        next.generation = 2;
+
+        let error = backend.apply(&next).unwrap_err();
+
+        assert!(error.to_string().contains("pending"));
+        assert_eq!(*store.state.lock().unwrap(), journal_before);
+        let kernel = kernel.lock().unwrap();
+        assert_eq!(mutation_count(&kernel), mutations_before);
+        assert!(kernel.has_table);
+        assert!(kernel.extra_nft_rule);
+    }
+
+    #[test]
+    fn same_process_inspect_rejects_inexact_pending_journal_without_mutation() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState {
+            fail_activation: true,
+            fail_rollback: true,
+            ..FakeKernelState::default()
+        }));
+        let store = FakeAppliedStateStore::default();
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        backend.apply(&fixture_valid_plan()).unwrap_err();
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.fail_activation = false;
+            kernel.fail_rollback = false;
+            kernel.extra_nft_rule = true;
+        }
+        let journal_before = store.state.lock().unwrap().clone();
+        let mutations_before = mutation_count(&kernel.lock().unwrap());
+
+        let error = backend.inspect().unwrap_err();
+
+        assert!(error.to_string().contains("pending"));
+        assert_eq!(*store.state.lock().unwrap(), journal_before);
+        assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
+    }
+
+    #[test]
     fn higher_generation_reuses_identical_policy_rule_without_deleting_it() {
         let state = Arc::new(Mutex::new(FakeKernelState::default()));
         let executor = FakeCommandExecutor {
@@ -3658,6 +3866,56 @@ mod tests {
             None,
             &pending,
             super::PendingNftPhase::Guard,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn committed_nft_phase_accepts_exact_activated_guard_cleanup_prefix() {
+        let active = fixture_valid_plan();
+        let mut pending = fixture_valid_plan();
+        pending.generation = 2;
+        pending.lanes = vec![fixture_lane("work", 1)];
+        let live = super::RoutingOwnership {
+            routes: [
+                super::RouteOwnership {
+                    family: 4,
+                    table: 20_000,
+                    gateway: "10.0.0.1".to_owned(),
+                    interface: "wg0".to_owned(),
+                },
+                super::RouteOwnership {
+                    family: 4,
+                    table: 20_001,
+                    gateway: "10.0.1.1".to_owned(),
+                    interface: "wg1".to_owned(),
+                },
+            ]
+            .into_iter()
+            .collect(),
+            rules: [
+                super::RuleOwnership {
+                    family: 4,
+                    priority: 10_000,
+                    table: 20_000,
+                    mark: 0x524c0001,
+                },
+                super::RuleOwnership {
+                    family: 4,
+                    priority: 10_001,
+                    table: 20_001,
+                    mark: 0x524c0002,
+                },
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        assert!(super::routing_state_reachable_for_phase(
+            &live,
+            Some(&active),
+            &pending,
+            super::PendingNftPhase::Committed,
         )
         .unwrap());
     }
