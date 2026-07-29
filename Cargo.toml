@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "routelane-helper"
 path = "src/bin/routelane_helper.rs"
 
+[[bin]]
+name = "routelane-daemon"
+path = "src/bin/routelane_daemon.rs"
+
 [dependencies]
 # Ubuntu 22.04: libgtk-4-dev (4.6.9) + libadwaita-1-dev (1.1.7)
 #
@@ -32,6 +36,8 @@ glib       = "0.16"
 
 # Async runtime (GTK main loop'tan bağımsız)
 tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+libc = "0.2"
 
 # GTK ↔ Tokio köprüsü — glib MainContext'ten await edilebilir MPMC kanal
 async-channel = "1"
@@ -47,3 +53,6 @@ ipnet = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 blake3 = "1"
 zbus = { version = "5.16", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+tempfile = "3"
