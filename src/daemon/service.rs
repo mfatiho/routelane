@@ -14,11 +14,14 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::backend::{
     compile_profile, AppliedKernelState, ApplyResponse, CleanupResponse, InspectResponse,
-    KernelPlan, ResolutionSnapshot, TopologySnapshot,
+    KernelPlan, ResolutionSnapshot, RestoreResponse, TopologySnapshot,
 };
 use crate::domain::{validate_profile, HealthState, Profile, ProfileId, RuleId, RuleTarget};
 use crate::exact_domain_resolver::resolve_domain;
-use crate::health::{evaluate_health, Diagnostic, DiagnosticCode, HealthReport};
+use crate::health::{
+    evaluate_health, Diagnostic, DiagnosticCode, DiagnosticSubject, HealthReport, Severity,
+    SuggestedAction,
+};
 use crate::ipc::{
     ApplyProfileResult, DaemonEnvelope, DaemonEvent, DaemonRequest, DaemonResponse, DaemonResult,
     IpcError, IPC_PROTOCOL_VERSION,
@@ -111,6 +114,11 @@ pub trait ResolutionProvider: Send + Sync {
 #[async_trait]
 pub trait PrivilegedHelperClient: Send + Sync {
     async fn apply(&self, plan: &KernelPlan) -> Result<ApplyResponse, DaemonError>;
+    async fn restore(
+        &self,
+        failed_candidate: &KernelPlan,
+        previous: Option<&KernelPlan>,
+    ) -> Result<RestoreResponse, DaemonError>;
     async fn inspect(&self) -> Result<InspectResponse, DaemonError>;
     async fn cleanup(&self) -> Result<CleanupResponse, DaemonError>;
 }
@@ -241,11 +249,14 @@ where
             return Err(error);
         }
 
-        let candidate_generation = {
+        let (candidate_generation, previous_plan) = {
             let mut state = self.state.lock().await;
             state.desired = Some(profile.clone());
             state.health = HealthReport::applying();
-            state.generation + 1
+            (
+                state.generation + 1,
+                state.applied.as_ref().map(|applied| applied.plan().clone()),
+            )
         };
         let topology = match self.topology.snapshot(&profile).await {
             Ok(snapshot) => snapshot,
@@ -281,7 +292,9 @@ where
                 "DAEMON_HELPER_RESPONSE_MISMATCH",
                 "privileged helper response did not match the requested generation and plan hash",
             );
-            self.record_failure(error.clone()).await;
+            self.restore_failed_candidate(&plan, previous_plan.as_ref())
+                .await?;
+            self.record_rolled_back_failure(error.clone()).await;
             return Err(error);
         }
 
@@ -292,6 +305,8 @@ where
                     "DAEMON_HEALTH_VERIFICATION_FAILED",
                     "live kernel state did not match the applied plan",
                 );
+                self.restore_failed_candidate(&plan, previous_plan.as_ref())
+                    .await?;
                 self.record_verification_failure(error.clone(), report)
                     .await;
                 return Err(error);
@@ -305,7 +320,9 @@ where
                         format!("could not inspect live kernel health: {}", error.message()),
                     )
                 };
-                self.record_failure(error.clone()).await;
+                self.restore_failed_candidate(&plan, previous_plan.as_ref())
+                    .await?;
+                self.record_rolled_back_failure(error.clone()).await;
                 return Err(error);
             }
         };
@@ -389,17 +406,92 @@ where
             } else {
                 HealthState::Failed
             };
+            let health = HealthReport::from_parts(health_state, Default::default(), vec![]);
+            state.health = health.clone();
+            state.last_error = Some(ipc_error.clone());
+            (state.generation, health)
+        };
+        let _ = self.events.send(DaemonEvent::OperationFailed {
+            generation,
+            health,
+            error: ipc_error,
+        });
+    }
+
+    async fn record_rolled_back_failure(&self, error: DaemonError) {
+        let ipc_error = IpcError::from(error.clone());
+        let (generation, health) = {
+            let mut state = self.state.lock().await;
+            let health_state = if error.code == "DAEMON_NEEDS_AUTHORIZATION" {
+                HealthState::NeedsAuthorization
+            } else if state.applied.is_some() {
+                HealthState::Degraded
+            } else {
+                HealthState::Failed
+            };
             let health = HealthReport::failure(
                 health_state,
                 DiagnosticCode::PolicyApplyRolledBack,
-                "active-policy",
-                "RouteLane could not complete the policy operation",
+                DiagnosticSubject::Policy,
+                "RouteLane restored the previous policy",
                 format!("{}: {}", error.code, error.message),
-                if health_state == HealthState::NeedsAuthorization {
-                    "Authorize the RouteLane privileged helper and retry."
-                } else {
-                    "Review the technical detail and retry the operation."
-                },
+                Some(SuggestedAction::new(
+                    "Review the technical detail and retry the operation.",
+                )),
+            );
+            state.health = health.clone();
+            state.last_error = Some(ipc_error.clone());
+            (state.generation, health)
+        };
+        let _ = self.events.send(DaemonEvent::OperationFailed {
+            generation,
+            health,
+            error: ipc_error,
+        });
+    }
+
+    async fn restore_failed_candidate(
+        &self,
+        failed_candidate: &KernelPlan,
+        previous: Option<&KernelPlan>,
+    ) -> Result<(), DaemonError> {
+        let restored = match self.helper.restore(failed_candidate, previous).await {
+            Ok(restored) => restored,
+            Err(error) => {
+                let error = DaemonError::new(
+                    "DAEMON_KERNEL_ROLLBACK_FAILED",
+                    format!("failed to restore kernel state after health check: {error}"),
+                );
+                self.record_kernel_restore_failure(error.clone()).await;
+                return Err(error);
+            }
+        };
+        if restored.generation != previous.map(|plan| plan.generation)
+            || restored.plan_hash != previous.map(KernelPlan::content_hash)
+        {
+            let error = DaemonError::new(
+                "DAEMON_KERNEL_ROLLBACK_FAILED",
+                "privileged helper restore response did not match the previous plan",
+            );
+            self.record_kernel_restore_failure(error.clone()).await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn record_kernel_restore_failure(&self, error: DaemonError) {
+        let ipc_error = IpcError::from(error);
+        let (generation, health) = {
+            let mut state = self.state.lock().await;
+            let health = HealthReport::failure(
+                HealthState::Failed,
+                DiagnosticCode::RoutingResourceConflict,
+                DiagnosticSubject::Policy,
+                "RouteLane could not restore the previous kernel policy",
+                ipc_error.message.clone(),
+                Some(SuggestedAction::new(
+                    "Stop policy changes and inspect privileged helper state.",
+                )),
             );
             state.health = health.clone();
             state.last_error = Some(ipc_error.clone());
@@ -426,9 +518,15 @@ where
                 DiagnosticCode::PolicyApplyRolledBack,
                 "Applied policy failed live verification",
                 ipc_error.message.clone(),
-                health_state,
-                "active-policy",
-                "Reapply the profile after resolving the reported health diagnostics.",
+                if health_state == HealthState::Failed {
+                    Severity::Error
+                } else {
+                    Severity::Warning
+                },
+                DiagnosticSubject::Policy,
+                Some(SuggestedAction::new(
+                    "Reapply the profile after resolving the reported health diagnostics.",
+                )),
             ));
             report = HealthReport::from_parts(report.state, report.lanes, report.diagnostics);
             state.health = report.clone();
@@ -476,21 +574,23 @@ where
                     };
                     HealthReport::failure(
                         state,
-                        DiagnosticCode::PolicyApplyRolledBack,
-                        "health-inspection",
+                        DiagnosticCode::NftablesFeatureMissing,
+                        DiagnosticSubject::HealthInspection,
                         "RouteLane could not inspect live policy health",
                         error.to_string(),
-                        "Authorize or restore the privileged helper, then retry.",
+                        Some(SuggestedAction::new(
+                            "Authorize or restore the privileged helper, then retry.",
+                        )),
                     )
                 }
             },
             (None, Some(_)) => HealthReport::failure(
                 HealthState::Failed,
-                DiagnosticCode::PolicyApplyRolledBack,
-                "health-inspection",
+                DiagnosticCode::RoutingResourceConflict,
+                DiagnosticSubject::HealthInspection,
                 "Applied policy has no corresponding profile",
                 "daemon state is missing the profile required for topology inspection",
-                "Reapply a saved profile.",
+                Some(SuggestedAction::new("Reapply a saved profile.")),
             ),
         };
         let mut status = base.status();
@@ -633,6 +733,30 @@ impl PrivilegedHelperClient for SystemPrivilegedHelperClient {
             .map_err(|error| helper_call_error("ApplyPlan", error))?;
         serde_json::from_str(&response_json)
             .map_err(|error| DaemonError::helper(format!("decode ApplyPlan response: {error}")))
+    }
+
+    async fn restore(
+        &self,
+        failed_candidate: &KernelPlan,
+        previous: Option<&KernelPlan>,
+    ) -> Result<RestoreResponse, DaemonError> {
+        let failed_candidate_json = serde_json::to_string(failed_candidate)
+            .map_err(|error| DaemonError::helper(format!("encode failed candidate: {error}")))?;
+        let previous_json = previous
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| DaemonError::helper(format!("encode previous plan: {error}")))?;
+        let previous_json = previous_json.as_deref().unwrap_or("");
+        let proxy = self.proxy().await?;
+        let response_json: String = proxy
+            .call(
+                "RestorePlan",
+                &(failed_candidate_json.as_str(), previous_json),
+            )
+            .await
+            .map_err(|error| helper_call_error("RestorePlan", error))?;
+        serde_json::from_str(&response_json)
+            .map_err(|error| DaemonError::helper(format!("decode RestorePlan response: {error}")))
     }
 
     async fn inspect(&self) -> Result<InspectResponse, DaemonError> {
