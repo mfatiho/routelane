@@ -1,6 +1,9 @@
 use std::fmt;
 
-use super::{detect_resource_conflicts, KernelPlan, KernelSnapshot, PlanHash, ResourceConflict};
+use super::{
+    detect_resource_conflicts, detect_resource_conflicts_for_update, KernelPlan, KernelSnapshot,
+    PlanHash, ResourceConflict,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedKernelState {
@@ -218,7 +221,11 @@ pub fn apply_plan(
     }
 
     let snapshot = runner.snapshot().map_err(ApplyError::Snapshot)?;
-    detect_resource_conflicts(next, &snapshot).map_err(ApplyError::ResourceConflict)?;
+    match current {
+        Some(current) => detect_resource_conflicts_for_update(next, current.plan(), &snapshot),
+        None => detect_resource_conflicts(next, &snapshot),
+    }
+    .map_err(ApplyError::ResourceConflict)?;
 
     run_mutating_stage(runner, current, ApplyStage::InstallGuard, |runner| {
         runner.install_guard(next)

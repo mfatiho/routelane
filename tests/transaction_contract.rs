@@ -299,16 +299,22 @@ fn fixture_applied_state(generation: u64) -> AppliedKernelState {
     AppliedKernelState::from_plan(&fixture_kernel_plan(generation))
 }
 
-fn conflicting_snapshot() -> KernelSnapshot {
+fn snapshot_with(ipv4_routes: &[u8], ipv4_rules: &[u8]) -> KernelSnapshot {
     KernelSnapshot::parse(SnapshotInput {
-        ipv4_routes:
-            br#"[{"dst":"default","gateway":"192.0.2.1","dev":"eth9","table":20000,"flags":[]}]"#,
+        ipv4_routes,
         ipv6_routes: b"[]",
-        ipv4_rules: b"[]",
+        ipv4_rules,
         ipv6_rules: b"[]",
         nft: br#"{"nftables":[]}"#,
     })
     .unwrap()
+}
+
+fn conflicting_snapshot() -> KernelSnapshot {
+    snapshot_with(
+        br#"[{"dst":"default","gateway":"192.0.2.1","dev":"eth9","table":20000,"flags":[]}]"#,
+        b"[]",
+    )
 }
 
 #[test]
@@ -379,6 +385,78 @@ fn higher_generation_applies_even_when_content_hash_is_unchanged() {
     assert_eq!(runner.route_generations(), BTreeSet::from([5]));
     assert!(!runner.has_temporary_guard());
     assert_eq!(runner.mutation_count(), 5);
+}
+
+#[test]
+fn higher_generation_replaces_exact_owned_route_and_rule_slot() {
+    let old = fixture_applied_state(4);
+    let mut next = fixture_kernel_plan(5);
+    next.lanes[0].interface = "wg1".to_owned();
+    next.lanes[0].gateway_v4 = Some("10.0.0.2".parse().unwrap());
+    next.lanes[0].mark = 0x524c0002;
+    assert_ne!(old.plan_hash, next.content_hash());
+    let mut runner = InMemoryKernel::from_applied(old.clone());
+
+    let applied = apply_plan(&mut runner, Some(&old), &next).unwrap();
+
+    assert_eq!(applied, AppliedKernelState::from_plan(&next));
+    assert_eq!(runner.applied_generation(), Some(5));
+    assert_eq!(runner.kernel_plan_hash(), Some(next.content_hash()));
+    assert_eq!(runner.route_generations(), BTreeSet::from([5]));
+    assert!(!runner.has_temporary_guard());
+    assert_eq!(runner.mutation_count(), 5);
+}
+
+#[test]
+fn foreign_route_alongside_exact_current_owned_route_conflicts_without_mutation() {
+    let old = fixture_applied_state(4);
+    let mut next = fixture_kernel_plan(5);
+    next.lanes[0].gateway_v4 = Some("10.0.0.2".parse().unwrap());
+    let snapshot = snapshot_with(
+        br#"[
+            {"dst":"default","gateway":"10.0.0.1","dev":"wg0","table":20000,"flags":[]},
+            {"dst":"192.0.2.0/24","dev":"wg0","table":20000,"flags":[]}
+        ]"#,
+        br#"[{"priority":10000,"src":"all","fwmark":"0x524c0001","table":20000}]"#,
+    );
+    let mut runner = InMemoryKernel::from_applied(old.clone()).with_snapshot(snapshot);
+
+    let error = apply_plan(&mut runner, Some(&old), &next).unwrap_err();
+
+    assert_eq!(
+        error,
+        ApplyError::ResourceConflict(ResourceConflict::RoutingTableInUse(20_000))
+    );
+    assert_eq!(runner.applied_generation(), Some(4));
+    assert_eq!(runner.kernel_plan_hash(), Some(old.plan_hash));
+    assert_eq!(runner.mutation_count(), 0);
+    assert!(!runner.has_temporary_guard());
+}
+
+#[test]
+fn foreign_rule_alongside_exact_current_owned_rule_conflicts_without_mutation() {
+    let old = fixture_applied_state(4);
+    let mut next = fixture_kernel_plan(5);
+    next.lanes[0].mark = 0x524c0002;
+    let snapshot = snapshot_with(
+        br#"[{"dst":"default","gateway":"10.0.0.1","dev":"wg0","table":20000,"flags":[]}]"#,
+        br#"[
+            {"priority":10000,"src":"all","fwmark":"0x524c0001","table":20000},
+            {"priority":10000,"src":"all","fwmark":"0x0000002a","table":20000}
+        ]"#,
+    );
+    let mut runner = InMemoryKernel::from_applied(old.clone()).with_snapshot(snapshot);
+
+    let error = apply_plan(&mut runner, Some(&old), &next).unwrap_err();
+
+    assert_eq!(
+        error,
+        ApplyError::ResourceConflict(ResourceConflict::RulePriorityInUse(10_000))
+    );
+    assert_eq!(runner.applied_generation(), Some(4));
+    assert_eq!(runner.kernel_plan_hash(), Some(old.plan_hash));
+    assert_eq!(runner.mutation_count(), 0);
+    assert!(!runner.has_temporary_guard());
 }
 
 #[test]
