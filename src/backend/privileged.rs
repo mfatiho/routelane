@@ -155,6 +155,55 @@ pub struct StoredAppliedState {
     pub pending_expectations: Option<PendingExpectations>,
     #[serde(default)]
     pub cleanup_pending: bool,
+    #[serde(default)]
+    restore_receipt: Option<RestoreReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreReceipt {
+    failed_generation: u64,
+    failed_plan_hash: PlanHash,
+    previous_generation: Option<u64>,
+    previous_plan_hash: Option<PlanHash>,
+}
+
+impl RestoreReceipt {
+    fn new(failed_candidate: &KernelPlan, previous: Option<&KernelPlan>) -> Self {
+        Self {
+            failed_generation: failed_candidate.generation,
+            failed_plan_hash: failed_candidate.content_hash(),
+            previous_generation: previous.map(|plan| plan.generation),
+            previous_plan_hash: previous.map(KernelPlan::content_hash),
+        }
+    }
+
+    fn matches_current(&self, current: Option<&AppliedKernelState>) -> bool {
+        match (current, self.previous_generation, self.previous_plan_hash) {
+            (Some(current), Some(generation), Some(hash)) => {
+                current.generation == generation && current.plan_hash == hash
+            }
+            (None, None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn failed_matches(&self, plan: Option<&KernelPlan>) -> bool {
+        plan.is_some_and(|plan| {
+            plan.generation == self.failed_generation
+                && plan.content_hash() == self.failed_plan_hash
+        })
+    }
+
+    fn previous_matches(&self, plan: Option<&KernelPlan>) -> bool {
+        match (plan, self.previous_generation, self.previous_plan_hash) {
+            (Some(plan), Some(generation), Some(hash)) => {
+                plan.generation == generation && plan.content_hash() == hash
+            }
+            (None, None, None) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,13 +218,18 @@ pub struct PendingExpectations {
 }
 
 impl StoredAppliedState {
-    fn committed(active: Option<KernelPlan>, active_nft_fingerprint: Option<String>) -> Self {
+    fn committed(
+        active: Option<KernelPlan>,
+        active_nft_fingerprint: Option<String>,
+        restore_receipt: Option<RestoreReceipt>,
+    ) -> Self {
         Self {
             active,
             active_nft_fingerprint,
             pending: None,
             pending_expectations: None,
             cleanup_pending: false,
+            restore_receipt,
         }
     }
 }
@@ -353,6 +407,7 @@ pub struct CommandPrivilegedBackend<E, S = InMemoryAppliedStateStore> {
     store: S,
     current: Option<AppliedKernelState>,
     current_nft_fingerprint: Option<String>,
+    restore_receipt: Option<RestoreReceipt>,
     initialized: bool,
 }
 
@@ -369,6 +424,7 @@ impl<E, S> CommandPrivilegedBackend<E, S> {
             store,
             current: None,
             current_nft_fingerprint: None,
+            restore_receipt: None,
             initialized: false,
         }
     }
@@ -405,10 +461,18 @@ where
                         plan.generation
                     )));
                 }
+                if self.restore_receipt.is_some() {
+                    persist_committed(
+                        &mut self.store,
+                        self.current.as_ref(),
+                        self.current_nft_fingerprint.as_deref(),
+                    )?;
+                    self.restore_receipt = None;
+                }
                 return Ok(ApplyResponse::from_plan(plan, vec![]));
             }
         }
-        self.transition_to(plan, false)
+        self.transition_to(plan, None)
     }
 
     fn restore(
@@ -418,10 +482,16 @@ where
     ) -> Result<RestoreResponse, PrivilegedError> {
         self.ensure_reconciled()?;
         self.revalidate_current_ownership()?;
+        let receipt = RestoreReceipt::new(failed_candidate, previous);
         if previous.is_some_and(|plan| plan.generation >= failed_candidate.generation) {
             return Err(PrivilegedError::new(
                 "restore target must be older than the failed candidate",
             ));
+        }
+        if self.restore_receipt.as_ref() == Some(&receipt)
+            && receipt.matches_current(self.current.as_ref())
+        {
+            return Ok(RestoreResponse::from_plan(previous));
         }
         let current = self.current.as_ref().ok_or_else(|| {
             PrivilegedError::new("cannot restore because no candidate plan is currently applied")
@@ -435,11 +505,11 @@ where
         }
         match previous {
             Some(plan) => {
-                self.transition_to(plan, true)?;
+                self.transition_to(plan, Some(receipt))?;
                 Ok(RestoreResponse::from_plan(Some(plan)))
             }
             None => {
-                self.cleanup()?;
+                self.cleanup_with_receipt(Some(receipt))?;
                 Ok(RestoreResponse::from_plan(None))
             }
         }
@@ -479,9 +549,25 @@ where
     }
 
     fn cleanup(&mut self) -> Result<CleanupResponse, PrivilegedError> {
+        self.cleanup_with_receipt(None)
+    }
+}
+
+impl<E, S> CommandPrivilegedBackend<E, S>
+where
+    E: CommandExecutor,
+    S: AppliedStateStore,
+{
+    fn cleanup_with_receipt(
+        &mut self,
+        restore_receipt: Option<RestoreReceipt>,
+    ) -> Result<CleanupResponse, PrivilegedError> {
         self.ensure_reconciled()?;
         let Some(current) = self.current.clone() else {
-            self.store.clear()?;
+            if restore_receipt.is_none() {
+                self.store.clear()?;
+                self.restore_receipt = None;
+            }
             return Ok(CleanupResponse {
                 cleaned: false,
                 diagnostics: vec!["no persisted RouteLane ownership to clean".to_owned()],
@@ -500,27 +586,28 @@ where
             pending: None,
             pending_expectations: None,
             cleanup_pending: true,
+            restore_receipt: restore_receipt.clone(),
         })?;
         let mut runner = CommandKernelRunner::new(&mut self.executor, Some(current));
         runner
             .snapshot()
             .and_then(|_| runner.restore(None))
             .map_err(|error| PrivilegedError::new(error.to_string()))?;
-        self.store.clear()?;
+        match restore_receipt.clone() {
+            Some(receipt) => {
+                self.store
+                    .save(&StoredAppliedState::committed(None, None, Some(receipt)))?
+            }
+            None => self.store.clear()?,
+        }
         self.current = None;
         self.current_nft_fingerprint = None;
+        self.restore_receipt = restore_receipt;
         Ok(CleanupResponse {
             cleaned: true,
             diagnostics: vec![],
         })
     }
-}
-
-impl<E, S> CommandPrivilegedBackend<E, S>
-where
-    E: CommandExecutor,
-    S: AppliedStateStore,
-{
     fn ensure_inspection_ready(&mut self) -> Result<(), PrivilegedError> {
         if self.initialized {
             return self.ensure_reconciled();
@@ -537,8 +624,10 @@ where
             record.active.as_ref(),
             record.active_nft_fingerprint.as_deref(),
         )?;
+        validate_restore_receipt(&record)?;
         self.current = record.active.as_ref().map(AppliedKernelState::from_plan);
         self.current_nft_fingerprint = record.active_nft_fingerprint;
+        self.restore_receipt = record.restore_receipt;
         self.initialized = true;
         Ok(())
     }
@@ -546,7 +635,7 @@ where
     fn transition_to(
         &mut self,
         plan: &KernelPlan,
-        restoring: bool,
+        restore_receipt: Option<RestoreReceipt>,
     ) -> Result<ApplyResponse, PrivilegedError> {
         let previous = self.current.clone();
         let previous_nft_fingerprint = self.current_nft_fingerprint.clone();
@@ -559,10 +648,12 @@ where
             pending: Some(plan.clone()),
             pending_expectations: Some(pending_expectations.clone()),
             cleanup_pending: false,
+            restore_receipt: restore_receipt.clone(),
         })?;
+        self.restore_receipt = None;
 
         let mut runner = CommandKernelRunner::new(&mut self.executor, previous.clone());
-        let transition = if restoring {
+        let transition = if restore_receipt.is_some() {
             restore_kernel_plan(
                 &mut runner,
                 previous
@@ -642,10 +733,11 @@ where
             )));
         }
 
-        if let Err(persistence) = persist_committed(
+        if let Err(persistence) = persist_committed_with_receipt(
             &mut self.store,
             Some(&applied),
             Some(&applied_nft_fingerprint),
+            restore_receipt.clone(),
         ) {
             let rollback = runner.restore(previous.as_ref());
             let state_repair = repair_committed_journal_after_rollback(
@@ -664,6 +756,7 @@ where
 
         self.current = Some(applied);
         self.current_nft_fingerprint = Some(applied_nft_fingerprint);
+        self.restore_receipt = restore_receipt;
         Ok(ApplyResponse::from_plan(plan, vec![]))
     }
     fn revalidate_current_ownership(&mut self) -> Result<(), PrivilegedError> {
@@ -713,6 +806,7 @@ where
             record.pending.as_ref(),
             record.pending_expectations.as_ref(),
         )?;
+        validate_restore_receipt(&record)?;
 
         let active = record.active.as_ref().map(AppliedKernelState::from_plan);
         if record.cleanup_pending {
@@ -729,9 +823,16 @@ where
                 .map_err(|error| {
                     PrivilegedError::new(format!("resume persisted cleanup: {error}"))
                 })?;
-            self.store.clear()?;
+            match record.restore_receipt.clone() {
+                Some(receipt) => {
+                    self.store
+                        .save(&StoredAppliedState::committed(None, None, Some(receipt)))?
+                }
+                None => self.store.clear()?,
+            }
             self.current = None;
             self.current_nft_fingerprint = None;
+            self.restore_receipt = record.restore_receipt;
             self.initialized = true;
             return Ok(());
         }
@@ -773,6 +874,7 @@ where
             )?;
             self.current = active;
             self.current_nft_fingerprint = record.active_nft_fingerprint;
+            self.restore_receipt = None;
             self.initialized = true;
             return Ok(());
         }
@@ -793,9 +895,14 @@ where
             }
             self.current = Some(active);
             self.current_nft_fingerprint = Some(expected_nft_fingerprint.to_owned());
+            self.restore_receipt = record.restore_receipt;
         } else {
-            self.store.clear()?;
+            if record.restore_receipt.is_none() {
+                self.store.clear()?;
+            }
+            self.current = None;
             self.current_nft_fingerprint = None;
+            self.restore_receipt = record.restore_receipt;
         }
 
         self.initialized = true;
@@ -851,17 +958,69 @@ fn validate_stored_plan(plan: Option<&KernelPlan>, label: &str) -> Result<(), Pr
         .map(|_| ())
 }
 
+fn validate_restore_receipt(record: &StoredAppliedState) -> Result<(), PrivilegedError> {
+    let Some(receipt) = record.restore_receipt.as_ref() else {
+        return Ok(());
+    };
+    if receipt.previous_generation.is_some() != receipt.previous_plan_hash.is_some() {
+        return Err(PrivilegedError::new(
+            "invalid persisted state: restore receipt previous generation and hash must be paired",
+        ));
+    }
+    if record.cleanup_pending {
+        if record.pending.is_some()
+            || !receipt.failed_matches(record.active.as_ref())
+            || !receipt.previous_matches(None)
+        {
+            return Err(PrivilegedError::new(
+                "invalid persisted state: cleanup restore receipt does not bind the failed candidate to an empty target",
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(pending) = record.pending.as_ref() {
+        if !receipt.failed_matches(record.active.as_ref())
+            || !receipt.previous_matches(Some(pending))
+        {
+            return Err(PrivilegedError::new(
+                "invalid persisted state: pending restore receipt does not bind the failed candidate and previous plan",
+            ));
+        }
+        return Ok(());
+    }
+    if receipt.previous_matches(record.active.as_ref()) {
+        Ok(())
+    } else {
+        Err(PrivilegedError::new(
+            "invalid persisted state: committed restore receipt does not match the restored plan",
+        ))
+    }
+}
+
 fn persist_committed(
     store: &mut impl AppliedStateStore,
     state: Option<&AppliedKernelState>,
     nft_fingerprint: Option<&str>,
 ) -> Result<(), PrivilegedError> {
+    persist_committed_with_receipt(store, state, nft_fingerprint, None)
+}
+
+fn persist_committed_with_receipt(
+    store: &mut impl AppliedStateStore,
+    state: Option<&AppliedKernelState>,
+    nft_fingerprint: Option<&str>,
+    restore_receipt: Option<RestoreReceipt>,
+) -> Result<(), PrivilegedError> {
     match (state, nft_fingerprint) {
         (Some(state), Some(fingerprint)) => store.save(&StoredAppliedState::committed(
             Some(state.plan().clone()),
             Some(fingerprint.to_owned()),
+            restore_receipt,
         )),
-        (None, None) => store.clear(),
+        (None, None) => match restore_receipt {
+            Some(receipt) => store.save(&StoredAppliedState::committed(None, None, Some(receipt))),
+            None => store.clear(),
+        },
         _ => Err(PrivilegedError::new(
             "cannot persist an active plan without its exact nftables fingerprint",
         )),
@@ -3051,8 +3210,9 @@ mod tests {
         render_guarded_ruleset, render_owned_ruleset, render_transaction_ruleset, run_nft_batch,
         validate_privileged_plan, AppliedStateStore, ApplyResponse, AuthorizationError, Authorizer,
         CleanupResponse, CommandExecutor, CommandOutput, CommandPrivilegedBackend, InspectResponse,
-        PrivilegedBackend, PrivilegedError, PrivilegedService, RestoreResponse, ServiceError,
-        StoredAppliedState, ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES, NFT_BINARY,
+        PrivilegedBackend, PrivilegedError, PrivilegedService, RestoreReceipt, RestoreResponse,
+        ServiceError, StoredAppliedState, ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES,
+        NFT_BINARY,
     };
     use crate::backend::{
         CommandSpec, CompiledAction, CompiledRule, CompiledTarget, IpFamily, KernelPlan,
@@ -3720,6 +3880,24 @@ mod tests {
 
         assert_eq!(restored, RestoreResponse::from_plan(Some(&first)));
         assert_eq!(backend.inspect().unwrap().generation, Some(1));
+        drop(backend);
+        let journal_after_restore = store.state.lock().unwrap().clone();
+        let mutations_after_restore = mutation_count(&kernel.lock().unwrap());
+        let mut restarted = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+
+        let retried = restarted.restore(&failed_candidate, Some(&first)).unwrap();
+
+        assert_eq!(retried, RestoreResponse::from_plan(Some(&first)));
+        assert_eq!(*store.state.lock().unwrap(), journal_after_restore);
+        assert_eq!(
+            mutation_count(&kernel.lock().unwrap()),
+            mutations_after_restore
+        );
         {
             let persisted = store.state.lock().unwrap();
             let persisted = persisted.as_ref().unwrap();
@@ -3732,9 +3910,296 @@ mod tests {
         different_next.generation = 2;
         different_next.rules[0].action = CompiledAction::Block;
         assert_eq!(
-            backend.apply(&different_next).unwrap().generation,
+            restarted.apply(&different_next).unwrap().generation,
             different_next.generation
         );
+        assert!(
+            store
+                .state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .restore_receipt
+                .is_none(),
+            "a new apply must invalidate the old restore receipt"
+        );
+        let journal_after_new_apply = store.state.lock().unwrap().clone();
+        let mutations_after_new_apply = mutation_count(&kernel.lock().unwrap());
+        let error = restarted
+            .restore(&failed_candidate, Some(&first))
+            .unwrap_err();
+        assert!(error.to_string().contains("not the failed candidate"));
+        assert_eq!(*store.state.lock().unwrap(), journal_after_new_apply);
+        assert_eq!(
+            mutation_count(&kernel.lock().unwrap()),
+            mutations_after_new_apply
+        );
+    }
+
+    #[test]
+    fn restore_to_empty_retry_uses_exact_receipt_without_kernel_or_journal_mutation() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let failed_candidate = fixture_valid_plan();
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        backend.apply(&failed_candidate).unwrap();
+        assert_eq!(
+            backend.restore(&failed_candidate, None).unwrap(),
+            RestoreResponse::from_plan(None)
+        );
+        drop(backend);
+        let journal_after_restore = store.state.lock().unwrap().clone();
+        let mutations_after_restore = mutation_count(&kernel.lock().unwrap());
+        let mut restarted = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+
+        let retried = restarted.restore(&failed_candidate, None).unwrap();
+
+        assert_eq!(retried, RestoreResponse::from_plan(None));
+        assert_eq!(*store.state.lock().unwrap(), journal_after_restore);
+        assert_eq!(
+            mutation_count(&kernel.lock().unwrap()),
+            mutations_after_restore
+        );
+    }
+
+    #[test]
+    fn cleanup_after_restore_invalidates_the_receipt() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let previous = fixture_valid_plan();
+        let mut failed_candidate = previous.clone();
+        failed_candidate.generation = 2;
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        backend.apply(&previous).unwrap();
+        backend.apply(&failed_candidate).unwrap();
+        backend.restore(&failed_candidate, Some(&previous)).unwrap();
+
+        assert!(backend.cleanup().unwrap().cleaned);
+        assert!(store.state.lock().unwrap().is_none());
+        let mutations_after_cleanup = mutation_count(&kernel.lock().unwrap());
+
+        let error = backend
+            .restore(&failed_candidate, Some(&previous))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no candidate"));
+        assert!(store.state.lock().unwrap().is_none());
+        assert_eq!(
+            mutation_count(&kernel.lock().unwrap()),
+            mutations_after_cleanup
+        );
+    }
+
+    #[test]
+    fn idempotent_apply_after_restore_invalidates_the_receipt() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let previous = fixture_valid_plan();
+        let mut failed_candidate = previous.clone();
+        failed_candidate.generation = 2;
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        backend.apply(&previous).unwrap();
+        backend.apply(&failed_candidate).unwrap();
+        backend.restore(&failed_candidate, Some(&previous)).unwrap();
+        let mutations_after_restore = mutation_count(&kernel.lock().unwrap());
+
+        backend.apply(&previous).unwrap();
+
+        assert!(store
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .restore_receipt
+            .is_none());
+        assert_eq!(
+            mutation_count(&kernel.lock().unwrap()),
+            mutations_after_restore
+        );
+        let journal_after_apply = store.state.lock().unwrap().clone();
+        let error = backend
+            .restore(&failed_candidate, Some(&previous))
+            .unwrap_err();
+        assert!(error.to_string().contains("not the failed candidate"));
+        assert_eq!(*store.state.lock().unwrap(), journal_after_apply);
+        assert_eq!(
+            mutation_count(&kernel.lock().unwrap()),
+            mutations_after_restore
+        );
+    }
+
+    #[test]
+    fn crashed_pending_restore_recovers_candidate_and_clears_uncommitted_receipt() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let previous = fixture_valid_plan();
+        let mut failed_candidate = previous.clone();
+        failed_candidate.generation = 2;
+        {
+            let mut backend = CommandPrivilegedBackend::with_store(
+                FakeCommandExecutor {
+                    state: Arc::clone(&kernel),
+                },
+                store.clone(),
+            );
+            backend.apply(&previous).unwrap();
+            backend.apply(&failed_candidate).unwrap();
+        }
+        {
+            let mut persisted = store.state.lock().unwrap();
+            let active_nft_fingerprint = persisted.as_ref().unwrap().active_nft_fingerprint.clone();
+            *persisted = Some(StoredAppliedState {
+                active: Some(failed_candidate.clone()),
+                active_nft_fingerprint,
+                pending: Some(previous.clone()),
+                pending_expectations: Some(
+                    build_pending_expectations(Some(&failed_candidate), &previous).unwrap(),
+                ),
+                cleanup_pending: false,
+                restore_receipt: Some(RestoreReceipt::new(&failed_candidate, Some(&previous))),
+            });
+        }
+        let mut restarted = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+
+        let inspection = restarted.inspect().unwrap();
+
+        assert_eq!(inspection.generation, Some(failed_candidate.generation));
+        {
+            let persisted = store.state.lock().unwrap();
+            let record = persisted.as_ref().unwrap();
+            assert_eq!(record.active.as_ref(), Some(&failed_candidate));
+            assert!(record.pending.is_none());
+            assert!(record.restore_receipt.is_none());
+        }
+        assert_eq!(
+            restarted
+                .restore(&failed_candidate, Some(&previous))
+                .unwrap(),
+            RestoreResponse::from_plan(Some(&previous))
+        );
+    }
+
+    #[test]
+    fn crashed_cleanup_restore_commits_empty_receipt_for_a_safe_retry() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let failed_candidate = fixture_valid_plan();
+        {
+            let mut backend = CommandPrivilegedBackend::with_store(
+                FakeCommandExecutor {
+                    state: Arc::clone(&kernel),
+                },
+                store.clone(),
+            );
+            backend.apply(&failed_candidate).unwrap();
+        }
+        {
+            let mut persisted = store.state.lock().unwrap();
+            let active_nft_fingerprint = persisted.as_ref().unwrap().active_nft_fingerprint.clone();
+            *persisted = Some(StoredAppliedState {
+                active: Some(failed_candidate.clone()),
+                active_nft_fingerprint,
+                pending: None,
+                pending_expectations: None,
+                cleanup_pending: true,
+                restore_receipt: Some(RestoreReceipt::new(&failed_candidate, None)),
+            });
+        }
+        let mut restarted = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+
+        assert_eq!(restarted.inspect().unwrap().generation, None);
+        let journal_after_recovery = store.state.lock().unwrap().clone();
+        let mutations_after_recovery = mutation_count(&kernel.lock().unwrap());
+        assert_eq!(
+            restarted.restore(&failed_candidate, None).unwrap(),
+            RestoreResponse::from_plan(None)
+        );
+        assert_eq!(*store.state.lock().unwrap(), journal_after_recovery);
+        assert_eq!(
+            mutation_count(&kernel.lock().unwrap()),
+            mutations_after_recovery
+        );
+    }
+
+    #[test]
+    fn mismatched_pending_restore_receipt_is_rejected_without_mutation() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let previous = fixture_valid_plan();
+        let mut failed_candidate = previous.clone();
+        failed_candidate.generation = 2;
+        {
+            let mut backend = CommandPrivilegedBackend::with_store(
+                FakeCommandExecutor {
+                    state: Arc::clone(&kernel),
+                },
+                store.clone(),
+            );
+            backend.apply(&previous).unwrap();
+            backend.apply(&failed_candidate).unwrap();
+        }
+        {
+            let mut persisted = store.state.lock().unwrap();
+            let active_nft_fingerprint = persisted.as_ref().unwrap().active_nft_fingerprint.clone();
+            let mut different_candidate = failed_candidate.clone();
+            different_candidate.rules[0].action = CompiledAction::Block;
+            *persisted = Some(StoredAppliedState {
+                active: Some(failed_candidate.clone()),
+                active_nft_fingerprint,
+                pending: Some(previous.clone()),
+                pending_expectations: Some(
+                    build_pending_expectations(Some(&failed_candidate), &previous).unwrap(),
+                ),
+                cleanup_pending: false,
+                restore_receipt: Some(RestoreReceipt::new(&different_candidate, Some(&previous))),
+            });
+        }
+        let journal_before = store.state.lock().unwrap().clone();
+        let mutations_before = mutation_count(&kernel.lock().unwrap());
+        let mut restarted = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+
+        let error = restarted.inspect().unwrap_err();
+
+        assert!(error.to_string().contains("restore receipt"));
+        assert_eq!(*store.state.lock().unwrap(), journal_before);
+        assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
     }
 
     #[test]
@@ -4149,6 +4614,7 @@ mod tests {
             pending: Some(pending.clone()),
             pending_expectations: Some(expectations),
             cleanup_pending: false,
+            restore_receipt: None,
         };
         assert!(
             serde_json::to_vec(&journal).unwrap().len() < super::MAX_STATE_BYTES as usize,
@@ -4320,6 +4786,7 @@ mod tests {
                     build_pending_expectations(Some(&active), &pending).unwrap(),
                 ),
                 cleanup_pending: false,
+                restore_receipt: None,
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -4380,6 +4847,7 @@ mod tests {
                     build_pending_expectations(Some(&active), &pending).unwrap(),
                 ),
                 cleanup_pending: false,
+                restore_receipt: None,
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -4446,6 +4914,7 @@ mod tests {
                         build_pending_expectations(Some(&active), &pending).unwrap(),
                     ),
                     cleanup_pending: false,
+                    restore_receipt: None,
                 });
             }
             let mut crash_executor = FakeCommandExecutor {
@@ -4509,6 +4978,7 @@ mod tests {
                     build_pending_expectations(Some(&active), &pending).unwrap(),
                 ),
                 cleanup_pending: false,
+                restore_receipt: None,
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -4564,6 +5034,7 @@ mod tests {
                     build_pending_expectations(Some(&active), &pending).unwrap(),
                 ),
                 cleanup_pending: false,
+                restore_receipt: None,
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -4622,6 +5093,7 @@ mod tests {
                     build_pending_expectations(Some(&active), &pending).unwrap(),
                 ),
                 cleanup_pending: false,
+                restore_receipt: None,
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -4813,6 +5285,7 @@ mod tests {
             pending: None,
             pending_expectations: None,
             cleanup_pending: false,
+            restore_receipt: None,
         });
         let mut backend = CommandPrivilegedBackend::with_store(
             FakeCommandExecutor {
