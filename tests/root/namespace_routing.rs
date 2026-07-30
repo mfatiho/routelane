@@ -32,6 +32,10 @@ impl RunNames {
     fn from_env() -> Result<Self, String> {
         let token = env::var("ROUTELANE_TEST_TOKEN")
             .map_err(|_| "ROUTELANE_TEST_TOKEN is required".to_owned())?;
+        Self::from_token(token)
+    }
+
+    fn from_token(token: String) -> Result<Self, String> {
         if token.len() != 6 || !token.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
             return Err(
                 "root integration token must be exactly six ASCII alphanumerics".to_owned(),
@@ -95,6 +99,28 @@ impl RunNames {
         }
         creations
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MainRouteSpec {
+    prefix: &'static str,
+    gateway: &'static str,
+    interface: String,
+}
+
+fn planned_client_main_routes(names: &RunNames) -> Vec<MainRouteSpec> {
+    vec![
+        MainRouteSpec {
+            prefix: "198.18.0.10/32",
+            gateway: "10.10.2.1",
+            interface: names.client_interfaces[1].clone(),
+        },
+        MainRouteSpec {
+            prefix: "192.0.2.99/32",
+            gateway: "10.10.3.1",
+            interface: names.client_interfaces[2].clone(),
+        },
+    ]
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -472,6 +498,19 @@ impl NamespaceHarness {
             "dev",
             &harness.names.client_interfaces[1],
         ]);
+        for route in planned_client_main_routes(&harness.names) {
+            run_ip([
+                "-n",
+                &harness.names.client,
+                "route",
+                "add",
+                route.prefix,
+                "via",
+                route.gateway,
+                "dev",
+                &route.interface,
+            ]);
+        }
         harness
     }
 }
@@ -490,8 +529,7 @@ fn create_lane(lane: usize, names: &RunNames) {
     let gateway_sink_if = &names.gateway_sink_interfaces[lane];
     let sink_if = &names.sink_interfaces[lane];
     let client_address = format!("10.10.{}.2/24", lane + 1);
-    let client_gateway = format!("10.10.{}.1", lane + 1);
-    let gateway_client_address = format!("{client_gateway}/24");
+    let gateway_client_address = format!("10.10.{}.1/24", lane + 1);
     let gateway_sink_address = format!("10.20.{}.1/24", lane + 1);
     let sink_address = format!("10.20.{}.2/24", lane + 1);
     let sink_gateway = format!("10.20.{}.1", lane + 1);
@@ -569,7 +607,6 @@ fn create_lane(lane: usize, names: &RunNames) {
     ]);
     for target in targets {
         run_ip(["-n", &names.sinks[lane], "addr", "add", target, "dev", "lo"]);
-        let target_ip = target.trim_end_matches("/32");
         run_ip([
             "-n",
             &names.gateways[lane],
@@ -581,19 +618,6 @@ fn create_lane(lane: usize, names: &RunNames) {
             "dev",
             gateway_sink_if,
         ]);
-        if target_ip == "198.18.0.10" || target_ip == "192.0.2.99" {
-            run_ip([
-                "-n",
-                &names.client,
-                "route",
-                "add",
-                target,
-                "via",
-                &client_gateway,
-                "dev",
-                client_if,
-            ]);
-        }
     }
 }
 
@@ -959,7 +983,13 @@ fn checked_output(command: &mut Command, context: &str) -> Output {
 
 #[cfg(test)]
 mod ownership_tests {
-    use super::{provision_owned, Creation, KernelObject, ProvisionBackend};
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::{Command, Stdio};
+
+    use super::{
+        planned_client_main_routes, provision_owned, Creation, KernelObject, ProvisionBackend,
+        RunNames,
+    };
 
     #[derive(Default)]
     struct FakeBackend {
@@ -1034,5 +1064,57 @@ mod ownership_tests {
             )]
         );
         assert_eq!(backend.deletes, backend.records);
+    }
+
+    #[test]
+    fn direct_prefix_has_exactly_one_main_route_via_lane_b() {
+        let names = RunNames::from_token("ABC123".to_owned()).unwrap();
+
+        let direct = planned_client_main_routes(&names)
+            .into_iter()
+            .filter(|route| route.prefix == "198.18.0.10/32")
+            .collect::<Vec<_>>();
+
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].gateway, "10.10.2.1");
+        assert_eq!(direct[0].interface, names.client_interfaces[1]);
+    }
+
+    #[test]
+    fn term_cleans_registry_exits_143_and_never_runs_sentinel() {
+        let script = format!(
+            "{}/scripts/run-root-integration.sh",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut child = Command::new("/bin/sh")
+            .arg(script)
+            .env("ROUTELANE_SHELL_SIGNAL_TEST", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn real root integration runner");
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        stdout
+            .read_line(&mut ready)
+            .expect("read signal-test readiness");
+        assert!(
+            ready.starts_with("READY /tmp/routelane-test-registry."),
+            "runner did not enter its real signal-test hook: {ready:?}"
+        );
+        let registry = ready
+            .trim()
+            .strip_prefix("READY ")
+            .expect("ready line includes registry path")
+            .to_owned();
+
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        let status = child.wait().expect("wait for signalled runner");
+        let mut remaining_stdout = String::new();
+        stdout.read_to_string(&mut remaining_stdout).unwrap();
+
+        assert_eq!(status.code(), Some(143));
+        assert!(!std::path::Path::new(&registry).exists());
+        assert!(!remaining_stdout.contains("SENTINEL"));
     }
 }
