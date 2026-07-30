@@ -1,4 +1,4 @@
-use super::{KernelPlan, LaneAvailability};
+use super::{KernelPlan, LaneAvailability, RouteMode};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,31 +61,39 @@ pub fn build_policy_commands(plan: &KernelPlan) -> Vec<CommandSpec> {
     let mut commands = Vec::new();
 
     for lane in &available_lanes {
-        if let Some(gateway) = lane.gateway_v4 {
-            commands.push(CommandSpec::ip4([
+        if let Some(route) = lane.route_v4 {
+            let mut command = vec![
                 "route".to_owned(),
                 "replace".to_owned(),
                 "default".to_owned(),
-                "via".to_owned(),
-                gateway.to_string(),
+            ];
+            if let RouteMode::Via(gateway) = route {
+                command.extend(["via".to_owned(), gateway.to_string()]);
+            }
+            command.extend([
                 "dev".to_owned(),
                 lane.interface.clone(),
                 "table".to_owned(),
                 lane.table.to_string(),
-            ]));
+            ]);
+            commands.push(CommandSpec::ip4(command));
         }
-        if let Some(gateway) = lane.gateway_v6 {
-            commands.push(CommandSpec::ip6([
+        if let Some(route) = lane.route_v6 {
+            let mut command = vec![
                 "route".to_owned(),
                 "replace".to_owned(),
                 "default".to_owned(),
-                "via".to_owned(),
-                gateway.to_string(),
+            ];
+            if let RouteMode::Via(gateway) = route {
+                command.extend(["via".to_owned(), gateway.to_string()]);
+            }
+            command.extend([
                 "dev".to_owned(),
                 lane.interface.clone(),
                 "table".to_owned(),
                 lane.table.to_string(),
-            ]));
+            ]);
+            commands.push(CommandSpec::ip6(command));
         }
     }
 
@@ -102,10 +110,10 @@ pub fn build_policy_commands(plan: &KernelPlan) -> Vec<CommandSpec> {
                 lane.rule_priority.to_string(),
             ]
         };
-        if lane.gateway_v4.is_some() {
+        if lane.route_v4.is_some() {
             commands.push(CommandSpec::ip4(args()));
         }
-        if lane.gateway_v6.is_some() {
+        if lane.route_v6.is_some() {
             commands.push(CommandSpec::ip6(args()));
         }
     }
@@ -120,7 +128,7 @@ mod tests {
     use crate::domain::{LaneFailurePolicy, LaneId, ProfileId};
 
     use super::{build_policy_commands, CommandSpec};
-    use crate::backend::{KernelPlan, LaneAvailability, LanePlan};
+    use crate::backend::{KernelPlan, LaneAvailability, LanePlan, RouteMode};
 
     fn lane(
         id: &str,
@@ -132,8 +140,8 @@ mod tests {
         LanePlan {
             id: LaneId::from(id),
             interface: interface.to_owned(),
-            gateway_v4: gateways.0,
-            gateway_v6: gateways.1,
+            route_v4: gateways.0.map(RouteMode::Via),
+            route_v6: gateways.1.map(RouteMode::Via),
             availability,
             table: resources.0,
             mark: resources.1,
@@ -274,6 +282,47 @@ mod tests {
                     "20001",
                     "priority",
                     "10001",
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_dual_stack_gatewayless_default_routes_and_rules() {
+        let mut gatewayless = lane(
+            "wireguard",
+            "wg0",
+            (None, None),
+            LaneAvailability::Available,
+            (20_000, 0x524c0001, 10_000),
+        );
+        gatewayless.route_v4 = Some(RouteMode::Device);
+        gatewayless.route_v6 = Some(RouteMode::Device);
+
+        assert_eq!(
+            build_policy_commands(&plan(vec![gatewayless])),
+            vec![
+                CommandSpec::ip4(["route", "replace", "default", "dev", "wg0", "table", "20000",]),
+                CommandSpec::ip6(["route", "replace", "default", "dev", "wg0", "table", "20000",]),
+                CommandSpec::ip4([
+                    "rule",
+                    "add",
+                    "fwmark",
+                    "0x524c0001",
+                    "lookup",
+                    "20000",
+                    "priority",
+                    "10000",
+                ]),
+                CommandSpec::ip6([
+                    "rule",
+                    "add",
+                    "fwmark",
+                    "0x524c0001",
+                    "lookup",
+                    "20000",
+                    "priority",
+                    "10000",
                 ]),
             ]
         );

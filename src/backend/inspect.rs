@@ -5,7 +5,8 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CommandSpec, IpFamily, KernelPlan, LaneAvailability, PlanHash, Program, TopologySnapshot,
+    CommandSpec, IpFamily, KernelPlan, LaneAvailability, PlanHash, Program, RouteMode,
+    TopologySnapshot,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -110,11 +111,12 @@ impl KernelSnapshot {
             SnapshotSource::Ipv6Rules,
         )?);
 
+        let topology = topology_from_routes(&routes);
         Ok(Self {
             routes,
             rules,
             nft_tables: parse_nft_tables(input.nft)?,
-            topology: TopologySnapshot::empty(),
+            topology,
             nft_generation: None,
             nft_plan_hash: None,
         })
@@ -140,13 +142,33 @@ impl KernelSnapshot {
         self.topology.interface(interface).is_some()
     }
 
-    pub fn gateway_reachable(&self, interface: &str, gateway: IpAddr) -> bool {
+    pub fn route_reachable(
+        &self,
+        interface: &str,
+        family: IpFamily,
+        gateway: Option<IpAddr>,
+    ) -> bool {
+        if self.routes.iter().any(|route| {
+            route.family == family
+                && route.destination.as_deref() == Some("default")
+                && route.interface.as_deref() == Some(interface)
+                && route.gateway == gateway
+        }) {
+            return true;
+        }
         let Some(topology) = self.topology.interface(interface) else {
             return false;
         };
-        match gateway {
-            IpAddr::V4(address) => topology.gateway_v4 == Some(address),
-            IpAddr::V6(address) => topology.gateway_v6 == Some(address),
+        match (family, gateway) {
+            (IpFamily::V4, Some(IpAddr::V4(address))) => {
+                topology.route_v4 == Some(RouteMode::Via(address))
+            }
+            (IpFamily::V6, Some(IpAddr::V6(address))) => {
+                topology.route_v6 == Some(RouteMode::Via(address))
+            }
+            (IpFamily::V4, None) => topology.route_v4 == Some(RouteMode::Device),
+            (IpFamily::V6, None) => topology.route_v6 == Some(RouteMode::Device),
+            _ => false,
         }
     }
 
@@ -160,7 +182,7 @@ impl KernelSnapshot {
         &self,
         family: IpFamily,
         table: u32,
-        gateway: IpAddr,
+        gateway: Option<IpAddr>,
         interface: &str,
     ) -> ResourceState {
         let mut entries = self
@@ -219,13 +241,13 @@ impl RouteEntry {
         &self,
         family: IpFamily,
         table: u32,
-        gateway: IpAddr,
+        gateway: Option<IpAddr>,
         interface: &str,
     ) -> bool {
         self.family == family
             && self.table == table
             && self.destination.as_deref() == Some("default")
-            && self.gateway == Some(gateway)
+            && self.gateway == gateway
             && self.interface.as_deref() == Some(interface)
             && self
                 .route_type
@@ -240,7 +262,9 @@ impl RouteEntry {
                 .protocol
                 .as_deref()
                 .is_none_or(|protocol| protocol == "boot")
-            && self.scope.as_deref().is_none_or(|scope| scope == "global")
+            && self.scope.as_deref().is_none_or(|scope| {
+                scope == "global" || (self.gateway.is_none() && scope == "link")
+            })
             && self.preferred_source.is_none()
             && self.flags.is_empty()
             && match family {
@@ -252,6 +276,45 @@ impl RouteEntry {
             }
             && self.extra.is_empty()
     }
+}
+
+fn topology_from_routes(routes: &[RouteEntry]) -> TopologySnapshot {
+    let mut evidence = BTreeMap::<
+        String,
+        (
+            Option<RouteMode<std::net::Ipv4Addr>>,
+            Option<RouteMode<std::net::Ipv6Addr>>,
+        ),
+    >::new();
+    for route in routes {
+        if route.destination.as_deref() != Some("default") {
+            continue;
+        }
+        let Some(interface) = route.interface.as_ref() else {
+            continue;
+        };
+        let entry = evidence.entry(interface.clone()).or_default();
+        match (route.family, route.gateway) {
+            (IpFamily::V4, Some(IpAddr::V4(gateway))) => {
+                entry.0 = Some(RouteMode::Via(gateway));
+            }
+            (IpFamily::V6, Some(IpAddr::V6(gateway))) => {
+                entry.1 = Some(RouteMode::Via(gateway));
+            }
+            (IpFamily::V4, None) => {
+                entry.0.get_or_insert(RouteMode::Device);
+            }
+            (IpFamily::V6, None) => {
+                entry.1.get_or_insert(RouteMode::Device);
+            }
+            _ => continue,
+        };
+    }
+    let mut topology = TopologySnapshot::empty();
+    for (interface, (route_v4, route_v6)) in evidence {
+        topology.insert_routes(interface, route_v4, route_v6);
+    }
+    topology
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,22 +639,22 @@ fn detect_resource_conflicts_with_owner(
         .filter(|lane| lane.availability == LaneAvailability::Available);
 
     for lane in lanes.clone() {
-        if let Some(gateway) = lane.gateway_v4 {
+        if let Some(route) = lane.route_v4 {
             check_route(
                 snapshot,
                 IpFamily::V4,
                 lane.table,
-                IpAddr::V4(gateway),
+                route.gateway().copied().map(IpAddr::V4),
                 &lane.interface,
                 current,
             )?;
         }
-        if let Some(gateway) = lane.gateway_v6 {
+        if let Some(route) = lane.route_v6 {
             check_route(
                 snapshot,
                 IpFamily::V6,
                 lane.table,
-                IpAddr::V6(gateway),
+                route.gateway().copied().map(IpAddr::V6),
                 &lane.interface,
                 current,
             )?;
@@ -599,7 +662,7 @@ fn detect_resource_conflicts_with_owner(
     }
 
     for lane in lanes {
-        if lane.gateway_v4.is_some() {
+        if lane.route_v4.is_some() {
             check_rule(
                 snapshot,
                 IpFamily::V4,
@@ -609,7 +672,7 @@ fn detect_resource_conflicts_with_owner(
                 current,
             )?;
         }
-        if lane.gateway_v6.is_some() {
+        if lane.route_v6.is_some() {
             check_rule(
                 snapshot,
                 IpFamily::V6,
@@ -628,7 +691,7 @@ fn check_route(
     snapshot: &KernelSnapshot,
     family: IpFamily,
     table: u32,
-    gateway: IpAddr,
+    gateway: Option<IpAddr>,
     interface: &str,
     current: Option<&KernelPlan>,
 ) -> Result<(), ResourceConflict> {
@@ -706,15 +769,15 @@ fn owned_route(
     current: &KernelPlan,
     family: IpFamily,
     table: u32,
-) -> Result<Option<(IpAddr, String)>, ()> {
+) -> Result<Option<(Option<IpAddr>, String)>, ()> {
     exactly_one(current.lanes.iter().filter_map(|lane| {
         if lane.availability != LaneAvailability::Available || lane.table != table {
             return None;
         }
         let gateway = match family {
-            IpFamily::V4 => lane.gateway_v4.map(IpAddr::V4),
-            IpFamily::V6 => lane.gateway_v6.map(IpAddr::V6),
-        }?;
+            IpFamily::V4 => lane.route_v4?.gateway().copied().map(IpAddr::V4),
+            IpFamily::V6 => lane.route_v6?.gateway().copied().map(IpAddr::V6),
+        };
         Some((gateway, lane.interface.clone()))
     }))
 }
@@ -729,8 +792,8 @@ fn owned_rule(
             return None;
         }
         let family_is_installed = match family {
-            IpFamily::V4 => lane.gateway_v4.is_some(),
-            IpFamily::V6 => lane.gateway_v6.is_some(),
+            IpFamily::V4 => lane.route_v4.is_some(),
+            IpFamily::V6 => lane.route_v6.is_some(),
         };
         family_is_installed.then_some((lane.table, lane.mark))
     }))
@@ -749,7 +812,8 @@ fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Result<Option<T>, ()> 
 mod tests {
     use crate::backend::{
         build_snapshot_commands, detect_resource_conflicts, CommandSpec, IpFamily, KernelPlan,
-        LaneAvailability, LanePlan, Program, ResourceConflict, SnapshotInput, SnapshotSource,
+        LaneAvailability, LanePlan, Program, ResourceConflict, RouteMode, SnapshotInput,
+        SnapshotSource,
     };
     use crate::domain::{LaneFailurePolicy, LaneId, ProfileId};
 
@@ -765,8 +829,8 @@ mod tests {
             lanes: vec![LanePlan {
                 id: LaneId::from("work"),
                 interface: "wg0".to_owned(),
-                gateway_v4: Some("10.0.0.1".parse().unwrap()),
-                gateway_v6: Some("2001:db8::1".parse().unwrap()),
+                route_v4: Some(RouteMode::Via("10.0.0.1".parse().unwrap())),
+                route_v6: Some(RouteMode::Via("2001:db8::1".parse().unwrap())),
                 availability: LaneAvailability::Available,
                 table: 20_000,
                 mark: 0x524c0001,

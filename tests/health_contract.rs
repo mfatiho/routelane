@@ -2,9 +2,10 @@ use std::fs;
 use std::path::Path;
 
 use routelane::backend::{
-    KernelPlan, KernelSnapshot, LaneAvailability, SnapshotInput, TopologySnapshot,
+    KernelPlan, KernelSnapshot, LaneAvailability, LanePlan, RouteMode, SnapshotInput,
+    TopologySnapshot,
 };
-use routelane::domain::{HealthState, LaneId};
+use routelane::domain::{HealthState, LaneFailurePolicy, LaneId, ProfileId};
 use routelane::health::{
     aggregate_health, evaluate_health, DiagnosticCode, DiagnosticSubject, Severity,
 };
@@ -79,6 +80,76 @@ fn reports_healthy_when_table_rules_routes_and_interfaces_match() {
         .lanes
         .values()
         .all(|state| *state == HealthState::Healthy));
+}
+
+fn gatewayless_plan() -> KernelPlan {
+    KernelPlan {
+        generation: 9,
+        profile_id: ProfileId::from("wireguard"),
+        lanes: vec![LanePlan {
+            id: LaneId::from("work"),
+            interface: "wg0".to_owned(),
+            route_v4: Some(RouteMode::Device),
+            route_v6: None,
+            availability: LaneAvailability::Available,
+            table: 20_000,
+            mark: 0x524c0001,
+            rule_priority: 10_000,
+            failure_policy: LaneFailurePolicy::Inactive,
+        }],
+        rules: vec![],
+    }
+}
+
+#[test]
+fn gatewayless_default_device_route_is_healthy_without_gateway_diagnostic() {
+    let plan = gatewayless_plan();
+    let snapshot = KernelSnapshot::parse(SnapshotInput {
+        ipv4_routes: br#"[
+            {"dst":"default","dev":"wg0","table":20000,"scope":"link","flags":[]},
+            {"dst":"default","gateway":"10.0.0.1","dev":"wg0","table":254,"flags":[]}
+        ]"#,
+        ipv6_routes: b"[]",
+        ipv4_rules: br#"[{"priority":10000,"src":"all","fwmark":"0x524c0001","table":20000}]"#,
+        ipv6_rules: b"[]",
+        nft: br#"{"nftables":[{"table":{"family":"inet","name":"routelane"}}]}"#,
+    })
+    .unwrap()
+    .with_nft_ownership(plan.generation, plan.content_hash());
+
+    let report = evaluate_health(Some(&plan), &snapshot);
+
+    assert_eq!(report.state, HealthState::Healthy);
+    assert!(report.diagnostics.is_empty());
+}
+
+#[test]
+fn missing_managed_gatewayless_route_is_degraded_not_gateway_unreachable() {
+    let plan = gatewayless_plan();
+    let mut topology = TopologySnapshot::empty();
+    topology.insert_routes("wg0", Some(RouteMode::Device), None);
+    let snapshot = KernelSnapshot::parse(SnapshotInput {
+        ipv4_routes: b"[]",
+        ipv6_routes: b"[]",
+        ipv4_rules: br#"[{"priority":10000,"src":"all","fwmark":"0x524c0001","table":20000}]"#,
+        ipv6_rules: b"[]",
+        nft: br#"{"nftables":[{"table":{"family":"inet","name":"routelane"}}]}"#,
+    })
+    .unwrap()
+    .with_topology(&topology)
+    .with_nft_ownership(plan.generation, plan.content_hash());
+
+    let report = evaluate_health(Some(&plan), &snapshot);
+
+    assert_eq!(report.state, HealthState::Degraded);
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == DiagnosticCode::RoutingResourceConflict));
+    assert!(report
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.code != DiagnosticCode::LaneGatewayUnreachable));
 }
 
 #[test]
@@ -190,8 +261,8 @@ fn unavailable_lane_stays_degraded_when_its_interface_later_appears() {
 fn available_lane_without_a_supported_gateway_is_degraded() {
     let path = "tests/fixtures/health/healthy";
     let mut plan = fixture_plan(&format!("{path}/plan.json"));
-    plan.lanes[1].gateway_v4 = None;
-    plan.lanes[1].gateway_v6 = None;
+    plan.lanes[1].route_v4 = None;
+    plan.lanes[1].route_v6 = None;
     let snapshot = fixture_snapshot(path, &plan);
 
     let report = evaluate_health(Some(&plan), &snapshot);

@@ -108,21 +108,19 @@ fn reconcile_profiles(
         return;
     }
     canonical.sort_by(|left, right| left.id.cmp(&right.id));
-    let previous_selected_id = selected.id.clone();
-    let selection = canonical
+    let selected_replacement = canonical
         .iter()
         .find(|profile| profile.id == selected.id)
-        .cloned()
-        .unwrap_or_else(|| canonical[0].clone());
+        .cloned();
     for profile in canonical {
         store_profile(document, profile);
     }
-    if selection.id != previous_selected_id {
-        document
-            .profiles
-            .retain(|profile| profile.id != previous_selected_id);
+    document
+        .profiles
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    if let Some(replacement) = selected_replacement {
+        *selected = replacement;
     }
-    *selected = selection;
 }
 
 fn switch_state_after_persistence_failure(applied_profile_id: Option<&ProfileId>) -> bool {
@@ -1187,8 +1185,8 @@ mod tests {
         selected.id = ProfileId::from("missing");
         document.profiles.push(selected.clone());
         reconcile_profiles(&mut document, &mut selected, vec![matching, alpha.clone()]);
-        assert_eq!(selected, alpha);
-        assert!(!document
+        assert_eq!(selected.id, ProfileId::from("missing"));
+        assert!(document
             .profiles
             .iter()
             .any(|profile| profile.id == ProfileId::from("missing")));
@@ -1196,6 +1194,46 @@ mod tests {
         let unchanged = selected.clone();
         reconcile_profiles(&mut document, &mut selected, vec![]);
         assert_eq!(selected, unchanged);
+    }
+
+    #[test]
+    fn partial_daemon_profile_snapshot_merges_without_deleting_local_profiles() {
+        let mut alpha = super::empty_default_profile();
+        alpha.id = ProfileId::from("alpha");
+        alpha.name = "Alpha local".to_owned();
+        let mut beta = super::empty_default_profile();
+        beta.id = ProfileId::from("beta");
+        beta.name = "Beta local".to_owned();
+        let mut canonical_beta = beta.clone();
+        canonical_beta.name = "Beta daemon".to_owned();
+        let mut remote_new = super::empty_default_profile();
+        remote_new.id = ProfileId::from("charlie");
+        remote_new.name = "Charlie daemon".to_owned();
+        let mut document = ConfigV2 {
+            profiles: vec![alpha.clone(), beta],
+            ..Default::default()
+        };
+        let mut selected = alpha.clone();
+
+        reconcile_profiles(
+            &mut document,
+            &mut selected,
+            vec![remote_new.clone(), canonical_beta.clone()],
+        );
+
+        assert_eq!(selected, alpha);
+        assert_eq!(
+            document
+                .profiles
+                .iter()
+                .map(|profile| (profile.id.clone(), profile.name.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ProfileId::from("alpha"), "Alpha local".to_owned()),
+                (ProfileId::from("beta"), "Beta daemon".to_owned()),
+                (ProfileId::from("charlie"), "Charlie daemon".to_owned()),
+            ]
+        );
     }
 
     #[test]

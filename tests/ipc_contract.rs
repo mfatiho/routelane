@@ -70,6 +70,7 @@ enum HelperBehavior {
     Mismatch,
     InspectFail,
     AuthorizationDenied,
+    Drift,
 }
 
 impl FakeHelper {
@@ -93,12 +94,20 @@ impl FakeHelper {
         *self.behavior.lock().unwrap() = HelperBehavior::AuthorizationDenied;
     }
 
+    fn drift(&self) {
+        *self.behavior.lock().unwrap() = HelperBehavior::Drift;
+    }
+
     fn live_plan(&self) -> Option<KernelPlan> {
         self.live.lock().unwrap().clone()
     }
 
     fn fail_restore(&self) {
         *self.restore_fails.lock().unwrap() = true;
+    }
+
+    fn seed_live_plan(&self, plan: KernelPlan) {
+        *self.live.lock().unwrap() = Some(plan);
     }
 
     fn pause_next_inspect(&self) -> (Arc<Notify>, Arc<Notify>) {
@@ -167,11 +176,18 @@ impl PrivilegedHelperClient for FakeHelper {
 
     async fn inspect(&self) -> Result<InspectResponse, DaemonError> {
         *self.inspect_calls.lock().unwrap() += 1;
-        if matches!(*self.behavior.lock().unwrap(), HelperBehavior::InspectFail) {
-            return Err(DaemonError::helper("injected inspect failure"));
+        match *self.behavior.lock().unwrap() {
+            HelperBehavior::InspectFail => {
+                return Err(DaemonError::helper("injected inspect failure"));
+            }
+            HelperBehavior::AuthorizationDenied => {
+                return Err(DaemonError::authorization("injected authorization denial"));
+            }
+            _ => {}
         }
         let plan = self.live.lock().unwrap().clone();
-        let nft = if plan.is_some() {
+        let drift = matches!(*self.behavior.lock().unwrap(), HelperBehavior::Drift);
+        let nft = if plan.is_some() && !drift {
             br#"{"nftables":[{"table":{"family":"inet","name":"routelane"}}]}"#.as_slice()
         } else {
             br#"{"nftables":[]}"#.as_slice()
@@ -191,6 +207,7 @@ impl PrivilegedHelperClient for FakeHelper {
         let response = InspectResponse {
             generation: plan.as_ref().map(|plan| plan.generation),
             plan_hash: plan.as_ref().map(KernelPlan::content_hash),
+            applied_plan: plan.clone(),
             routelane_table_present: plan.is_some(),
             snapshot,
             diagnostics: vec![],
@@ -273,6 +290,19 @@ fn service() -> (Arc<TestService>, FakeHelper, MemoryConfig) {
         DaemonService::new(FakeTopology, FakeResolution, helper.clone(), config.clone()).unwrap(),
     );
     (service, helper, config)
+}
+
+fn restarted_service(helper: FakeHelper, config: MemoryConfig) -> Arc<TestService> {
+    Arc::new(DaemonService::new(FakeTopology, FakeResolution, helper, config).unwrap())
+}
+
+fn applied_fixture_plan(generation: u64) -> KernelPlan {
+    KernelPlan {
+        generation,
+        profile_id: ProfileId::from("default"),
+        lanes: vec![],
+        rules: vec![],
+    }
 }
 
 #[tokio::test]
@@ -487,6 +517,186 @@ async fn status_and_list_profiles_are_read_only() {
     ));
     assert_eq!(service.state().await.generation, 1);
     assert_eq!(config.saves.lock().unwrap().len(), saves_before);
+}
+
+#[tokio::test]
+async fn restart_without_helper_state_reports_inactive() {
+    let (service, helper, _) = service();
+
+    let response = service
+        .handle(DaemonEnvelope::new(
+            "fresh-status",
+            DaemonRequest::GetStatus,
+        ))
+        .await;
+    let Some(DaemonResult::Status(status)) = response.result else {
+        panic!("expected fresh status");
+    };
+
+    assert_eq!(status.generation, 0);
+    assert_eq!(status.health.state, HealthState::Inactive);
+    assert!(status.applied_profile_id.is_none());
+    assert_eq!(*helper.inspect_calls.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn restart_reconciles_applied_generation_before_status_and_next_apply() {
+    let helper = FakeHelper::default();
+    helper.seed_live_plan(applied_fixture_plan(7));
+    let config = MemoryConfig::default();
+    let service = restarted_service(helper.clone(), config);
+
+    let status = service
+        .handle(DaemonEnvelope::new(
+            "restart-status",
+            DaemonRequest::GetStatus,
+        ))
+        .await;
+    let Some(DaemonResult::Status(status)) = status.result else {
+        panic!("expected status after restart");
+    };
+    assert_eq!(status.generation, 7);
+    assert_eq!(status.applied_profile_id, Some(ProfileId::from("default")));
+    assert_eq!(status.health.state, HealthState::Healthy);
+
+    let repeated = service
+        .handle(DaemonEnvelope::new(
+            "restart-status-again",
+            DaemonRequest::GetStatus,
+        ))
+        .await;
+    assert!(matches!(
+        repeated.result,
+        Some(DaemonResult::Status(ref status))
+            if status.generation == 7
+                && status.applied_profile_id == Some(ProfileId::from("default"))
+                && status.health.state == HealthState::Healthy
+    ));
+
+    let mut changed = fixture_profile();
+    changed.name = "After restart".to_owned();
+    let applied = service.apply_profile(changed).await.unwrap();
+    assert_eq!(applied.generation, 8);
+    assert_eq!(helper.live_plan().unwrap().generation, 8);
+}
+
+#[tokio::test]
+async fn restart_inspect_failures_are_explicit_and_block_stale_mutation() {
+    for (authorize, expected_state, expected_code) in [
+        (false, HealthState::Failed, "DAEMON_RECONCILIATION_FAILED"),
+        (
+            true,
+            HealthState::NeedsAuthorization,
+            "DAEMON_NEEDS_AUTHORIZATION",
+        ),
+    ] {
+        let helper = FakeHelper::default();
+        helper.seed_live_plan(applied_fixture_plan(7));
+        if authorize {
+            helper.deny_authorization();
+        } else {
+            helper.fail_inspect();
+        }
+        let service = restarted_service(helper.clone(), MemoryConfig::default());
+
+        let status = service
+            .handle(DaemonEnvelope::new(
+                "restart-error",
+                DaemonRequest::GetStatus,
+            ))
+            .await;
+        let Some(DaemonResult::Status(status)) = status.result else {
+            panic!("reconciliation failure must still produce explicit status");
+        };
+        assert_eq!(status.health.state, expected_state);
+
+        let error = service.apply_profile(fixture_profile()).await.unwrap_err();
+        assert_eq!(error.code(), expected_code);
+        assert_eq!(helper.live_plan().unwrap().generation, 7);
+    }
+}
+
+#[tokio::test]
+async fn restart_reconciliation_retries_after_helper_authorization_recovers() {
+    let helper = FakeHelper::default();
+    helper.seed_live_plan(applied_fixture_plan(7));
+    helper.deny_authorization();
+    let service = restarted_service(helper.clone(), MemoryConfig::default());
+
+    let denied = service
+        .handle(DaemonEnvelope::new("denied", DaemonRequest::GetStatus))
+        .await;
+    assert!(matches!(
+        denied.result,
+        Some(DaemonResult::Status(ref status))
+            if status.health.state == HealthState::NeedsAuthorization
+    ));
+
+    helper.succeed();
+    let recovered = service
+        .handle(DaemonEnvelope::new("recovered", DaemonRequest::GetStatus))
+        .await;
+    assert!(matches!(
+        recovered.result,
+        Some(DaemonResult::Status(ref status))
+            if status.generation == 7 && status.health.state == HealthState::Healthy
+    ));
+    assert_eq!(*helper.inspect_calls.lock().unwrap(), 2);
+}
+
+#[tokio::test]
+async fn restart_live_drift_is_failed_without_claiming_inactive_or_mutating() {
+    let helper = FakeHelper::default();
+    helper.seed_live_plan(applied_fixture_plan(7));
+    helper.drift();
+    let service = restarted_service(helper.clone(), MemoryConfig::default());
+
+    let status = service
+        .handle(DaemonEnvelope::new("drift", DaemonRequest::GetStatus))
+        .await;
+    let Some(DaemonResult::Status(status)) = status.result else {
+        panic!("drift must produce explicit status");
+    };
+    assert_eq!(status.generation, 7);
+    assert_eq!(status.applied_profile_id, Some(ProfileId::from("default")));
+    assert_eq!(status.health.state, HealthState::Failed);
+    assert_eq!(
+        status.health.diagnostics[0].code,
+        DiagnosticCode::RoutingResourceConflict
+    );
+
+    let error = service.apply_profile(fixture_profile()).await.unwrap_err();
+    assert_eq!(error.code(), "DAEMON_RECONCILIATION_FAILED");
+    assert_eq!(helper.live_plan().unwrap().generation, 7);
+}
+
+#[tokio::test]
+async fn concurrent_first_requests_share_one_restart_reconciliation() {
+    let helper = FakeHelper::default();
+    helper.seed_live_plan(applied_fixture_plan(7));
+    let service = restarted_service(helper.clone(), MemoryConfig::default());
+    let (inspect_entered, release_inspect) = helper.pause_next_inspect();
+
+    let left_service = service.clone();
+    let left = tokio::spawn(async move {
+        left_service
+            .handle(DaemonEnvelope::new("left", DaemonRequest::GetStatus))
+            .await
+    });
+    inspect_entered.notified().await;
+    let right_service = service.clone();
+    let right = tokio::spawn(async move {
+        right_service
+            .handle(DaemonEnvelope::new("right", DaemonRequest::GetStatus))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    release_inspect.notify_one();
+    let (left, right) = (left.await.unwrap(), right.await.unwrap());
+
+    assert!(matches!(left.result, Some(DaemonResult::Status(_))));
+    assert!(matches!(right.result, Some(DaemonResult::Status(_))));
+    assert_eq!(*helper.inspect_calls.lock().unwrap(), 1);
 }
 
 #[tokio::test]

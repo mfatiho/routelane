@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use routelane::backend::{
     apply_plan, AppliedKernelState, ApplyError, ApplyStage, CompiledAction, CompiledRule,
     CompiledTarget, KernelPlan, KernelRunner, KernelSnapshot, LaneAvailability, LanePlan,
-    ResourceConflict, RunnerError, SnapshotInput,
+    ResourceConflict, RouteMode, RunnerError, SnapshotInput,
 };
 use routelane::domain::{LaneFailurePolicy, LaneId, ProfileId, RuleId};
 
@@ -130,14 +130,17 @@ impl InMemoryKernel {
             .flat_map(|plan| &plan.lanes)
             .filter(|lane| lane.availability == LaneAvailability::Available)
         {
-            if let Some(gateway) = lane.gateway_v4 {
-                ipv4_routes.push(serde_json::json!({
+            if let Some(route) = lane.route_v4 {
+                let mut value = serde_json::json!({
                     "dst": "default",
-                    "gateway": gateway,
                     "dev": lane.interface,
                     "table": lane.table,
                     "flags": [],
-                }));
+                });
+                if let RouteMode::Via(gateway) = route {
+                    value["gateway"] = serde_json::json!(gateway);
+                }
+                ipv4_routes.push(value);
                 ipv4_rules.push(serde_json::json!({
                     "priority": lane.rule_priority,
                     "src": "all",
@@ -145,16 +148,19 @@ impl InMemoryKernel {
                     "table": lane.table,
                 }));
             }
-            if let Some(gateway) = lane.gateway_v6 {
-                ipv6_routes.push(serde_json::json!({
+            if let Some(route) = lane.route_v6 {
+                let mut value = serde_json::json!({
                     "dst": "default",
-                    "gateway": gateway,
                     "dev": lane.interface,
                     "table": lane.table,
                     "metric": 1024,
                     "flags": [],
                     "pref": "medium",
-                }));
+                });
+                if let RouteMode::Via(gateway) = route {
+                    value["gateway"] = serde_json::json!(gateway);
+                }
+                ipv6_routes.push(value);
                 ipv6_rules.push(serde_json::json!({
                     "priority": lane.rule_priority,
                     "src": "all",
@@ -278,8 +284,8 @@ fn fixture_kernel_plan(generation: u64) -> KernelPlan {
         lanes: vec![LanePlan {
             id: LaneId::from("privacy"),
             interface: "wg0".to_owned(),
-            gateway_v4: Some("10.0.0.1".parse().unwrap()),
-            gateway_v6: None,
+            route_v4: Some(RouteMode::Via("10.0.0.1".parse().unwrap())),
+            route_v6: None,
             availability: LaneAvailability::Available,
             table: 20_000,
             mark: 0x524c0001,
@@ -392,7 +398,7 @@ fn higher_generation_replaces_exact_owned_route_and_rule_slot() {
     let old = fixture_applied_state(4);
     let mut next = fixture_kernel_plan(5);
     next.lanes[0].interface = "wg1".to_owned();
-    next.lanes[0].gateway_v4 = Some("10.0.0.2".parse().unwrap());
+    next.lanes[0].route_v4 = Some(RouteMode::Via("10.0.0.2".parse().unwrap()));
     next.lanes[0].mark = 0x524c0002;
     assert_ne!(old.plan_hash, next.content_hash());
     let mut runner = InMemoryKernel::from_applied(old.clone());
@@ -408,10 +414,29 @@ fn higher_generation_replaces_exact_owned_route_and_rule_slot() {
 }
 
 #[test]
+fn gatewayless_route_update_rolls_back_to_previous_gateway_route_on_failure() {
+    let old = fixture_applied_state(4);
+    let mut next = fixture_kernel_plan(5);
+    next.lanes[0].route_v4 = Some(RouteMode::Device);
+    let mut runner = InMemoryKernel::from_applied(old.clone()).fail_at(FailurePoint::ActivateNft);
+
+    let error = apply_plan(&mut runner, Some(&old), &next).unwrap_err();
+
+    assert!(matches!(
+        error,
+        ApplyError::Mutation(ref failure)
+            if failure.stage == ApplyStage::ActivateNft
+                && failure.rollback_error.is_none()
+    ));
+    assert_eq!(runner.applied_state(), Some(old));
+    assert!(!runner.has_temporary_guard());
+}
+
+#[test]
 fn foreign_route_alongside_exact_current_owned_route_conflicts_without_mutation() {
     let old = fixture_applied_state(4);
     let mut next = fixture_kernel_plan(5);
-    next.lanes[0].gateway_v4 = Some("10.0.0.2".parse().unwrap());
+    next.lanes[0].route_v4 = Some(RouteMode::Via("10.0.0.2".parse().unwrap()));
     let snapshot = snapshot_with(
         br#"[
             {"dst":"default","gateway":"10.0.0.1","dev":"wg0","table":20000,"flags":[]},

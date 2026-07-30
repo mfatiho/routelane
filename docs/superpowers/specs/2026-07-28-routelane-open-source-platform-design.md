@@ -369,6 +369,18 @@ Her plan monoton artan `generation` taşır. Helper:
 - Uygulanmış generation'dan eski bir mutation'ı reddeder.
 - Kendi yönettiği kernel nesnelerinde aktif generation bilgisini tutar.
 
+Daemon yeniden başladığında mutation veya status sunmadan önce helper'ın
+doğrulanmış journal/live planıyla tek seferlik reconcile yapar. Böylece
+uygulanmış plan ve generation süreç ömründen bağımsızdır; ilk yeni mutation
+canlı generation'ın bir sonrasını kullanır. Yetki hatası veya drift
+`Inactive` olarak gizlenmez.
+
+`ListProfiles` yanıtı tam katalog değildir. Daemon bu aşamada yalnızca kısmi
+desired/applied profil snapshot'ı verir; GUI bunu profil ID'sine göre
+merge/upsert eder. Yanıtta bulunmayan yerel profiller silinmez. Aynı ID
+canonical daemon kopyasıyla değiştirilir ve yeni ID'ler deterministik sırada
+eklenir.
+
 ## 9. nftables ve policy routing
 
 RouteLane yalnızca kendine ait isim alanını yönetir:
@@ -387,6 +399,17 @@ Plan şu nesneleri üretir:
 - Her lane için ayrılmış mark
 - Her lane için ayrılmış routing table
 - `fwmark → lookup table` policy rule'ları
+
+Kurallar öncelik sırasıyla ve **ilk eşleşme kazanır** semantiğiyle çalışır.
+Route eylemi mark ve sayaçtan sonra terminal `return`, Direct mark sıfırlama ve
+sayaçtan sonra `return`, Block ise sayaçtan sonra terminal `reject` üretir.
+Böylece daha düşük öncelikli catch-all kuralı daha önce eşleşmiş Route veya
+Direct kararını değiştiremez.
+
+Lane rota kanıtı aile başına typed tutulur: `Via(gateway)` veya `Device`.
+`Device`, WireGuard/TUN gibi gateway alanı taşımayan geçerli
+`default dev <interface>` rotasını ifade eder. Yalnızca interface varlığı rota
+kanıtı değildir; default-route kanıtı olmayan lane `Unavailable` kalır.
 
 İlk sabit kaynak sınırları:
 

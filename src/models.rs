@@ -9,6 +9,7 @@ pub enum UiToDaemon {
 
 #[derive(Debug, Clone)]
 pub enum DaemonToUi {
+    ConnectionEstablished { epoch: u64 },
     Status(DaemonStatus),
     Profiles(Vec<Profile>),
     Applied(ApplyProfileResult),
