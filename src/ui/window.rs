@@ -133,11 +133,43 @@ fn status_is_active(status: &DaemonStatus) -> bool {
     status.applied_profile_id.is_some()
 }
 
-fn accept_daemon_generation(last: &Cell<Option<u64>>, incoming: u64) -> bool {
-    if last.get().is_some_and(|generation| incoming < generation) {
+fn accept_daemon_status_revision(
+    last_generation: &Cell<Option<u64>>,
+    last_sequence: &Cell<Option<u64>>,
+    generation: u64,
+    event_sequence: u64,
+) -> bool {
+    if last_generation
+        .get()
+        .is_some_and(|current| generation < current)
+        || last_sequence
+            .get()
+            .is_some_and(|current| event_sequence < current)
+    {
         return false;
     }
-    last.set(Some(incoming));
+    last_generation.set(Some(generation));
+    last_sequence.set(Some(event_sequence));
+    true
+}
+
+fn accept_daemon_event_revision(
+    last_generation: &Cell<Option<u64>>,
+    last_sequence: &Cell<Option<u64>>,
+    generation: u64,
+    sequence: u64,
+) -> bool {
+    if last_generation
+        .get()
+        .is_some_and(|current| generation < current)
+        || last_sequence
+            .get()
+            .is_some_and(|current| sequence <= current)
+    {
+        return false;
+    }
+    last_generation.set(Some(generation));
+    last_sequence.set(Some(sequence));
     true
 }
 
@@ -196,6 +228,7 @@ pub fn build_window(
     let routing_active = Rc::new(Cell::new(false));
     let last_applied_profile_id = Rc::new(RefCell::new(None::<ProfileId>));
     let last_daemon_generation = Rc::new(Cell::new(None::<u64>));
+    let last_event_sequence = Rc::new(Cell::new(None::<u64>));
     let settings = gtk::Button::builder()
         .icon_name("preferences-system-symbolic")
         .tooltip_text(texts.settings_title)
@@ -510,7 +543,12 @@ pub fn build_window(
             while let Ok(event) = receiver.recv().await {
                 match event {
                     DaemonToUi::Status(status) => {
-                        if !accept_daemon_generation(&last_daemon_generation, status.generation) {
+                        if !accept_daemon_status_revision(
+                            &last_daemon_generation,
+                            &last_event_sequence,
+                            status.generation,
+                            status.event_sequence,
+                        ) {
                             continue;
                         }
                         let is_active = status_is_active(&status);
@@ -528,13 +566,25 @@ pub fn build_window(
                         );
                     }
                     DaemonToUi::Event(event) => {
-                        let (generation, health) = match event {
-                            DaemonEvent::StateChanged { generation, health }
+                        let (generation, sequence, health) = match event {
+                            DaemonEvent::StateChanged {
+                                generation,
+                                sequence,
+                                health,
+                            }
                             | DaemonEvent::OperationFailed {
-                                generation, health, ..
-                            } => (generation, health),
+                                generation,
+                                sequence,
+                                health,
+                                ..
+                            } => (generation, sequence, health),
                         };
-                        if !accept_daemon_generation(&last_daemon_generation, generation) {
+                        if !accept_daemon_event_revision(
+                            &last_daemon_generation,
+                            &last_event_sequence,
+                            generation,
+                            sequence,
+                        ) {
                             continue;
                         }
                         title.set_subtitle(&format!("{:?}", health.state));
@@ -837,9 +887,9 @@ fn refreshed_interface_selection(previous_name: Option<&str>, names: &[String]) 
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_daemon_generation, configuration_error_view, daemon_unavailable_view,
-        health_sections, health_view, reconcile_profiles, refreshed_interface_selection,
-        status_is_active, switch_state_after_persistence_failure,
+        accept_daemon_event_revision, accept_daemon_status_revision, configuration_error_view,
+        daemon_unavailable_view, health_sections, health_view, reconcile_profiles,
+        refreshed_interface_selection, status_is_active, switch_state_after_persistence_failure,
     };
     use crate::ui::i18n::LanguageTexts;
     use routelane::config::ConfigV2;
@@ -917,6 +967,7 @@ mod tests {
     fn failed_health_does_not_hide_a_previously_applied_profile() {
         let status = DaemonStatus {
             generation: 7,
+            event_sequence: 3,
             health: HealthReport::from_parts(HealthState::Failed, Default::default(), vec![]),
             desired_profile_id: Some(ProfileId::from("new")),
             applied_profile_id: Some(ProfileId::from("old")),
@@ -927,23 +978,51 @@ mod tests {
     }
 
     #[test]
-    fn daemon_generation_guard_rejects_only_lower_updates() {
-        let last = std::cell::Cell::new(None);
+    fn daemon_revision_guard_rejects_stale_duplicate_and_out_of_order_updates() {
+        let last_generation = std::cell::Cell::new(None);
+        let last_sequence = std::cell::Cell::new(None);
         let mut view = ("Healthy", true, None::<&str>);
 
-        assert!(accept_daemon_generation(&last, 2));
-        if accept_daemon_generation(&last, 1) {
+        assert!(accept_daemon_status_revision(
+            &last_generation,
+            &last_sequence,
+            2,
+            5
+        ));
+        if accept_daemon_event_revision(&last_generation, &last_sequence, 2, 5) {
+            view = ("Failed", false, Some("duplicate"));
+        }
+        if accept_daemon_event_revision(&last_generation, &last_sequence, 1, 6) {
             view = ("Failed", false, Some("stale error"));
         }
         assert_eq!(view, ("Healthy", true, None));
-        assert_eq!(last.get(), Some(2));
-        if accept_daemon_generation(&last, 2) {
+        assert_eq!(last_generation.get(), Some(2));
+        assert_eq!(last_sequence.get(), Some(5));
+
+        if accept_daemon_event_revision(&last_generation, &last_sequence, 2, 6) {
             view = ("Degraded", true, Some("same generation update"));
         }
         assert_eq!(view.0, "Degraded");
-        assert_eq!(last.get(), Some(2));
-        assert!(accept_daemon_generation(&last, 3));
-        assert_eq!(last.get(), Some(3));
+        assert!(!accept_daemon_event_revision(
+            &last_generation,
+            &last_sequence,
+            2,
+            6
+        ));
+        assert!(accept_daemon_event_revision(
+            &last_generation,
+            &last_sequence,
+            3,
+            7
+        ));
+        assert!(!accept_daemon_status_revision(
+            &last_generation,
+            &last_sequence,
+            3,
+            6
+        ));
+        assert_eq!(last_generation.get(), Some(3));
+        assert_eq!(last_sequence.get(), Some(7));
     }
 
     #[test]

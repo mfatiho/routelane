@@ -79,6 +79,7 @@ pub enum DaemonResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub generation: u64,
+    pub event_sequence: u64,
     pub health: HealthReport,
     pub desired_profile_id: Option<ProfileId>,
     pub applied_profile_id: Option<ProfileId>,
@@ -95,10 +96,12 @@ pub struct ApplyProfileResult {
 #[serde(tag = "event", content = "value")]
 pub enum DaemonEvent {
     StateChanged {
+        sequence: u64,
         generation: u64,
         health: HealthReport,
     },
     OperationFailed {
+        sequence: u64,
         generation: u64,
         health: HealthReport,
         error: IpcError,

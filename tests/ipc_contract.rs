@@ -23,6 +23,7 @@ use routelane::ipc::{
 };
 use tempfile::TempDir;
 use tokio::io::{duplex, AsyncWriteExt};
+use tokio::sync::Notify;
 
 #[derive(Clone, Default)]
 struct FakeTopology;
@@ -52,6 +53,13 @@ struct FakeHelper {
     restore_fails: Arc<Mutex<bool>>,
     cleanup_calls: Arc<Mutex<usize>>,
     inspect_calls: Arc<Mutex<usize>>,
+    next_inspect_gate: Arc<Mutex<Option<InspectGate>>>,
+}
+
+#[derive(Clone)]
+struct InspectGate {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
 }
 
 #[derive(Clone, Default)]
@@ -91,6 +99,15 @@ impl FakeHelper {
 
     fn fail_restore(&self) {
         *self.restore_fails.lock().unwrap() = true;
+    }
+
+    fn pause_next_inspect(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let gate = InspectGate {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *self.next_inspect_gate.lock().unwrap() = Some(gate.clone());
+        (gate.entered, gate.release)
     }
 }
 
@@ -171,13 +188,19 @@ impl PrivilegedHelperClient for FakeHelper {
             Some(plan) => snapshot.with_nft_ownership(plan.generation, plan.content_hash()),
             None => snapshot,
         };
-        Ok(InspectResponse {
+        let response = InspectResponse {
             generation: plan.as_ref().map(|plan| plan.generation),
             plan_hash: plan.as_ref().map(KernelPlan::content_hash),
             routelane_table_present: plan.is_some(),
             snapshot,
             diagnostics: vec![],
-        })
+        };
+        let gate = self.next_inspect_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        Ok(response)
     }
 
     async fn cleanup(&self) -> Result<CleanupResponse, DaemonError> {
@@ -299,6 +322,7 @@ async fn apply_profile_returns_generation_and_publishes_event() {
     assert!(matches!(
         event,
         DaemonEvent::StateChanged {
+            sequence: 1,
             generation: 1,
             health
         } if health.state == HealthState::Healthy
@@ -333,6 +357,7 @@ async fn failed_apply_keeps_persisted_desired_and_last_successful_generation() {
     assert!(matches!(
         event,
         DaemonEvent::OperationFailed {
+            sequence: 2,
             generation: 1,
             health,
             error
@@ -380,6 +405,7 @@ async fn invalid_profile_emits_failure_without_persisting_or_advancing_generatio
     assert!(matches!(
         events.recv().await.unwrap(),
         DaemonEvent::OperationFailed {
+            sequence: 1,
             generation: 0,
             health,
             ..
@@ -512,6 +538,7 @@ async fn unix_socket_round_trip_uses_secure_permissions() {
     assert_eq!(
         events.recv().await.unwrap(),
         DaemonEvent::StateChanged {
+            sequence: 1,
             generation: 1,
             health: service.state().await.health,
         }
@@ -610,6 +637,69 @@ async fn slow_event_subscriber_does_not_block_mutations() {
         let response = service.apply_profile(profile).await.unwrap();
         assert_eq!(response.generation, generation);
     }
+}
+
+#[tokio::test]
+async fn event_sequence_orders_a_status_snapshot_against_a_concurrent_publish() {
+    let (service, helper, _) = service();
+    let mut events = service.subscribe();
+    service.apply_profile(fixture_profile()).await.unwrap();
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        DaemonEvent::StateChanged { sequence: 1, .. }
+    ));
+
+    let (inspect_entered, release_inspect) = helper.pause_next_inspect();
+    let status_service = service.clone();
+    let status_task = tokio::spawn(async move {
+        status_service
+            .handle(DaemonEnvelope::new(
+                "concurrent-status",
+                DaemonRequest::GetStatus,
+            ))
+            .await
+    });
+    inspect_entered.notified().await;
+
+    let mut changed = fixture_profile();
+    changed.name = "Concurrent change".to_owned();
+    service.apply_profile(changed).await.unwrap();
+    let published = events.recv().await.unwrap();
+    release_inspect.notify_one();
+    let status_response = status_task.await.unwrap();
+    let Some(DaemonResult::Status(status)) = status_response.result else {
+        panic!("expected a daemon status response");
+    };
+
+    assert_eq!(status.generation, 1);
+    assert_eq!(status.event_sequence, 1);
+    assert!(matches!(
+        published,
+        DaemonEvent::StateChanged {
+            sequence: 2,
+            generation: 2,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn protocol_v1_serializes_status_and_event_sequence_fields() {
+    let (service, _, _) = service();
+    let mut events = service.subscribe();
+    service.apply_profile(fixture_profile()).await.unwrap();
+    let event = events.recv().await.unwrap();
+    let response = service
+        .handle(DaemonEnvelope::new("status-json", DaemonRequest::GetStatus))
+        .await;
+
+    let response_json = serde_json::to_value(response).unwrap();
+    assert_eq!(
+        response_json["result"]["value"]["event_sequence"],
+        serde_json::json!(1)
+    );
+    let event_json = serde_json::to_value(event).unwrap();
+    assert_eq!(event_json["value"]["sequence"], serde_json::json!(1));
 }
 
 #[tokio::test]
