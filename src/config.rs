@@ -303,6 +303,15 @@ impl ConfigRepository {
     }
 
     pub fn save(&self, config: &ConfigV2) -> anyhow::Result<()> {
+        let mut current = config.clone();
+        current.schema_version = CURRENT_SCHEMA_VERSION;
+        for profile in &mut current.profiles {
+            profile.enabled = false;
+            validate_profile(profile)
+                .map_err(|error| anyhow::anyhow!("refusing to save invalid profile: {error:?}"))?;
+        }
+        let bytes = serde_json::to_vec_pretty(&current)?;
+
         let parent = self
             .path
             .parent()
@@ -312,12 +321,6 @@ impl ConfigRepository {
             validate_existing_file(&self.path)?;
         }
 
-        let mut current = config.clone();
-        current.schema_version = CURRENT_SCHEMA_VERSION;
-        for profile in &mut current.profiles {
-            profile.enabled = false;
-        }
-        let bytes = serde_json::to_vec_pretty(&current)?;
         let temp_path = parent.join(format!(
             ".{}.{}.tmp",
             self.path
@@ -636,5 +639,41 @@ mod tests {
             ConfigRepository::new(path).load().unwrap().language,
             Language::En
         );
+    }
+
+    #[test]
+    fn invalid_document_is_rejected_before_existing_file_is_touched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let original = br#"{"schema_version":2,"language":"tr","profiles":[]}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut invalid = ConfigV2::default();
+        invalid.profiles.push(Profile {
+            id: ProfileId::from("bad"),
+            name: "Bad".to_owned(),
+            enabled: false,
+            lanes: vec![
+                Lane {
+                    id: LaneId::from("a"),
+                    name: "Ärea".to_owned(),
+                    interface: InterfaceSelector::from("tun0"),
+                    fallback_lane: None,
+                    failure_policy: LaneFailurePolicy::Inactive,
+                },
+                Lane {
+                    id: LaneId::from("b"),
+                    name: "äREA".to_owned(),
+                    interface: InterfaceSelector::from("tun1"),
+                    fallback_lane: None,
+                    failure_policy: LaneFailurePolicy::Inactive,
+                },
+            ],
+            rules: vec![],
+        });
+
+        assert!(ConfigRepository::new(&path).save(&invalid).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!path.with_extension("json.bak").exists());
     }
 }

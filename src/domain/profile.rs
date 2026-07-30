@@ -94,10 +94,8 @@ pub fn validate_profile(profile: &Profile) -> Result<(), DomainError> {
         if !lane_ids.insert(lane.id.clone()) {
             return Err(DomainError::DuplicateLaneId(lane.id.clone()));
         }
-        let normalized_name = lane.name.trim().to_lowercase();
-        if normalized_name.is_empty() {
-            return Err(DomainError::EmptyLaneName(lane.id.clone()));
-        }
+        let normalized_name =
+            lane_name_key(&lane.name).ok_or_else(|| DomainError::EmptyLaneName(lane.id.clone()))?;
         if !lane_names.insert(normalized_name.clone()) {
             return Err(DomainError::DuplicateLaneName(normalized_name));
         }
@@ -148,6 +146,32 @@ pub fn validate_profile(profile: &Profile) -> Result<(), DomainError> {
     Ok(())
 }
 
+pub fn canonical_lane_name(
+    profile: &Profile,
+    excluded_lane: Option<&LaneId>,
+    input: &str,
+) -> Result<String, DomainError> {
+    let canonical = input.trim();
+    let key = lane_name_key(canonical).ok_or_else(|| {
+        DomainError::EmptyLaneName(
+            excluded_lane
+                .cloned()
+                .unwrap_or_else(|| LaneId::from("new")),
+        )
+    })?;
+    if profile.lanes.iter().any(|lane| {
+        excluded_lane != Some(&lane.id) && lane_name_key(&lane.name).as_deref() == Some(&key)
+    }) {
+        return Err(DomainError::DuplicateLaneName(key));
+    }
+    Ok(canonical.to_owned())
+}
+
+fn lane_name_key(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_lowercase())
+}
+
 pub fn normalize_lane_names(profile: &mut Profile) {
     for lane in &mut profile.lanes {
         let trimmed = lane.name.trim();
@@ -162,8 +186,8 @@ pub fn normalize_lane_names(profile: &mut Profile) {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_profile, DomainError, InterfaceSelector, Lane, LaneFailurePolicy, LaneId, Profile,
-        ProfileId,
+        canonical_lane_name, validate_profile, DomainError, InterfaceSelector, Lane,
+        LaneFailurePolicy, LaneId, Profile, ProfileId,
     };
     use crate::domain::{Rule, RuleAction, RuleId, RuleSource, RuleTarget};
 
@@ -279,6 +303,17 @@ mod tests {
         assert_eq!(
             validate_profile(&duplicate),
             Err(DomainError::DuplicateLaneName("work".to_owned()))
+        );
+    }
+
+    #[test]
+    fn lane_name_validation_uses_unicode_lowercase_keys() {
+        let mut profile = fixture_profile(vec![fixture_lane("a", "tun0")], vec![]);
+        profile.lanes[0].name = "Ärea".to_owned();
+
+        assert_eq!(
+            canonical_lane_name(&profile, None, " äREA "),
+            Err(DomainError::DuplicateLaneName("ärea".to_owned()))
         );
     }
 }
