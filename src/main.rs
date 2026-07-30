@@ -12,6 +12,34 @@ use routelane::ipc::{
 
 use crate::models::{DaemonToUi, UiToDaemon};
 
+#[derive(Debug, Clone, Copy)]
+struct ConnectionPolicy {
+    request_timeout: Duration,
+    activation_timeout: Duration,
+    initial_reconnect_delay: Duration,
+    maximum_reconnect_delay: Duration,
+}
+
+impl Default for ConnectionPolicy {
+    fn default() -> Self {
+        Self {
+            request_timeout: Duration::from_secs(3),
+            activation_timeout: Duration::from_secs(8),
+            initial_reconnect_delay: Duration::from_millis(250),
+            maximum_reconnect_delay: Duration::from_secs(8),
+        }
+    }
+}
+
+impl ConnectionPolicy {
+    fn reconnect_delay(self, attempt: u32) -> Duration {
+        let multiplier = 1_u32.checked_shl(attempt.min(16)).unwrap_or(u32::MAX);
+        self.initial_reconnect_delay
+            .saturating_mul(multiplier)
+            .min(self.maximum_reconnect_delay)
+    }
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -38,6 +66,7 @@ fn main() {
 }
 
 async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>) {
+    let policy = ConnectionPolicy::default();
     let path = match socket_path() {
         Ok(path) => path,
         Err(error) => {
@@ -49,30 +78,38 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
     };
     let client = DaemonClient::new(path);
 
-    if let Err(first_error) = request_status(&client, &to_ui).await {
-        if let Err(activation_error) = activate_user_daemon().await {
+    if let Err(first_error) = request_status(&client, &to_ui, policy).await {
+        if let Err(activation_error) = activate_user_daemon(policy).await {
             let _ = to_ui
                 .send(DaemonToUi::DaemonUnavailable(format!(
                     "{first_error}; systemd user activation failed: {activation_error}"
                 )))
                 .await;
-        } else if let Err(error) = wait_for_daemon(&client, &to_ui).await {
+        } else if let Err(error) = wait_for_daemon(&client, &to_ui, policy).await {
             let _ = to_ui
                 .send(DaemonToUi::DaemonUnavailable(error.to_string()))
                 .await;
         }
     }
 
-    let mut subscription = client.subscribe(request_id()).await.ok();
+    let mut subscription = subscribe_with_timeout(&client, policy).await.ok();
+    let mut reconnect_attempt = 0;
+    let mut next_reconnect = tokio::time::Instant::now();
     loop {
+        let reconnecting = subscription.is_none();
+        let retry_deadline = next_reconnect;
         tokio::select! {
             command = from_ui.recv() => {
                 match command {
                     Ok(UiToDaemon::Request(request)) => {
-                        match client.send(DaemonEnvelope::new(request_id(), request)).await {
+                        match send_with_timeout(&client, request, policy).await {
                             Ok(response) => forward_response(response, &to_ui).await,
                             Err(error) => {
                                 let _ = to_ui.send(DaemonToUi::DaemonUnavailable(error.to_string())).await;
+                                subscription = None;
+                                next_reconnect = tokio::time::Instant::now()
+                                    + policy.reconnect_delay(reconnect_attempt);
+                                reconnect_attempt = reconnect_attempt.saturating_add(1);
                             }
                         }
                     }
@@ -89,7 +126,45 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
                     Some(event) => {
                         let _ = to_ui.send(DaemonToUi::Event(event)).await;
                     }
-                    None => subscription = None,
+                    None => {
+                        subscription = None;
+                        let _ = to_ui
+                            .send(DaemonToUi::DaemonUnavailable(
+                                "daemon event subscription disconnected".to_owned(),
+                            ))
+                            .await;
+                        next_reconnect = tokio::time::Instant::now()
+                            + policy.reconnect_delay(reconnect_attempt);
+                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    }
+                }
+            }
+            _ = async {
+                if reconnecting {
+                    tokio::time::sleep_until(retry_deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                match request_status(&client, &to_ui, policy).await {
+                    Ok(()) => match subscribe_with_timeout(&client, policy).await {
+                        Ok(events) => {
+                            subscription = Some(events);
+                            reconnect_attempt = 0;
+                        }
+                        Err(error) => {
+                            let _ = to_ui.send(DaemonToUi::DaemonUnavailable(error.to_string())).await;
+                            next_reconnect = tokio::time::Instant::now()
+                                + policy.reconnect_delay(reconnect_attempt);
+                            reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        }
+                    },
+                    Err(error) => {
+                        let _ = to_ui.send(DaemonToUi::DaemonUnavailable(error.to_string())).await;
+                        next_reconnect = tokio::time::Instant::now()
+                            + policy.reconnect_delay(reconnect_attempt);
+                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    }
                 }
             }
         }
@@ -99,10 +174,9 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
 async fn request_status(
     client: &DaemonClient,
     sender: &Sender<DaemonToUi>,
+    policy: ConnectionPolicy,
 ) -> Result<(), IpcError> {
-    let response = client
-        .send(DaemonEnvelope::new(request_id(), DaemonRequest::GetStatus))
-        .await?;
+    let response = send_with_timeout(client, DaemonRequest::GetStatus, policy).await?;
     if let Some(error) = response.error {
         return Err(error);
     }
@@ -121,23 +195,29 @@ async fn request_status(
 async fn wait_for_daemon(
     client: &DaemonClient,
     sender: &Sender<DaemonToUi>,
+    policy: ConnectionPolicy,
 ) -> Result<(), IpcError> {
     let mut last_error = IpcError::new("IPC_CONNECT_FAILED", "daemon did not create its socket");
-    for _ in 0..20 {
-        match request_status(client, sender).await {
+    for attempt in 0..6 {
+        match request_status(client, sender, policy).await {
             Ok(()) => return Ok(()),
             Err(error) => last_error = error,
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(policy.reconnect_delay(attempt)).await;
     }
     Err(last_error)
 }
 
-async fn activate_user_daemon() -> std::io::Result<()> {
-    let status = tokio::process::Command::new("systemctl")
+async fn activate_user_daemon(policy: ConnectionPolicy) -> std::io::Result<()> {
+    let mut command = tokio::process::Command::new("systemctl");
+    command
         .args(["--user", "start", "routelane-daemon.service"])
-        .status()
-        .await?;
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(policy.activation_timeout, command.status())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "systemd activation timed out")
+        })??;
     if status.success() {
         Ok(())
     } else {
@@ -145,6 +225,28 @@ async fn activate_user_daemon() -> std::io::Result<()> {
             "systemctl exited with {status}"
         )))
     }
+}
+
+async fn send_with_timeout(
+    client: &DaemonClient,
+    request: DaemonRequest,
+    policy: ConnectionPolicy,
+) -> Result<routelane::ipc::DaemonResponse, IpcError> {
+    tokio::time::timeout(
+        policy.request_timeout,
+        client.send(DaemonEnvelope::new(request_id(), request)),
+    )
+    .await
+    .map_err(|_| IpcError::new("IPC_TIMEOUT", "daemon request timed out"))?
+}
+
+async fn subscribe_with_timeout(
+    client: &DaemonClient,
+    policy: ConnectionPolicy,
+) -> Result<tokio::sync::mpsc::Receiver<routelane::ipc::DaemonEvent>, IpcError> {
+    tokio::time::timeout(policy.request_timeout, client.subscribe(request_id()))
+        .await
+        .map_err(|_| IpcError::new("IPC_TIMEOUT", "daemon subscription timed out"))?
 }
 
 async fn forward_response(response: routelane::ipc::DaemonResponse, sender: &Sender<DaemonToUi>) {
@@ -166,4 +268,20 @@ async fn forward_response(response: routelane::ipc::DaemonResponse, sender: &Sen
 
 fn request_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionPolicy;
+    use std::time::Duration;
+
+    #[test]
+    fn connection_policy_bounds_io_and_exponential_reconnect_delay() {
+        let policy = ConnectionPolicy::default();
+
+        assert!(policy.request_timeout <= Duration::from_secs(5));
+        assert!(policy.activation_timeout <= Duration::from_secs(10));
+        assert_eq!(policy.reconnect_delay(0), Duration::from_millis(250));
+        assert_eq!(policy.reconnect_delay(20), policy.maximum_reconnect_delay);
+    }
 }

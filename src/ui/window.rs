@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 
@@ -6,15 +7,13 @@ use async_channel::{Receiver, Sender};
 use glib::signal::Inhibit;
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
-use routelane::domain::{
-    HealthState, Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource, RuleTarget,
-};
+use routelane::domain::{Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource, RuleTarget};
 use routelane::health::HealthReport;
-use routelane::ipc::{DaemonEvent, DaemonRequest};
+use routelane::ipc::{DaemonEvent, DaemonRequest, DaemonStatus};
 
-use crate::config::{ConfigRepository, Language};
+use crate::config::{ConfigRepository, Language, PersistenceRequest, PersistenceWorker};
 use crate::models::{DaemonToUi, UiToDaemon};
-use crate::ui::rule_row::create_rule_row;
+use crate::ui::rule_row::{create_rule_row, set_rule_enabled_request, RuleEdit, RuleRowContext};
 use crate::ui::settings::build_settings_dialog;
 use crate::ui::tray::{spawn_tray, TrayCommand, APP_ICON_NAME};
 
@@ -28,7 +27,7 @@ pub struct HealthDiagnosticView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionHealthView {
     pub aggregate: String,
-    pub last_apply_generation: Option<String>,
+    pub apply_generation: Option<String>,
     pub lanes: Vec<(String, String)>,
     pub diagnostics: Vec<HealthDiagnosticView>,
 }
@@ -36,7 +35,7 @@ pub struct ConnectionHealthView {
 pub fn health_view(report: &HealthReport, generation: Option<u64>) -> ConnectionHealthView {
     ConnectionHealthView {
         aggregate: format!("{:?}", report.state),
-        last_apply_generation: generation.map(|value| value.to_string()),
+        apply_generation: generation.map(|value| value.to_string()),
         lanes: report
             .lanes
             .iter()
@@ -60,7 +59,7 @@ pub fn health_view(report: &HealthReport, generation: Option<u64>) -> Connection
 pub fn daemon_unavailable_view(detail: impl Into<String>) -> ConnectionHealthView {
     ConnectionHealthView {
         aggregate: "DaemonUnavailable".to_owned(),
-        last_apply_generation: None,
+        apply_generation: None,
         lanes: Vec::new(),
         diagnostics: vec![HealthDiagnosticView {
             summary: "RouteLane daemon is unavailable".to_owned(),
@@ -70,6 +69,39 @@ pub fn daemon_unavailable_view(detail: impl Into<String>) -> ConnectionHealthVie
     }
 }
 
+pub fn configuration_error_view(detail: impl Into<String>) -> ConnectionHealthView {
+    ConnectionHealthView {
+        aggregate: "ConfigurationError".to_owned(),
+        apply_generation: None,
+        lanes: Vec::new(),
+        diagnostics: vec![HealthDiagnosticView {
+            summary: "RouteLane configuration could not be loaded".to_owned(),
+            action: Some("Fix file ownership, permissions, or JSON before editing".to_owned()),
+            technical_detail: detail.into(),
+        }],
+    }
+}
+
+fn status_is_active(status: &DaemonStatus) -> bool {
+    status.applied_profile_id.is_some()
+}
+
+#[derive(Debug)]
+enum PostSaveAction {
+    None,
+    Request(DaemonRequest),
+}
+
+#[derive(Clone)]
+struct RuleListContext {
+    group: adw::PreferencesGroup,
+    rows: Rc<RefCell<Vec<adw::ActionRow>>>,
+    profile: Rc<RefCell<Profile>>,
+    routing_active: Rc<Cell<bool>>,
+    texts: crate::ui::i18n::Texts,
+    save_profile: Rc<dyn Fn(PostSaveAction)>,
+}
+
 pub fn build_window(
     app: &adw::Application,
     sender: Sender<UiToDaemon>,
@@ -77,7 +109,10 @@ pub fn build_window(
 ) {
     gtk::Window::set_default_icon_name(APP_ICON_NAME);
     let repository = ConfigRepository::user_default();
-    let mut document = repository.load().unwrap_or_default();
+    let (mut document, load_error) = match repository.load() {
+        Ok(document) => (document, None),
+        Err(error) => (Default::default(), Some(error.to_string())),
+    };
     if document.profiles.is_empty() {
         document.profiles.push(empty_default_profile());
     }
@@ -109,6 +144,9 @@ pub fn build_window(
         .tooltip_text(texts.settings_title)
         .build();
     settings.add_css_class("flat");
+    let editable = load_error.is_none();
+    active.set_sensitive(editable);
+    settings.set_sensitive(editable);
     header.pack_end(&settings);
     header.pack_end(&active);
 
@@ -120,17 +158,18 @@ pub fn build_window(
     let health_row = adw::ActionRow::new();
     health_row.set_child(Some(&health_content));
     health_group.add(&health_row);
-    render_health(
-        &health_content,
-        &health_view(&HealthReport::inactive(), None),
-        texts,
-    );
+    let initial_health = load_error
+        .as_ref()
+        .map(configuration_error_view)
+        .unwrap_or_else(|| health_view(&HealthReport::inactive(), None));
+    render_health(&health_content, &initial_health, texts);
     page.add(&health_group);
 
     let rules_group = adw::PreferencesGroup::builder()
         .title(texts.rules_title)
         .description(texts.rules_description)
         .build();
+    rules_group.set_sensitive(editable);
     let add_row = adw::ActionRow::builder()
         .title(texts.add_address_title)
         .build();
@@ -147,6 +186,7 @@ pub fn build_window(
         .icon_name("list-add-symbolic")
         .tooltip_text(texts.add_rule_tooltip)
         .build();
+    add.set_sensitive(editable);
     add_row.add_suffix(&target);
     add_row.add_suffix(&action);
     add_row.add_suffix(&priority);
@@ -161,52 +201,89 @@ pub fn build_window(
     body.append(&toast_overlay);
     window.set_content(Some(&body));
 
-    let save_profile: Rc<dyn Fn()> = {
+    let persistence = load_error
+        .is_none()
+        .then(|| PersistenceWorker::spawn(repository));
+    let persistence_requests = persistence.as_ref().map(|worker| worker.requests.clone());
+    let persistence_results = persistence.as_ref().map(|worker| worker.results.clone());
+    let persistence_generation = Rc::new(Cell::new(0_u64));
+    let pending_actions = Rc::new(RefCell::new(BTreeMap::<u64, PostSaveAction>::new()));
+    let persist_document: Rc<dyn Fn(PostSaveAction)> = {
+        let document = document.clone();
+        let generation = persistence_generation.clone();
+        let pending = pending_actions.clone();
+        Rc::new(move |action| {
+            let Some(requests) = persistence_requests.clone() else {
+                return;
+            };
+            let next = generation.get().saturating_add(1);
+            generation.set(next);
+            pending.borrow_mut().insert(next, action);
+            let request = PersistenceRequest::new(next, document.borrow().clone());
+            glib::MainContext::default().spawn_local(async move {
+                if requests.send(request).await.is_err() {
+                    log::warn!("configuration persistence worker stopped");
+                }
+            });
+        })
+    };
+    let save_profile: Rc<dyn Fn(PostSaveAction)> = {
         let document = document.clone();
         let profile = profile.clone();
-        let active = active.clone();
-        let sender = sender.clone();
-        Rc::new(move || {
-            let mut document = document.borrow_mut();
+        let persist_document = persist_document.clone();
+        Rc::new(move |action| {
             let current = profile.borrow().clone();
-            if let Some(stored) = document
-                .profiles
-                .iter_mut()
-                .find(|stored| stored.id == current.id)
-            {
-                *stored = current;
-            } else {
-                document.profiles.push(current);
-            }
-            if let Err(error) = repository.save(&document) {
-                log::warn!("Could not save RouteLane configuration: {error}");
-            }
-            if active.is_active() {
-                let mut candidate = profile.borrow().clone();
-                candidate.enabled = true;
-                let sender = sender.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    sender
-                        .send(UiToDaemon::Request(DaemonRequest::ApplyProfile(candidate)))
-                        .await
-                        .ok();
-                });
-            }
+            store_profile(&mut document.borrow_mut(), current);
+            persist_document(action);
         })
     };
 
+    if let Some(results) = persistence_results {
+        let pending = pending_actions.clone();
+        let sender = sender.clone();
+        let toast_overlay = toast_overlay.clone();
+        let health_content = health_content.clone();
+        let active = active.clone();
+        let settings = settings.clone();
+        let add = add.clone();
+        let rules_group = rules_group.clone();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(result) = results.recv().await {
+                let action = pending
+                    .borrow_mut()
+                    .remove(&result.generation)
+                    .unwrap_or(PostSaveAction::None);
+                match result.result {
+                    Ok(()) => {
+                        if let PostSaveAction::Request(request) = action {
+                            sender.send(UiToDaemon::Request(request)).await.ok();
+                        }
+                    }
+                    Err(error) => {
+                        active.set_sensitive(false);
+                        settings.set_sensitive(false);
+                        add.set_sensitive(false);
+                        rules_group.set_sensitive(false);
+                        render_health(&health_content, &configuration_error_view(&error), texts);
+                        toast_overlay
+                            .add_toast(&adw::Toast::builder().title(&error).timeout(7).build());
+                    }
+                }
+            }
+        });
+    }
+
     let rows = Rc::new(RefCell::new(Vec::<adw::ActionRow>::new()));
+    let rule_list = RuleListContext {
+        group: rules_group.clone(),
+        rows: rows.clone(),
+        profile: profile.clone(),
+        routing_active: routing_active.clone(),
+        texts,
+        save_profile: save_profile.clone(),
+    };
     for rule in profile.borrow().rules.clone() {
-        append_rule(
-            &rules_group,
-            &rows,
-            &profile,
-            &rule,
-            &sender,
-            routing_active.clone(),
-            texts,
-            save_profile.clone(),
-        );
+        append_rule(&rule_list, &rule);
     }
 
     {
@@ -214,22 +291,41 @@ pub fn build_window(
         let profile = profile.clone();
         let save_profile = save_profile.clone();
         let document = document.clone();
+        let persist_document = persist_document.clone();
+        let rule_list = rule_list.clone();
+        let routing_active = routing_active.clone();
         settings.connect_clicked(move |_| {
             let initial_language = document.borrow().language;
             let on_language: Rc<dyn Fn(Language)> = {
                 let document = document.clone();
+                let persist_document = persist_document.clone();
                 Rc::new(move |language| {
-                    document.borrow_mut().language = language;
-                    if let Err(error) = ConfigRepository::user_default().save(&document.borrow()) {
-                        log::warn!("Could not save language preference: {error}");
+                    {
+                        document.borrow_mut().language = language;
                     }
+                    persist_document(PostSaveAction::None);
+                })
+            };
+            let on_lane_change: Rc<dyn Fn()> = {
+                let save_profile = save_profile.clone();
+                let rule_list = rule_list.clone();
+                let routing_active = routing_active.clone();
+                let profile = profile.clone();
+                Rc::new(move || {
+                    let action = if routing_active.get() {
+                        PostSaveAction::Request(apply_request(&profile.borrow()))
+                    } else {
+                        PostSaveAction::None
+                    };
+                    save_profile(action);
+                    rebuild_rule_rows(&rule_list);
                 })
             };
             let dialog = build_settings_dialog(
                 &window,
                 texts,
                 profile.clone(),
-                save_profile.clone(),
+                on_lane_change,
                 initial_language,
                 on_language,
             );
@@ -239,32 +335,31 @@ pub fn build_window(
     {
         let sender = sender.clone();
         let profile = profile.clone();
+        let save_profile = save_profile.clone();
         let updating_switch = updating_switch.clone();
         active.connect_state_set(move |_, state| {
             if updating_switch.get() {
                 return Inhibit(false);
             }
-            let request = if state {
-                let mut candidate = profile.borrow().clone();
-                candidate.enabled = true;
-                DaemonRequest::ApplyProfile(candidate)
+            if state {
+                save_profile(PostSaveAction::Request(apply_request(&profile.borrow())));
             } else {
-                DaemonRequest::Deactivate
-            };
-            let sender = sender.clone();
-            glib::MainContext::default().spawn_local(async move {
-                sender.send(UiToDaemon::Request(request)).await.ok();
-            });
+                let sender = sender.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    sender
+                        .send(UiToDaemon::Request(DaemonRequest::Deactivate))
+                        .await
+                        .ok();
+                });
+            }
             Inhibit(false)
         });
     }
     {
-        let rules_group = rules_group.clone();
-        let rows = rows.clone();
         let profile = profile.clone();
-        let sender = sender.clone();
         let save_profile = save_profile.clone();
         let routing_active = routing_active.clone();
+        let rule_list = rule_list.clone();
         let target_for_add = target.clone();
         let add_rule = move || {
             let text = target_for_add.text().trim().to_owned();
@@ -289,18 +384,16 @@ pub fn build_window(
                 target: target_value,
                 action: rule_action,
             };
-            profile.borrow_mut().rules.push(rule.clone());
-            save_profile();
-            append_rule(
-                &rules_group,
-                &rows,
-                &profile,
-                &rule,
-                &sender,
-                routing_active.clone(),
-                texts,
-                save_profile.clone(),
-            );
+            {
+                profile.borrow_mut().rules.push(rule.clone());
+            }
+            let action = if routing_active.get() {
+                PostSaveAction::Request(apply_request(&profile.borrow()))
+            } else {
+                PostSaveAction::None
+            };
+            save_profile(action);
+            append_rule(&rule_list, &rule);
             target_for_add.set_text("");
         };
         add.connect_clicked({
@@ -316,13 +409,17 @@ pub fn build_window(
         let routing_active = routing_active.clone();
         let title = title.clone();
         let health_content = health_content.clone();
+        let profile = profile.clone();
+        let rule_list = rule_list.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = receiver.recv().await {
                 match event {
                     DaemonToUi::Status(status) => {
-                        routing_active.set(status.applied_profile_id.is_some());
+                        let is_active = status_is_active(&status);
+                        routing_active.set(is_active);
+                        active.set_sensitive(editable);
                         updating_switch.set(true);
-                        active.set_active(status.applied_profile_id.is_some());
+                        active.set_active(is_active);
                         updating_switch.set(false);
                         title.set_subtitle(&format!("{:?}", status.health.state));
                         render_health(
@@ -338,25 +435,26 @@ pub fn build_window(
                                 generation, health, ..
                             } => (generation, health),
                         };
-                        routing_active.set(!matches!(
-                            health.state,
-                            HealthState::Inactive | HealthState::Failed
-                        ));
-                        updating_switch.set(true);
-                        active.set_active(!matches!(health.state, HealthState::Inactive));
-                        updating_switch.set(false);
                         title.set_subtitle(&format!("{:?}", health.state));
                         render_health(
                             &health_content,
                             &health_view(&health, Some(generation)),
                             texts,
                         );
+                        let sender = sender.clone();
+                        glib::MainContext::default().spawn_local(async move {
+                            sender
+                                .send(UiToDaemon::Request(DaemonRequest::GetStatus))
+                                .await
+                                .ok();
+                            sender
+                                .send(UiToDaemon::Request(DaemonRequest::ListProfiles))
+                                .await
+                                .ok();
+                        });
                     }
                     DaemonToUi::DaemonUnavailable(detail) => {
-                        routing_active.set(false);
-                        updating_switch.set(true);
-                        active.set_active(false);
-                        updating_switch.set(false);
+                        active.set_sensitive(false);
                         title.set_subtitle("DaemonUnavailable");
                         render_health(&health_content, &daemon_unavailable_view(detail), texts);
                     }
@@ -367,8 +465,20 @@ pub fn build_window(
                                 .timeout(7)
                                 .build(),
                         );
+                        let sender = sender.clone();
+                        glib::MainContext::default().spawn_local(async move {
+                            sender
+                                .send(UiToDaemon::Request(DaemonRequest::GetStatus))
+                                .await
+                                .ok();
+                            sender
+                                .send(UiToDaemon::Request(DaemonRequest::ListProfiles))
+                                .await
+                                .ok();
+                        });
                     }
                     DaemonToUi::Applied(result) => {
+                        rebuild_rule_rows(&rule_list);
                         title.set_subtitle(&format!("Applying generation {}", result.generation));
                         let sender = sender.clone();
                         glib::MainContext::default().spawn_local(async move {
@@ -380,6 +490,7 @@ pub fn build_window(
                     }
                     DaemonToUi::Deactivated => {
                         routing_active.set(false);
+                        active.set_sensitive(editable);
                         updating_switch.set(true);
                         active.set_active(false);
                         updating_switch.set(false);
@@ -391,6 +502,10 @@ pub fn build_window(
                     }
                     DaemonToUi::Profiles(profiles) => {
                         log::debug!("daemon returned {} profile(s)", profiles.len());
+                        if let Some(canonical) = profiles.into_iter().next() {
+                            *profile.borrow_mut() = canonical;
+                            rebuild_rule_rows(&rule_list);
+                        }
                     }
                 }
             }
@@ -423,57 +538,103 @@ pub fn build_window(
     window.present();
 }
 
-fn append_rule(
-    group: &adw::PreferencesGroup,
-    rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
-    profile: &Rc<RefCell<Profile>>,
-    rule: &Rule,
-    sender: &Sender<UiToDaemon>,
-    routing_active: Rc<Cell<bool>>,
-    texts: crate::ui::i18n::Texts,
-    save: Rc<dyn Fn()>,
-) {
-    let lanes = profile
+fn append_rule(context: &RuleListContext, rule: &Rule) {
+    let lanes = context
+        .profile
         .borrow()
         .lanes
         .iter()
         .map(|lane| (lane.id.clone(), lane.name.clone()))
         .collect::<Vec<_>>();
-    let on_change: Rc<dyn Fn(Rule)> = {
-        let profile = profile.clone();
-        let save = save.clone();
-        Rc::new(move |updated| {
-            if let Some(rule) = profile
-                .borrow_mut()
-                .rules
-                .iter_mut()
-                .find(|rule| rule.id == updated.id)
-            {
-                *rule = updated;
-                save();
+    let on_change: Rc<dyn Fn(Rule, RuleEdit)> = {
+        let profile = context.profile.clone();
+        let save = context.save_profile.clone();
+        let routing_active = context.routing_active.clone();
+        Rc::new(move |updated, edit| {
+            let updated_id = updated.id.clone();
+            let changed = {
+                let mut profile = profile.borrow_mut();
+                if let Some(rule) = profile.rules.iter_mut().find(|rule| rule.id == updated.id) {
+                    *rule = updated;
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
+                let action = if routing_active.get() {
+                    match edit {
+                        RuleEdit::Enabled(enabled) => {
+                            PostSaveAction::Request(set_rule_enabled_request(
+                                profile.borrow().id.clone(),
+                                updated_id,
+                                enabled,
+                            ))
+                        }
+                        RuleEdit::Definition => {
+                            PostSaveAction::Request(apply_request(&profile.borrow()))
+                        }
+                    }
+                } else {
+                    PostSaveAction::None
+                };
+                save(action);
             }
         })
     };
     let on_delete: Rc<dyn Fn(RuleId)> = {
-        let profile = profile.clone();
-        let save = save.clone();
+        let profile = context.profile.clone();
+        let save = context.save_profile.clone();
+        let routing_active = context.routing_active.clone();
         Rc::new(move |id| {
-            profile.borrow_mut().rules.retain(|rule| rule.id != id);
-            save();
+            {
+                profile.borrow_mut().rules.retain(|rule| rule.id != id);
+            }
+            let action = if routing_active.get() {
+                PostSaveAction::Request(apply_request(&profile.borrow()))
+            } else {
+                PostSaveAction::None
+            };
+            save(action);
         })
     };
-    let row = create_rule_row(
-        rule,
-        profile.borrow().id.clone(),
-        &lanes,
-        sender.clone(),
-        routing_active,
-        texts,
+    let row_context = RuleRowContext {
+        lanes,
+        texts: context.texts,
         on_change,
         on_delete,
-    );
-    group.add(&row);
-    rows.borrow_mut().push(row);
+    };
+    let row = create_rule_row(rule, row_context);
+    context.group.add(&row);
+    context.rows.borrow_mut().push(row);
+}
+
+fn rebuild_rule_rows(context: &RuleListContext) {
+    for row in context.rows.borrow_mut().drain(..) {
+        context.group.remove(&row);
+    }
+    let rules = context.profile.borrow().rules.clone();
+    for rule in rules {
+        append_rule(context, &rule);
+    }
+}
+
+fn apply_request(profile: &Profile) -> DaemonRequest {
+    let mut candidate = profile.clone();
+    candidate.enabled = true;
+    DaemonRequest::ApplyProfile(candidate)
+}
+
+fn store_profile(document: &mut crate::config::ConfigV2, current: Profile) {
+    if let Some(stored) = document
+        .profiles
+        .iter_mut()
+        .find(|stored| stored.id == current.id)
+    {
+        *stored = current;
+    } else {
+        document.profiles.push(current);
+    }
 }
 
 fn parse_target(value: &str) -> Option<RuleTarget> {
@@ -506,10 +667,10 @@ fn render_health(container: &gtk::Box, view: &ConnectionHealthView, texts: crate
             .xalign(0.0)
             .build(),
     );
-    if let Some(last) = &view.last_apply_generation {
+    if let Some(last) = &view.apply_generation {
         container.append(
             &gtk::Label::builder()
-                .label(&format!("{}: {}", texts.last_apply, last))
+                .label(&format!("{}: {}", texts.apply_generation, last))
                 .xalign(0.0)
                 .build(),
         );
@@ -568,12 +729,16 @@ fn refreshed_interface_selection(previous_name: Option<&str>, names: &[String]) 
 
 #[cfg(test)]
 mod tests {
-    use super::{daemon_unavailable_view, health_view, refreshed_interface_selection};
-    use routelane::domain::{HealthState, LaneId};
+    use super::{
+        configuration_error_view, daemon_unavailable_view, health_view,
+        refreshed_interface_selection, status_is_active,
+    };
+    use routelane::domain::{HealthState, LaneId, ProfileId};
     use routelane::health::{
         Diagnostic, DiagnosticCode, DiagnosticSubject, HealthReport, LaneHealth, Severity,
         SuggestedAction,
     };
+    use routelane::ipc::DaemonStatus;
 
     #[test]
     fn clears_selection_when_previous_interface_disappears() {
@@ -605,7 +770,7 @@ mod tests {
         );
         let view = health_view(&report, Some(42));
         assert_eq!(view.aggregate, "Degraded");
-        assert_eq!(view.last_apply_generation.as_deref(), Some("42"));
+        assert_eq!(view.apply_generation.as_deref(), Some("42"));
         assert_eq!(view.lanes, vec![("work".to_owned(), "Degraded".to_owned())]);
         assert_eq!(view.diagnostics[0].summary, "VPN interface is missing");
         assert_eq!(
@@ -626,5 +791,25 @@ mod tests {
             view.diagnostics[0].technical_detail,
             "systemd user activation failed"
         );
+    }
+
+    #[test]
+    fn configuration_failure_is_visible_and_not_presented_as_an_empty_config() {
+        let view = configuration_error_view("configuration is not owned by the current user");
+        assert_eq!(view.aggregate, "ConfigurationError");
+        assert!(view.diagnostics[0].technical_detail.contains("not owned"));
+    }
+
+    #[test]
+    fn failed_health_does_not_hide_a_previously_applied_profile() {
+        let status = DaemonStatus {
+            generation: 7,
+            health: HealthReport::from_parts(HealthState::Failed, Default::default(), vec![]),
+            desired_profile_id: Some(ProfileId::from("new")),
+            applied_profile_id: Some(ProfileId::from("old")),
+            last_error: None,
+        };
+
+        assert!(status_is_active(&status));
     }
 }
