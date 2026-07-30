@@ -75,6 +75,17 @@ fn block_counter_precedes_the_terminal_reject_verdict() {
 }
 
 #[test]
+fn direct_rule_counts_the_mark_reset_before_returning() {
+    let rendered = render_ruleset(&fixture_kernel_plan_with_all_actions(), TableMode::Create)
+        .expect("render direct rule");
+
+    assert!(
+        rendered.contains("ip daddr 198.51.100.7 meta mark set 0x00000000 counter return"),
+        "Direct observability requires its counter before the terminal return"
+    );
+}
+
+#[test]
 fn rejects_interface_value_that_cannot_be_a_kernel_interface() {
     let mut plan = fixture_kernel_plan_with_all_actions();
     plan.lanes[0].interface = "wg0\nflush ruleset".into();
