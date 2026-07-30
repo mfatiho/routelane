@@ -133,6 +133,14 @@ fn status_is_active(status: &DaemonStatus) -> bool {
     status.applied_profile_id.is_some()
 }
 
+fn accept_daemon_generation(last: &Cell<Option<u64>>, incoming: u64) -> bool {
+    if last.get().is_some_and(|generation| incoming < generation) {
+        return false;
+    }
+    last.set(Some(incoming));
+    true
+}
+
 #[derive(Debug)]
 enum PostSaveAction {
     None,
@@ -187,6 +195,7 @@ pub fn build_window(
     let updating_switch = Rc::new(Cell::new(false));
     let routing_active = Rc::new(Cell::new(false));
     let last_applied_profile_id = Rc::new(RefCell::new(None::<ProfileId>));
+    let last_daemon_generation = Rc::new(Cell::new(None::<u64>));
     let settings = gtk::Button::builder()
         .icon_name("preferences-system-symbolic")
         .tooltip_text(texts.settings_title)
@@ -501,6 +510,9 @@ pub fn build_window(
             while let Ok(event) = receiver.recv().await {
                 match event {
                     DaemonToUi::Status(status) => {
+                        if !accept_daemon_generation(&last_daemon_generation, status.generation) {
+                            continue;
+                        }
                         let is_active = status_is_active(&status);
                         *last_applied_profile_id.borrow_mut() = status.applied_profile_id.clone();
                         routing_active.set(is_active);
@@ -522,6 +534,9 @@ pub fn build_window(
                                 generation, health, ..
                             } => (generation, health),
                         };
+                        if !accept_daemon_generation(&last_daemon_generation, generation) {
+                            continue;
+                        }
                         title.set_subtitle(&format!("{:?}", health.state));
                         render_health(
                             &health_content,
@@ -822,9 +837,9 @@ fn refreshed_interface_selection(previous_name: Option<&str>, names: &[String]) 
 #[cfg(test)]
 mod tests {
     use super::{
-        configuration_error_view, daemon_unavailable_view, health_sections, health_view,
-        reconcile_profiles, refreshed_interface_selection, status_is_active,
-        switch_state_after_persistence_failure,
+        accept_daemon_generation, configuration_error_view, daemon_unavailable_view,
+        health_sections, health_view, reconcile_profiles, refreshed_interface_selection,
+        status_is_active, switch_state_after_persistence_failure,
     };
     use crate::ui::i18n::LanguageTexts;
     use routelane::config::ConfigV2;
@@ -909,6 +924,26 @@ mod tests {
         };
 
         assert!(status_is_active(&status));
+    }
+
+    #[test]
+    fn daemon_generation_guard_rejects_only_lower_updates() {
+        let last = std::cell::Cell::new(None);
+        let mut view = ("Healthy", true, None::<&str>);
+
+        assert!(accept_daemon_generation(&last, 2));
+        if accept_daemon_generation(&last, 1) {
+            view = ("Failed", false, Some("stale error"));
+        }
+        assert_eq!(view, ("Healthy", true, None));
+        assert_eq!(last.get(), Some(2));
+        if accept_daemon_generation(&last, 2) {
+            view = ("Degraded", true, Some("same generation update"));
+        }
+        assert_eq!(view.0, "Degraded");
+        assert_eq!(last.get(), Some(2));
+        assert!(accept_daemon_generation(&last, 3));
+        assert_eq!(last.get(), Some(3));
     }
 
     #[test]

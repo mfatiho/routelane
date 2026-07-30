@@ -1,6 +1,7 @@
 mod models;
 mod ui;
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use async_channel::{bounded, Receiver, Sender};
@@ -17,6 +18,21 @@ struct ConnectionPolicy {
     activation_timeout: Duration,
     initial_reconnect_delay: Duration,
     maximum_reconnect_delay: Duration,
+}
+
+#[derive(Debug)]
+struct EventSubscription {
+    receiver: tokio::sync::mpsc::Receiver<routelane::ipc::DaemonEvent>,
+    buffered: VecDeque<routelane::ipc::DaemonEvent>,
+}
+
+impl EventSubscription {
+    async fn recv(&mut self) -> Option<routelane::ipc::DaemonEvent> {
+        match self.buffered.pop_front() {
+            Some(event) => Some(event),
+            None => self.receiver.recv().await,
+        }
+    }
 }
 
 impl Default for ConnectionPolicy {
@@ -172,18 +188,14 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
 
 async fn request_status(
     client: &DaemonClient,
-    sender: &Sender<DaemonToUi>,
     policy: ConnectionPolicy,
-) -> Result<(), IpcError> {
+) -> Result<routelane::ipc::DaemonStatus, IpcError> {
     let response = send_with_timeout(client, DaemonRequest::GetStatus, policy).await?;
     if let Some(error) = response.error {
         return Err(error);
     }
     match response.result {
-        Some(DaemonResult::Status(status)) => {
-            let _ = sender.send(DaemonToUi::Status(status)).await;
-            Ok(())
-        }
+        Some(DaemonResult::Status(status)) => Ok(status),
         _ => Err(IpcError::new(
             "IPC_INVALID_RESPONSE",
             "status request returned an unexpected response",
@@ -193,18 +205,14 @@ async fn request_status(
 
 async fn request_profiles(
     client: &DaemonClient,
-    sender: &Sender<DaemonToUi>,
     policy: ConnectionPolicy,
-) -> Result<(), IpcError> {
+) -> Result<Vec<routelane::domain::Profile>, IpcError> {
     let response = send_with_timeout(client, DaemonRequest::ListProfiles, policy).await?;
     if let Some(error) = response.error {
         return Err(error);
     }
     match response.result {
-        Some(DaemonResult::Profiles(profiles)) => {
-            let _ = sender.send(DaemonToUi::Profiles(profiles)).await;
-            Ok(())
-        }
+        Some(DaemonResult::Profiles(profiles)) => Ok(profiles),
         _ => Err(IpcError::new(
             "IPC_INVALID_RESPONSE",
             "profile request returned an unexpected response",
@@ -216,26 +224,37 @@ async fn refresh_daemon_state(
     client: &DaemonClient,
     sender: &Sender<DaemonToUi>,
     policy: ConnectionPolicy,
-) -> Result<(), IpcError> {
-    request_status(client, sender, policy).await?;
-    request_profiles(client, sender, policy).await
+) -> Result<u64, IpcError> {
+    let status = request_status(client, policy).await?;
+    let profiles = request_profiles(client, policy).await?;
+    let generation = status.generation;
+    let _ = sender.send(DaemonToUi::Status(status)).await;
+    let _ = sender.send(DaemonToUi::Profiles(profiles)).await;
+    Ok(generation)
 }
 
 async fn establish_subscription_and_refresh(
     client: &DaemonClient,
     sender: &Sender<DaemonToUi>,
     policy: ConnectionPolicy,
-) -> Result<tokio::sync::mpsc::Receiver<routelane::ipc::DaemonEvent>, IpcError> {
-    let events = subscribe_with_timeout(client, policy).await?;
-    refresh_daemon_state(client, sender, policy).await?;
-    Ok(events)
+) -> Result<EventSubscription, IpcError> {
+    let mut receiver = subscribe_with_timeout(client, policy).await?;
+    let snapshot_generation = refresh_daemon_state(client, sender, policy).await?;
+    tokio::task::yield_now().await;
+    let mut buffered = VecDeque::new();
+    while let Ok(event) = receiver.try_recv() {
+        if daemon_event_generation(&event) > snapshot_generation {
+            buffered.push_back(event);
+        }
+    }
+    Ok(EventSubscription { receiver, buffered })
 }
 
 async fn wait_for_daemon(
     client: &DaemonClient,
     sender: &Sender<DaemonToUi>,
     policy: ConnectionPolicy,
-) -> Result<tokio::sync::mpsc::Receiver<routelane::ipc::DaemonEvent>, IpcError> {
+) -> Result<EventSubscription, IpcError> {
     let mut last_error = IpcError::new("IPC_CONNECT_FAILED", "daemon did not create its socket");
     for attempt in 0..6 {
         match establish_subscription_and_refresh(client, sender, policy).await {
@@ -245,6 +264,13 @@ async fn wait_for_daemon(
         tokio::time::sleep(policy.reconnect_delay(attempt)).await;
     }
     Err(last_error)
+}
+
+fn daemon_event_generation(event: &routelane::ipc::DaemonEvent) -> u64 {
+    match event {
+        routelane::ipc::DaemonEvent::StateChanged { generation, .. }
+        | routelane::ipc::DaemonEvent::OperationFailed { generation, .. } => *generation,
+    }
 }
 
 async fn activate_user_daemon(policy: ConnectionPolicy) -> std::io::Result<()> {
@@ -312,6 +338,7 @@ fn request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::{establish_subscription_and_refresh, ConnectionPolicy};
+    use crate::models::DaemonToUi;
     use async_channel::bounded;
     use routelane::domain::{Profile, ProfileId};
     use routelane::health::HealthReport;
@@ -323,18 +350,9 @@ mod tests {
     use tempfile::TempDir;
     use tokio::net::UnixListener;
 
-    #[test]
-    fn connection_policy_bounds_io_and_exponential_reconnect_delay() {
-        let policy = ConnectionPolicy::default();
-
-        assert!(policy.request_timeout <= Duration::from_secs(5));
-        assert!(policy.activation_timeout <= Duration::from_secs(10));
-        assert_eq!(policy.reconnect_delay(0), Duration::from_millis(250));
-        assert_eq!(policy.reconnect_delay(20), policy.maximum_reconnect_delay);
-    }
-
-    #[tokio::test]
-    async fn event_after_subscription_ack_is_buffered_before_authoritative_snapshots() {
+    async fn run_snapshot_scenario(
+        event_generation: u64,
+    ) -> (Option<DaemonEvent>, Vec<DaemonToUi>, Vec<DaemonRequest>) {
         let runtime = TempDir::new().unwrap();
         let path = runtime.path().join("daemon.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -373,6 +391,125 @@ mod tests {
                     write_frame(
                         &mut stream,
                         &DaemonEvent::StateChanged {
+                            generation: event_generation,
+                            health: HealthReport::applying(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    subscription = Some(stream);
+                }
+            }
+            drop(subscription);
+        });
+        let client = DaemonClient::new(path);
+        let (ui_sender, ui_receiver) = bounded(4);
+        let mut events =
+            establish_subscription_and_refresh(&client, &ui_sender, ConnectionPolicy::default())
+                .await
+                .unwrap();
+        let event = tokio::time::timeout(Duration::from_millis(100), events.recv())
+            .await
+            .ok()
+            .flatten();
+        let ui = vec![
+            ui_receiver.recv().await.unwrap(),
+            ui_receiver.recv().await.unwrap(),
+        ];
+        let order = vec![
+            order_receiver.recv().await.unwrap(),
+            order_receiver.recv().await.unwrap(),
+            order_receiver.recv().await.unwrap(),
+        ];
+        (event, ui, order)
+    }
+
+    #[test]
+    fn connection_policy_bounds_io_and_exponential_reconnect_delay() {
+        let policy = ConnectionPolicy::default();
+
+        assert!(policy.request_timeout <= Duration::from_secs(5));
+        assert!(policy.activation_timeout <= Duration::from_secs(10));
+        assert_eq!(policy.reconnect_delay(0), Duration::from_millis(250));
+        assert_eq!(policy.reconnect_delay(20), policy.maximum_reconnect_delay);
+    }
+
+    #[tokio::test]
+    async fn buffered_event_not_newer_than_snapshot_is_discarded() {
+        let (event, ui, order) = run_snapshot_scenario(1).await;
+
+        assert_eq!(
+            order,
+            vec![
+                DaemonRequest::Subscribe,
+                DaemonRequest::GetStatus,
+                DaemonRequest::ListProfiles,
+            ]
+        );
+        assert_eq!(event, None);
+        assert!(matches!(
+            &ui[0],
+            DaemonToUi::Status(DaemonStatus { generation: 2, .. })
+        ));
+        assert!(matches!(
+            &ui[1],
+            DaemonToUi::Profiles(profiles)
+                if profiles.len() == 1 && profiles[0].id == ProfileId::from("canonical")
+        ));
+    }
+
+    #[tokio::test]
+    async fn buffered_event_newer_than_snapshot_is_delivered() {
+        let (event, ui, _) = run_snapshot_scenario(3).await;
+
+        assert!(matches!(
+            event,
+            Some(DaemonEvent::StateChanged { generation: 3, .. })
+        ));
+        assert!(matches!(
+            &ui[0],
+            DaemonToUi::Status(DaemonStatus { generation: 2, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_drops_buffered_events_and_partial_snapshot() {
+        let runtime = TempDir::new().unwrap();
+        let path = runtime.path().join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let mut subscription = None;
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let envelope: DaemonEnvelope = read_frame(&mut stream).await.unwrap();
+                let response = match envelope.request {
+                    DaemonRequest::Subscribe => {
+                        DaemonResponse::success(envelope.request_id, DaemonResult::Subscribed)
+                    }
+                    DaemonRequest::GetStatus => DaemonResponse::success(
+                        envelope.request_id,
+                        DaemonResult::Status(DaemonStatus {
+                            generation: 2,
+                            health: HealthReport::inactive(),
+                            desired_profile_id: None,
+                            applied_profile_id: None,
+                            last_error: None,
+                        }),
+                    ),
+                    DaemonRequest::ListProfiles => DaemonResponse::failure(
+                        envelope.request_id,
+                        routelane::ipc::IpcError::new(
+                            "CONFIG_SNAPSHOT_FAILED",
+                            "profile snapshot failed",
+                        ),
+                    ),
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                write_frame(&mut stream, &response).await.unwrap();
+                if matches!(envelope.request, DaemonRequest::Subscribe) {
+                    write_frame(
+                        &mut stream,
+                        &DaemonEvent::StateChanged {
                             generation: 1,
                             health: HealthReport::applying(),
                         },
@@ -387,37 +524,17 @@ mod tests {
         let client = DaemonClient::new(path);
         let (ui_sender, ui_receiver) = bounded(4);
 
-        let mut events =
+        let error =
             establish_subscription_and_refresh(&client, &ui_sender, ConnectionPolicy::default())
                 .await
-                .unwrap();
+                .unwrap_err();
 
-        assert_eq!(
-            order_receiver.recv().await.unwrap(),
-            DaemonRequest::Subscribe
+        assert_eq!(error.code, "CONFIG_SNAPSHOT_FAILED");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), ui_receiver.recv())
+                .await
+                .is_err(),
+            "failed refresh must not expose a partial snapshot or buffered event"
         );
-        assert_eq!(
-            order_receiver.recv().await.unwrap(),
-            DaemonRequest::GetStatus
-        );
-        assert_eq!(
-            order_receiver.recv().await.unwrap(),
-            DaemonRequest::ListProfiles
-        );
-        assert!(matches!(
-            events.recv().await,
-            Some(DaemonEvent::StateChanged { generation: 1, .. })
-        ));
-        assert!(matches!(
-            ui_receiver.recv().await.unwrap(),
-            crate::models::DaemonToUi::Status(DaemonStatus { generation: 2, .. })
-        ));
-        match ui_receiver.recv().await.unwrap() {
-            crate::models::DaemonToUi::Profiles(profiles) => {
-                assert_eq!(profiles.len(), 1);
-                assert_eq!(profiles[0].id, ProfileId::from("canonical"));
-            }
-            other => panic!("unexpected UI snapshot: {other:?}"),
-        }
     }
 }
