@@ -44,6 +44,8 @@ pub enum LaneFailurePolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lane {
     pub id: LaneId,
+    #[serde(default)]
+    pub name: String,
     pub interface: InterfaceSelector,
     pub fallback_lane: Option<LaneId>,
     pub failure_policy: LaneFailurePolicy,
@@ -147,6 +149,7 @@ mod tests {
     fn fixture_lane(id: &str, interface: &str) -> Lane {
         Lane {
             id: LaneId::from(id),
+            name: id.to_owned(),
             interface: InterfaceSelector::from(interface),
             fallback_lane: None,
             failure_policy: LaneFailurePolicy::Inactive,

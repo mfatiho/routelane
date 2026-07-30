@@ -12,6 +12,7 @@ use routelane::domain::{
 fn lane(id: &str, interface: &str) -> Lane {
     Lane {
         id: LaneId::from(id),
+        name: id.to_owned(),
         interface: InterfaceSelector::from(interface),
         fallback_lane: None,
         failure_policy: LaneFailurePolicy::Inactive,

@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 
@@ -7,568 +6,561 @@ use async_channel::{Receiver, Sender};
 use glib::signal::Inhibit;
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
+use routelane::domain::{
+    HealthState, Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource, RuleTarget,
+};
+use routelane::health::HealthReport;
+use routelane::ipc::{DaemonEvent, DaemonRequest};
 
-use crate::config::{Language, PersistedState};
-use crate::models::{EngineToUi, NetworkInterface, RuleTarget, UiToEngine};
+use crate::config::{ConfigRepository, Language};
+use crate::models::{DaemonToUi, UiToDaemon};
 use crate::ui::rule_row::create_rule_row;
 use crate::ui::settings::build_settings_dialog;
 use crate::ui::tray::{spawn_tray, TrayCommand, APP_ICON_NAME};
 
-const TOAST_TIMEOUT_SHORT: u32 = 4;
-const TOAST_TIMEOUT_LONG: u32 = 7;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthDiagnosticView {
+    pub summary: String,
+    pub action: Option<String>,
+    pub technical_detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionHealthView {
+    pub aggregate: String,
+    pub last_apply_generation: Option<String>,
+    pub lanes: Vec<(String, String)>,
+    pub diagnostics: Vec<HealthDiagnosticView>,
+}
+
+pub fn health_view(report: &HealthReport, generation: Option<u64>) -> ConnectionHealthView {
+    ConnectionHealthView {
+        aggregate: format!("{:?}", report.state),
+        last_apply_generation: generation.map(|value| value.to_string()),
+        lanes: report
+            .lanes
+            .iter()
+            .map(|(lane, state)| (lane.as_str().to_owned(), format!("{state:?}")))
+            .collect(),
+        diagnostics: report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| HealthDiagnosticView {
+                summary: diagnostic.summary.clone(),
+                action: diagnostic
+                    .suggested_action
+                    .as_ref()
+                    .map(|action| action.description.clone()),
+                technical_detail: diagnostic.technical_detail.clone(),
+            })
+            .collect(),
+    }
+}
+
+pub fn daemon_unavailable_view(detail: impl Into<String>) -> ConnectionHealthView {
+    ConnectionHealthView {
+        aggregate: "DaemonUnavailable".to_owned(),
+        last_apply_generation: None,
+        lanes: Vec::new(),
+        diagnostics: vec![HealthDiagnosticView {
+            summary: "RouteLane daemon is unavailable".to_owned(),
+            action: Some("Start the RouteLane user service and try again".to_owned()),
+            technical_detail: detail.into(),
+        }],
+    }
+}
 
 pub fn build_window(
     app: &adw::Application,
-    ui_sender: Sender<UiToEngine>,
-    engine_receiver: Receiver<EngineToUi>,
+    sender: Sender<UiToDaemon>,
+    receiver: Receiver<DaemonToUi>,
 ) {
     gtk::Window::set_default_icon_name(APP_ICON_NAME);
-    let initial_language = PersistedState::load().language;
-    let current_language = Rc::new(RefCell::new(initial_language));
-    let tray_language = Arc::new(Mutex::new(initial_language));
-    let texts = initial_language.texts();
+    let repository = ConfigRepository::user_default();
+    let mut document = repository.load().unwrap_or_default();
+    if document.profiles.is_empty() {
+        document.profiles.push(empty_default_profile());
+    }
+    let language = document.language;
+    let texts = language.texts();
+    let document = Rc::new(RefCell::new(document));
+    let profile = Rc::new(RefCell::new(document.borrow().profiles[0].clone()));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("RouteLane")
-        .icon_name(APP_ICON_NAME)
-        .default_width(480)
-        .default_height(640)
+        .default_width(720)
+        .default_height(720)
         .build();
+    let header = adw::HeaderBar::new();
+    let title = adw::WindowTitle::builder()
+        .title("RouteLane")
+        .subtitle(texts.inactive)
+        .build();
+    header.set_title_widget(Some(&title));
+    let active = gtk::Switch::builder()
+        .tooltip_text(texts.service_tooltip)
+        .valign(gtk::Align::Center)
+        .build();
+    let updating_switch = Rc::new(Cell::new(false));
+    let routing_active = Rc::new(Cell::new(false));
+    let settings = gtk::Button::builder()
+        .icon_name("preferences-system-symbolic")
+        .tooltip_text(texts.settings_title)
+        .build();
+    settings.add_css_class("flat");
+    header.pack_end(&settings);
+    header.pack_end(&active);
+
+    let page = adw::PreferencesPage::new();
+    let health_group = adw::PreferencesGroup::builder()
+        .title(texts.health_title)
+        .build();
+    let health_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let health_row = adw::ActionRow::new();
+    health_row.set_child(Some(&health_content));
+    health_group.add(&health_row);
+    render_health(
+        &health_content,
+        &health_view(&HealthReport::inactive(), None),
+        texts,
+    );
+    page.add(&health_group);
+
+    let rules_group = adw::PreferencesGroup::builder()
+        .title(texts.rules_title)
+        .description(texts.rules_description)
+        .build();
+    let add_row = adw::ActionRow::builder()
+        .title(texts.add_address_title)
+        .build();
+    let target = gtk::Entry::builder()
+        .placeholder_text(texts.address_placeholder)
+        .hexpand(true)
+        .build();
+    let actions =
+        gtk::StringList::new(&[texts.action_route, texts.action_direct, texts.action_block]);
+    let action = gtk::DropDown::builder().model(&actions).build();
+    let priority = gtk::SpinButton::with_range(1.0, 4_294_967_295.0, 1.0);
+    priority.set_value(100.0);
+    let add = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text(texts.add_rule_tooltip)
+        .build();
+    add_row.add_suffix(&target);
+    add_row.add_suffix(&action);
+    add_row.add_suffix(&priority);
+    add_row.add_suffix(&add);
+    rules_group.add(&add_row);
+    page.add(&rules_group);
+
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&page));
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    body.append(&header);
+    body.append(&toast_overlay);
+    window.set_content(Some(&body));
+
+    let save_profile: Rc<dyn Fn()> = {
+        let document = document.clone();
+        let profile = profile.clone();
+        let active = active.clone();
+        let sender = sender.clone();
+        Rc::new(move || {
+            let mut document = document.borrow_mut();
+            let current = profile.borrow().clone();
+            if let Some(stored) = document
+                .profiles
+                .iter_mut()
+                .find(|stored| stored.id == current.id)
+            {
+                *stored = current;
+            } else {
+                document.profiles.push(current);
+            }
+            if let Err(error) = repository.save(&document) {
+                log::warn!("Could not save RouteLane configuration: {error}");
+            }
+            if active.is_active() {
+                let mut candidate = profile.borrow().clone();
+                candidate.enabled = true;
+                let sender = sender.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    sender
+                        .send(UiToDaemon::Request(DaemonRequest::ApplyProfile(candidate)))
+                        .await
+                        .ok();
+                });
+            }
+        })
+    };
+
+    let rows = Rc::new(RefCell::new(Vec::<adw::ActionRow>::new()));
+    for rule in profile.borrow().rules.clone() {
+        append_rule(
+            &rules_group,
+            &rows,
+            &profile,
+            &rule,
+            &sender,
+            routing_active.clone(),
+            texts,
+            save_profile.clone(),
+        );
+    }
+
+    {
+        let window = window.clone();
+        let profile = profile.clone();
+        let save_profile = save_profile.clone();
+        let document = document.clone();
+        settings.connect_clicked(move |_| {
+            let initial_language = document.borrow().language;
+            let on_language: Rc<dyn Fn(Language)> = {
+                let document = document.clone();
+                Rc::new(move |language| {
+                    document.borrow_mut().language = language;
+                    if let Err(error) = ConfigRepository::user_default().save(&document.borrow()) {
+                        log::warn!("Could not save language preference: {error}");
+                    }
+                })
+            };
+            let dialog = build_settings_dialog(
+                &window,
+                texts,
+                profile.clone(),
+                save_profile.clone(),
+                initial_language,
+                on_language,
+            );
+            dialog.present();
+        });
+    }
+    {
+        let sender = sender.clone();
+        let profile = profile.clone();
+        let updating_switch = updating_switch.clone();
+        active.connect_state_set(move |_, state| {
+            if updating_switch.get() {
+                return Inhibit(false);
+            }
+            let request = if state {
+                let mut candidate = profile.borrow().clone();
+                candidate.enabled = true;
+                DaemonRequest::ApplyProfile(candidate)
+            } else {
+                DaemonRequest::Deactivate
+            };
+            let sender = sender.clone();
+            glib::MainContext::default().spawn_local(async move {
+                sender.send(UiToDaemon::Request(request)).await.ok();
+            });
+            Inhibit(false)
+        });
+    }
+    {
+        let rules_group = rules_group.clone();
+        let rows = rows.clone();
+        let profile = profile.clone();
+        let sender = sender.clone();
+        let save_profile = save_profile.clone();
+        let routing_active = routing_active.clone();
+        let target_for_add = target.clone();
+        let add_rule = move || {
+            let text = target_for_add.text().trim().to_owned();
+            let Some(target_value) = parse_target(&text) else {
+                return;
+            };
+            let rule_action = match action.selected() {
+                1 => RuleAction::Direct,
+                2 => RuleAction::Block,
+                _ => profile
+                    .borrow()
+                    .lanes
+                    .first()
+                    .map(|lane| RuleAction::Route(lane.id.clone()))
+                    .unwrap_or(RuleAction::Direct),
+            };
+            let rule = Rule {
+                id: RuleId::from(format!("rule-{}", uuid::Uuid::new_v4()).as_str()),
+                enabled: true,
+                priority: priority.value_as_int().max(1) as u32,
+                source: RuleSource::Any,
+                target: target_value,
+                action: rule_action,
+            };
+            profile.borrow_mut().rules.push(rule.clone());
+            save_profile();
+            append_rule(
+                &rules_group,
+                &rows,
+                &profile,
+                &rule,
+                &sender,
+                routing_active.clone(),
+                texts,
+                save_profile.clone(),
+            );
+            target_for_add.set_text("");
+        };
+        add.connect_clicked({
+            let add_rule = add_rule.clone();
+            move |_| add_rule()
+        });
+        target.connect_activate(move |_| add_rule());
+    }
+
+    {
+        let active = active.clone();
+        let updating_switch = updating_switch.clone();
+        let routing_active = routing_active.clone();
+        let title = title.clone();
+        let health_content = health_content.clone();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(event) = receiver.recv().await {
+                match event {
+                    DaemonToUi::Status(status) => {
+                        routing_active.set(status.applied_profile_id.is_some());
+                        updating_switch.set(true);
+                        active.set_active(status.applied_profile_id.is_some());
+                        updating_switch.set(false);
+                        title.set_subtitle(&format!("{:?}", status.health.state));
+                        render_health(
+                            &health_content,
+                            &health_view(&status.health, Some(status.generation)),
+                            texts,
+                        );
+                    }
+                    DaemonToUi::Event(event) => {
+                        let (generation, health) = match event {
+                            DaemonEvent::StateChanged { generation, health }
+                            | DaemonEvent::OperationFailed {
+                                generation, health, ..
+                            } => (generation, health),
+                        };
+                        routing_active.set(!matches!(
+                            health.state,
+                            HealthState::Inactive | HealthState::Failed
+                        ));
+                        updating_switch.set(true);
+                        active.set_active(!matches!(health.state, HealthState::Inactive));
+                        updating_switch.set(false);
+                        title.set_subtitle(&format!("{:?}", health.state));
+                        render_health(
+                            &health_content,
+                            &health_view(&health, Some(generation)),
+                            texts,
+                        );
+                    }
+                    DaemonToUi::DaemonUnavailable(detail) => {
+                        routing_active.set(false);
+                        updating_switch.set(true);
+                        active.set_active(false);
+                        updating_switch.set(false);
+                        title.set_subtitle("DaemonUnavailable");
+                        render_health(&health_content, &daemon_unavailable_view(detail), texts);
+                    }
+                    DaemonToUi::Error(error) => {
+                        toast_overlay.add_toast(
+                            &adw::Toast::builder()
+                                .title(&error.to_string())
+                                .timeout(7)
+                                .build(),
+                        );
+                    }
+                    DaemonToUi::Applied(result) => {
+                        title.set_subtitle(&format!("Applying generation {}", result.generation));
+                        let sender = sender.clone();
+                        glib::MainContext::default().spawn_local(async move {
+                            sender
+                                .send(UiToDaemon::Request(DaemonRequest::GetStatus))
+                                .await
+                                .ok();
+                        });
+                    }
+                    DaemonToUi::Deactivated => {
+                        routing_active.set(false);
+                        updating_switch.set(true);
+                        active.set_active(false);
+                        updating_switch.set(false);
+                        render_health(
+                            &health_content,
+                            &health_view(&HealthReport::inactive(), None),
+                            texts,
+                        );
+                    }
+                    DaemonToUi::Profiles(profiles) => {
+                        log::debug!("daemon returned {} profile(s)", profiles.len());
+                    }
+                }
+            }
+        });
+    }
 
     let (tray_sender, tray_receiver) =
         glib::MainContext::channel::<TrayCommand>(glib::PRIORITY_DEFAULT);
-    let tray_available = spawn_tray(tray_sender, tray_language.clone());
-
+    let tray_language = Arc::new(Mutex::new(language));
+    let tray_available = spawn_tray(tray_sender, tray_language);
     {
         let window = window.clone();
         let app = app.clone();
         tray_receiver.attach(None, move |command| {
             match command {
-                TrayCommand::ShowWindow => {
-                    window.present();
-                }
-                TrayCommand::Quit => {
-                    app.quit();
-                }
+                TrayCommand::ShowWindow => window.present(),
+                TrayCommand::Quit => app.quit(),
             }
             glib::Continue(true)
         });
     }
-
-    {
-        let window = window.clone();
-        let tray_available = tray_available.clone();
-        window.connect_close_request(move |window| {
-            if tray_available.load(Ordering::Relaxed) {
-                window.hide();
-                Inhibit(true)
-            } else {
-                Inhibit(false)
-            }
-        });
-    }
-
-    // ── HeaderBar ─────────────────────────────────────────────────────────────
-    let header = adw::HeaderBar::new();
-
-    let window_title = adw::WindowTitle::builder()
-        .title("RouteLane")
-        .subtitle(texts.inactive)
-        .build();
-    header.set_title_widget(Some(&window_title));
-
-    // Servis switch + etiket
-    let routing_label = gtk::Label::builder()
-        .label(texts.routing_label)
-        .valign(gtk::Align::Center)
-        .build();
-    let service_switch = gtk::Switch::builder()
-        .valign(gtk::Align::Center)
-        .tooltip_text(texts.service_tooltip)
-        .build();
-    let switch_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .valign(gtk::Align::Center)
-        .build();
-    switch_box.append(&routing_label);
-    switch_box.append(&service_switch);
-
-    // Tercihler butonu
-    let prefs_btn = gtk::Button::builder()
-        .icon_name("preferences-system-symbolic")
-        .valign(gtk::Align::Center)
-        .tooltip_text(texts.settings_title)
-        .build();
-    prefs_btn.add_css_class("flat");
-
-    // Menü butonu (⋮) — popover içinde Reset
-    let reset_popover_btn = gtk::Button::builder().label(texts.menu_reset).build();
-    reset_popover_btn.add_css_class("destructive-action");
-    reset_popover_btn.add_css_class("flat");
-
-    let reset_popover_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .margin_top(6)
-        .margin_bottom(6)
-        .margin_start(6)
-        .margin_end(6)
-        .build();
-    reset_popover_box.append(&reset_popover_btn);
-
-    let reset_popover = gtk::Popover::new();
-    reset_popover.set_child(Some(&reset_popover_box));
-
-    let menu_btn = gtk::MenuButton::builder()
-        .icon_name("open-menu-symbolic")
-        .valign(gtk::Align::Center)
-        .popover(&reset_popover)
-        .build();
-
-    header.pack_end(&menu_btn);
-    header.pack_end(&prefs_btn);
-    header.pack_end(&switch_box);
-
-    // ── Toast overlay + içerik ────────────────────────────────────────────────
-    let toast_overlay = adw::ToastOverlay::new();
-
-    let prefs_page = adw::PreferencesPage::new();
-    toast_overlay.set_child(Some(&prefs_page));
-
-    // ── Settings diyaloğu ────────────────────────────────────────────────────
-    let sw = build_settings_dialog(&window, texts, initial_language.index());
-    let default_info_row = sw.default_info_row.clone();
-    let alt_combo = sw.alt_combo.clone();
-    let language_combo = sw.language_combo.clone();
-    let iface_group = sw.iface_group.clone();
-    let language_group = sw.language_group.clone();
-
-    // ── Yönlendirme Kuralları ─────────────────────────────────────────────────
-    let rules_group = adw::PreferencesGroup::builder()
-        .title(texts.rules_title)
-        .description(texts.rules_description)
-        .build();
-
-    // Kural ekleme satırı
-    let add_row = adw::ActionRow::builder()
-        .title(texts.add_address_title)
-        .build();
-
-    let target_entry = gtk::Entry::builder()
-        .placeholder_text(texts.address_placeholder)
-        .hexpand(true)
-        .valign(gtk::Align::Center)
-        .build();
-
-    let add_btn = gtk::Button::builder()
-        .icon_name("list-add-symbolic")
-        .valign(gtk::Align::Center)
-        .tooltip_text(texts.add_rule_tooltip)
-        .build();
-    add_btn.add_css_class("flat");
-    add_btn.add_css_class("circular");
-
-    add_row.add_suffix(&target_entry);
-    add_row.add_suffix(&add_btn);
-    add_row.set_activatable_widget(Some(&add_btn));
-    rules_group.add(&add_row);
-
-    // Boş durum satırı — kural yokken görünür
-    let empty_icon = gtk::Image::from_icon_name("list-add-symbolic");
-    empty_icon.set_pixel_size(32);
-    empty_icon.set_opacity(0.35);
-
-    let empty_row = adw::ActionRow::new();
-    empty_row.set_title(texts.no_rules_title);
-    empty_row.set_subtitle(texts.no_rules_subtitle);
-    empty_row.set_sensitive(false);
-    empty_row.add_prefix(&empty_icon);
-    rules_group.add(&empty_row);
-
-    prefs_page.add(&rules_group);
-
-    // ── Pencere düzeni ────────────────────────────────────────────────────────
-    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    vbox.append(&header);
-    vbox.append(&toast_overlay);
-    window.set_content(Some(&vbox));
-
-    // ── Paylaşılan state ──────────────────────────────────────────────────────
-    let rule_rows: Rc<RefCell<HashMap<u64, adw::ActionRow>>> =
-        Rc::new(RefCell::new(HashMap::new()));
-
-    let iface_model: Rc<RefCell<Vec<NetworkInterface>>> = Rc::new(RefCell::new(Vec::new()));
-
-    // Kaç kural var — boş durum satırını göster/gizle için
-    let rule_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
-
-    // ── Sinyaller ─────────────────────────────────────────────────────────────
-
-    // Tercihler butonu
-    {
-        let settings_dialog = sw.dialog.clone();
-        let sender = ui_sender.clone();
-        prefs_btn.connect_clicked(move |_| {
-            let sender = sender.clone();
-            glib::MainContext::default().spawn_local(async move {
-                sender.send(UiToEngine::RefreshInterfaces).await.ok();
-            });
-            settings_dialog.present();
-        });
-    }
-
-    // Dil seçimi
-    {
-        let current_language = current_language.clone();
-        let tray_language = tray_language.clone();
-        let window_title = window_title.clone();
-        let service_switch = service_switch.clone();
-        let rules_group = rules_group.clone();
-        let add_row = add_row.clone();
-        let target_entry = target_entry.clone();
-        let add_btn = add_btn.clone();
-        let empty_row = empty_row.clone();
-        let iface_group = iface_group.clone();
-        let language_group = language_group.clone();
-        let iface_model = iface_model.clone();
-        let default_info_row = default_info_row.clone();
-        let alt_combo = alt_combo.clone();
-        let language_combo_widget = language_combo.clone();
-
-        language_combo.connect_selected_notify(move |combo| {
-            let language = Language::from_index(combo.selected());
-            if *current_language.borrow() == language {
-                return;
-            }
-
-            *current_language.borrow_mut() = language;
-            if let Ok(mut tray_language) = tray_language.lock() {
-                *tray_language = language;
-            }
-            if let Err(err) = PersistedState::save_language(language) {
-                log::warn!("Dil ayarı kaydedilemedi: {}", err);
-            }
-
-            let texts = language.texts();
-            if !service_switch.is_active() {
-                window_title.set_subtitle(texts.inactive);
-            }
-            service_switch.set_tooltip_text(Some(texts.service_tooltip));
-
-            rules_group.set_title(texts.rules_title);
-            rules_group.set_description(Some(texts.rules_description));
-            add_row.set_title(texts.add_address_title);
-            target_entry.set_placeholder_text(Some(texts.address_placeholder));
-            add_btn.set_tooltip_text(Some(texts.add_rule_tooltip));
-            empty_row.set_title(texts.no_rules_title);
-            empty_row.set_subtitle(texts.no_rules_subtitle);
-
-            // Settings diyaloğu widget'larını güncelle
-            iface_group.set_title(texts.network_title);
-            iface_group.set_description(Some(texts.network_description));
-            default_info_row.set_title(texts.default_connection_title);
-            let ifaces = iface_model.borrow();
-            if let Some(def) = ifaces.iter().find(|i| i.is_default) {
-                let gw = def.gateway.as_deref().unwrap_or("?");
-                default_info_row.set_subtitle(&language.default_gateway_subtitle(&def.name, gw));
-            } else if ifaces.is_empty() {
-                default_info_row.set_subtitle(texts.detecting);
-            } else {
-                default_info_row.set_subtitle(texts.default_not_found);
-            }
-            alt_combo.set_title(texts.exception_network_title);
-            if ifaces.is_empty() {
-                alt_combo.set_subtitle(texts.no_interfaces);
-            } else if alt_combo.selected() == gtk::INVALID_LIST_POSITION {
-                alt_combo.set_subtitle(texts.exception_select_prompt);
-            } else {
-                alt_combo.set_subtitle(texts.exception_subtitle);
-            }
-            drop(ifaces);
-            language_group.set_title(texts.language_title);
-            language_group.set_description(Some(texts.language_description));
-            language_combo_widget.set_title(texts.language_row_title);
-            language_combo_widget.set_subtitle(texts.language_row_subtitle);
-        });
-    }
-
-    // Sıfırla butonu — onay diyaloğu ile
-    {
-        let sender = ui_sender.clone();
-        let window = window.clone();
-        let current_language = current_language.clone();
-        let reset_popover = reset_popover.clone();
-        reset_popover_btn.connect_clicked(move |_| {
-            reset_popover.popdown();
-            let texts = current_language.borrow().texts();
-            let dialog = gtk::MessageDialog::builder()
-                .transient_for(&window)
-                .modal(true)
-                .message_type(gtk::MessageType::Warning)
-                .text(texts.reset_dialog_heading)
-                .secondary_text(texts.reset_dialog_body)
-                .build();
-            dialog.add_button(texts.reset_dialog_cancel, gtk::ResponseType::Cancel);
-            let confirm_widget =
-                dialog.add_button(texts.reset_dialog_confirm, gtk::ResponseType::Accept);
-            if let Some(btn) = confirm_widget.downcast_ref::<gtk::Button>() {
-                btn.add_css_class("destructive-action");
-            }
-            let sender = sender.clone();
-            dialog.connect_response(move |dlg, response| {
-                dlg.close();
-                if response == gtk::ResponseType::Accept {
-                    let sender = sender.clone();
-                    glib::MainContext::default().spawn_local(async move {
-                        sender.send(UiToEngine::Reset).await.ok();
-                    });
-                }
-            });
-            dialog.present();
-        });
-    }
-
-    // Servis switch'i
-    {
-        let sender = ui_sender.clone();
-        service_switch.connect_state_set(move |_sw, active| {
-            let sender = sender.clone();
-            glib::MainContext::default().spawn_local(async move {
-                sender.send(UiToEngine::SetActive(active)).await.ok();
-            });
+    window.connect_close_request(move |window| {
+        if tray_available.load(Ordering::Relaxed) {
+            window.hide();
+            Inhibit(true)
+        } else {
             Inhibit(false)
-        });
-    }
-
-    // İstisna ağı seçildiğinde engine'e bildir
-    {
-        let sender = ui_sender.clone();
-        let iface_model = iface_model.clone();
-        alt_combo.connect_selected_notify(move |combo| {
-            if combo.selected() == gtk::INVALID_LIST_POSITION {
-                return;
-            }
-            let idx = combo.selected() as usize;
-            let model = iface_model.borrow();
-            if let Some(iface) = model.get(idx) {
-                let name = iface.name.clone();
-                let sender = sender.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    sender
-                        .send(UiToEngine::SetAltInterface { interface: name })
-                        .await
-                        .ok();
-                });
-            }
-        });
-    }
-
-    // Kural ekleme
-    let add_rule = {
-        let sender = ui_sender.clone();
-        let target_entry = target_entry.clone();
-        let alt_combo = alt_combo.clone();
-        let iface_model = iface_model.clone();
-
-        move || {
-            let text = target_entry.text().trim().to_owned();
-            if text.is_empty() {
-                return;
-            }
-
-            let idx = alt_combo.selected() as usize;
-            let model = iface_model.borrow();
-            let Some(iface) = model.get(idx) else { return };
-            let interface = iface.name.clone();
-            drop(model);
-
-            let Some(target) = RuleTarget::from_user_input(&text) else {
-                return;
-            };
-
-            target_entry.set_text("");
-
-            let sender = sender.clone();
-            glib::MainContext::default().spawn_local(async move {
-                sender
-                    .send(UiToEngine::AddRule { target, interface })
-                    .await
-                    .ok();
-            });
         }
-    };
-
-    add_btn.connect_clicked({
-        let add_rule = add_rule.clone();
-        move |_| add_rule()
     });
-    target_entry.connect_activate(move |_| add_rule());
-
-    // ── Engine → UI güncelleme döngüsü ───────────────────────────────────────
-    {
-        let rule_rows = rule_rows.clone();
-        let rules_group = rules_group.clone();
-        let service_switch = service_switch.clone();
-        let toast_overlay = toast_overlay.clone();
-        let iface_model = iface_model.clone();
-        let ui_sender = ui_sender.clone();
-        let window_title = window_title.clone();
-        let alt_combo = alt_combo.clone();
-        let default_info_row = default_info_row.clone();
-        let empty_row = empty_row.clone();
-        let rule_count = rule_count.clone();
-        let current_language = current_language.clone();
-
-        glib::MainContext::default().spawn_local(async move {
-            while let Ok(msg) = engine_receiver.recv().await {
-                let language = *current_language.borrow();
-                let texts = language.texts();
-                match msg {
-                    EngineToUi::InterfacesList(ifaces) => {
-                        let previous_selection = {
-                            let old_model = iface_model.borrow();
-                            if alt_combo.selected() == gtk::INVALID_LIST_POSITION {
-                                None
-                            } else {
-                                old_model
-                                    .get(alt_combo.selected() as usize)
-                                    .map(|iface| iface.name.clone())
-                            }
-                        };
-
-                        // Varsayılan arayüzü bilgi satırına yaz
-                        if let Some(def) = ifaces.iter().find(|i| i.is_default) {
-                            let gw = def.gateway.as_deref().unwrap_or("?");
-                            default_info_row
-                                .set_subtitle(&language.default_gateway_subtitle(&def.name, gw));
-                        } else {
-                            default_info_row.set_subtitle(texts.default_not_found);
-                        }
-
-                        // İstisna ağı combo'sunu doldur
-                        let names: Vec<String> = ifaces.iter().map(|i| i.name.clone()).collect();
-                        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                        let model = gtk::StringList::new(&name_refs);
-                        alt_combo.set_model(Some(&model));
-                        alt_combo.set_sensitive(!ifaces.is_empty());
-                        if ifaces.is_empty() {
-                            alt_combo.set_subtitle(texts.no_interfaces);
-                        } else {
-                            match refreshed_interface_selection(
-                                previous_selection.as_deref(),
-                                &names,
-                            ) {
-                                Some(idx) => {
-                                    alt_combo.set_selected(idx as u32);
-                                    alt_combo.set_subtitle(texts.exception_subtitle);
-                                }
-                                None => {
-                                    alt_combo.set_selected(gtk::INVALID_LIST_POSITION);
-                                    alt_combo.set_subtitle(texts.exception_select_prompt);
-                                    if previous_selection.is_some() {
-                                        let sender = ui_sender.clone();
-                                        glib::MainContext::default().spawn_local(async move {
-                                            sender.send(UiToEngine::ClearAltInterface).await.ok();
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        *iface_model.borrow_mut() = ifaces;
-                    }
-
-                    EngineToUi::RuleAdded(rule) => {
-                        let row = create_rule_row(&rule, ui_sender.clone(), texts);
-                        rules_group.add(&row);
-                        rule_rows.borrow_mut().insert(rule.id, row);
-
-                        let mut count = rule_count.borrow_mut();
-                        *count += 1;
-                        empty_row.set_visible(*count == 0);
-                    }
-
-                    EngineToUi::RuleRemoved(id) => {
-                        if let Some(row) = rule_rows.borrow_mut().remove(&id) {
-                            rules_group.remove(&row);
-                        }
-                        let mut count = rule_count.borrow_mut();
-                        *count = count.saturating_sub(1);
-                        empty_row.set_visible(*count == 0);
-                    }
-
-                    EngineToUi::ResetComplete => {
-                        let mut rows = rule_rows.borrow_mut();
-                        for (_, row) in rows.drain() {
-                            rules_group.remove(&row);
-                        }
-                        *rule_count.borrow_mut() = 0;
-                        empty_row.set_visible(true);
-                        service_switch.set_active(false);
-                        window_title.set_subtitle(texts.inactive);
-                    }
-
-                    EngineToUi::Deactivated => {
-                        service_switch.set_active(false);
-                        window_title.set_subtitle(texts.inactive);
-                    }
-
-                    EngineToUi::Error(msg) => {
-                        let toast = adw::Toast::builder()
-                            .title(&msg)
-                            .timeout(TOAST_TIMEOUT_SHORT)
-                            .build();
-                        toast_overlay.add_toast(&toast);
-                    }
-
-                    EngineToUi::StatusUpdate(s) => {
-                        window_title.set_subtitle(&language.localized_status(&s));
-                    }
-
-                    EngineToUi::ActivationFailed(msg) => {
-                        service_switch.set_active(false);
-                        window_title.set_subtitle(texts.activation_failed);
-                        let toast = adw::Toast::builder()
-                            .title(&format!("{}: {}", texts.activation_failed_toast, msg))
-                            .timeout(TOAST_TIMEOUT_LONG)
-                            .build();
-                        toast_overlay.add_toast(&toast);
-                    }
-
-                    EngineToUi::StateRestored { alt_interface } => {
-                        // Kaydedilmiş arayüz seçimini geri yükle
-                        if let Some(saved_iface) = alt_interface {
-                            let model = iface_model.borrow();
-                            if let Some((idx, _)) = model
-                                .iter()
-                                .enumerate()
-                                .find(|(_, i)| i.name == saved_iface)
-                            {
-                                // set_selected'ın connect_selected_notify'ı tetiklemesine izin ver
-                                // (bu yalnızca tercih kaydeder, kernel'a dokunmaz)
-                                alt_combo.set_selected(idx as u32);
-                                alt_combo.set_subtitle(texts.exception_subtitle);
-                            } else {
-                                alt_combo.set_selected(gtk::INVALID_LIST_POSITION);
-                                alt_combo.set_subtitle(texts.exception_select_prompt);
-                                let sender = ui_sender.clone();
-                                glib::MainContext::default().spawn_local(async move {
-                                    sender.send(UiToEngine::ClearAltInterface).await.ok();
-                                });
-                            }
-                        }
-                        // Kural sayısına göre boş durum satırını ayarla
-                        let count = *rule_count.borrow();
-                        empty_row.set_visible(count == 0);
-                    }
-                }
-            }
-        });
-    }
-
     window.present();
 }
 
+fn append_rule(
+    group: &adw::PreferencesGroup,
+    rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    profile: &Rc<RefCell<Profile>>,
+    rule: &Rule,
+    sender: &Sender<UiToDaemon>,
+    routing_active: Rc<Cell<bool>>,
+    texts: crate::ui::i18n::Texts,
+    save: Rc<dyn Fn()>,
+) {
+    let lanes = profile
+        .borrow()
+        .lanes
+        .iter()
+        .map(|lane| (lane.id.clone(), lane.name.clone()))
+        .collect::<Vec<_>>();
+    let on_change: Rc<dyn Fn(Rule)> = {
+        let profile = profile.clone();
+        let save = save.clone();
+        Rc::new(move |updated| {
+            if let Some(rule) = profile
+                .borrow_mut()
+                .rules
+                .iter_mut()
+                .find(|rule| rule.id == updated.id)
+            {
+                *rule = updated;
+                save();
+            }
+        })
+    };
+    let on_delete: Rc<dyn Fn(RuleId)> = {
+        let profile = profile.clone();
+        let save = save.clone();
+        Rc::new(move |id| {
+            profile.borrow_mut().rules.retain(|rule| rule.id != id);
+            save();
+        })
+    };
+    let row = create_rule_row(
+        rule,
+        profile.borrow().id.clone(),
+        &lanes,
+        sender.clone(),
+        routing_active,
+        texts,
+        on_change,
+        on_delete,
+    );
+    group.add(&row);
+    rows.borrow_mut().push(row);
+}
+
+fn parse_target(value: &str) -> Option<RuleTarget> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value == "*" {
+        return Some(RuleTarget::Any);
+    }
+    if let Ok(network) = value.parse() {
+        return Some(RuleTarget::Cidr(network));
+    }
+    if let Ok(address) = value.parse() {
+        return Some(RuleTarget::Ip(address));
+    }
+    value
+        .strip_prefix("*.")
+        .map(|_| RuleTarget::WildcardDomain(value.to_owned()))
+        .or_else(|| Some(RuleTarget::Domain(value.to_ascii_lowercase())))
+}
+
+fn render_health(container: &gtk::Box, view: &ConnectionHealthView, texts: crate::ui::i18n::Texts) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+    container.append(
+        &gtk::Label::builder()
+            .label(&view.aggregate)
+            .xalign(0.0)
+            .build(),
+    );
+    if let Some(last) = &view.last_apply_generation {
+        container.append(
+            &gtk::Label::builder()
+                .label(&format!("{}: {}", texts.last_apply, last))
+                .xalign(0.0)
+                .build(),
+        );
+    }
+    for (lane, state) in &view.lanes {
+        container.append(
+            &gtk::Label::builder()
+                .label(&format!("{lane}: {state}"))
+                .xalign(0.0)
+                .build(),
+        );
+    }
+    for diagnostic in &view.diagnostics {
+        let summary = diagnostic
+            .action
+            .as_ref()
+            .map(|action| format!("{} — {}", diagnostic.summary, action))
+            .unwrap_or_else(|| diagnostic.summary.clone());
+        container.append(
+            &gtk::Label::builder()
+                .label(&summary)
+                .xalign(0.0)
+                .wrap(true)
+                .build(),
+        );
+        let expander = gtk::Expander::builder()
+            .label(texts.technical_details)
+            .child(
+                &gtk::Label::builder()
+                    .label(&diagnostic.technical_detail)
+                    .xalign(0.0)
+                    .selectable(true)
+                    .wrap(true)
+                    .build(),
+            )
+            .build();
+        container.append(&expander);
+    }
+}
+
+fn empty_default_profile() -> Profile {
+    Profile {
+        id: ProfileId::from("default"),
+        name: "Default".to_owned(),
+        enabled: false,
+        lanes: Vec::new(),
+        rules: Vec::new(),
+    }
+}
+
+#[allow(dead_code)]
 fn refreshed_interface_selection(previous_name: Option<&str>, names: &[String]) -> Option<usize> {
     let previous_name = previous_name?;
     names.iter().position(|name| name == previous_name)
@@ -576,19 +568,63 @@ fn refreshed_interface_selection(previous_name: Option<&str>, names: &[String]) 
 
 #[cfg(test)]
 mod tests {
-    use super::refreshed_interface_selection;
+    use super::{daemon_unavailable_view, health_view, refreshed_interface_selection};
+    use routelane::domain::{HealthState, LaneId};
+    use routelane::health::{
+        Diagnostic, DiagnosticCode, DiagnosticSubject, HealthReport, LaneHealth, Severity,
+        SuggestedAction,
+    };
 
     #[test]
     fn clears_selection_when_previous_interface_disappears() {
         let names = ["wlan0".to_owned(), "tun0".to_owned()];
-
         assert_eq!(refreshed_interface_selection(Some("old-vpn"), &names), None);
     }
 
     #[test]
     fn preserves_selection_when_previous_interface_still_exists() {
         let names = ["wlan0".to_owned(), "tun0".to_owned()];
-
         assert_eq!(refreshed_interface_selection(Some("tun0"), &names), Some(1));
+    }
+
+    #[test]
+    fn presents_aggregate_lane_diagnostic_action_and_technical_detail() {
+        let lane_id = LaneId::from("work");
+        let lanes = LaneHealth::from([(lane_id.clone(), HealthState::Degraded)]);
+        let report = HealthReport::from_parts(
+            HealthState::Degraded,
+            lanes,
+            vec![Diagnostic::new(
+                DiagnosticCode::LaneInterfaceMissing,
+                "VPN interface is missing",
+                "interface tun0 was not present in the live topology",
+                Severity::Warning,
+                DiagnosticSubject::Lane(lane_id),
+                Some(SuggestedAction::new("Connect the VPN and apply again")),
+            )],
+        );
+        let view = health_view(&report, Some(42));
+        assert_eq!(view.aggregate, "Degraded");
+        assert_eq!(view.last_apply_generation.as_deref(), Some("42"));
+        assert_eq!(view.lanes, vec![("work".to_owned(), "Degraded".to_owned())]);
+        assert_eq!(view.diagnostics[0].summary, "VPN interface is missing");
+        assert_eq!(
+            view.diagnostics[0].action.as_deref(),
+            Some("Connect the VPN and apply again")
+        );
+        assert_eq!(
+            view.diagnostics[0].technical_detail,
+            "interface tun0 was not present in the live topology"
+        );
+    }
+
+    #[test]
+    fn reports_daemon_unavailable_after_activation_failure() {
+        let view = daemon_unavailable_view("systemd user activation failed");
+        assert_eq!(view.aggregate, "DaemonUnavailable");
+        assert_eq!(
+            view.diagnostics[0].technical_detail,
+            "systemd user activation failed"
+        );
     }
 }

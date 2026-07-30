@@ -1,9 +1,6 @@
 pub mod backend;
 pub mod daemon;
+pub mod dns;
 pub mod domain;
 pub mod health;
 pub mod ipc;
-
-#[allow(dead_code)]
-#[path = "routing/resolver.rs"]
-pub(crate) mod exact_domain_resolver;

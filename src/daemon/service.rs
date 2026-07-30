@@ -16,8 +16,8 @@ use crate::backend::{
     compile_profile, AppliedKernelState, ApplyResponse, CleanupResponse, InspectResponse,
     KernelPlan, ResolutionSnapshot, RestoreResponse, TopologySnapshot,
 };
+use crate::dns::periodic::resolve_domain;
 use crate::domain::{validate_profile, HealthState, Profile, ProfileId, RuleId, RuleTarget};
-use crate::exact_domain_resolver::resolve_domain;
 use crate::health::{
     evaluate_health, Diagnostic, DiagnosticCode, DiagnosticSubject, HealthReport, Severity,
     SuggestedAction,
