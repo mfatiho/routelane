@@ -7,7 +7,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +36,7 @@ const MAX_RULES: usize = 10_000;
 const ROUTING_CRASH_MODEL_VERSION: &str = "exact-command-prefix-v2";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_COMMAND_PIPE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 struct CommandInvocation<'a> {
@@ -116,6 +117,88 @@ impl CommandExecutor for ProcessCommandExecutor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandPipe {
+    Stdout,
+    Stderr,
+}
+
+impl fmt::Display for CommandPipe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        })
+    }
+}
+
+#[derive(Debug)]
+enum CommandPipeError {
+    Read {
+        pipe: CommandPipe,
+        source: std::io::Error,
+    },
+    OutputLimitExceeded {
+        pipe: CommandPipe,
+        maximum: usize,
+    },
+}
+
+impl fmt::Display for CommandPipeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { pipe, source } => {
+                write!(formatter, "failed to read typed command {pipe}: {source}")
+            }
+            Self::OutputLimitExceeded { pipe, maximum } => {
+                write!(
+                    formatter,
+                    "typed command {pipe} exceeded the {maximum} byte output limit"
+                )
+            }
+        }
+    }
+}
+
+fn read_command_pipe(pipe: CommandPipe, reader: impl Read) -> Result<Vec<u8>, CommandPipeError> {
+    let mut output = Vec::new();
+    reader
+        .take((MAX_COMMAND_PIPE_BYTES + 1) as u64)
+        .read_to_end(&mut output)
+        .map_err(|source| CommandPipeError::Read { pipe, source })?;
+    if output.len() > MAX_COMMAND_PIPE_BYTES {
+        return Err(CommandPipeError::OutputLimitExceeded {
+            pipe,
+            maximum: MAX_COMMAND_PIPE_BYTES,
+        });
+    }
+    Ok(output)
+}
+
+fn terminate_command_group(
+    child: &mut Child,
+    completed_status: Option<ExitStatus>,
+    context: &str,
+) -> Result<ExitStatus, RunnerError> {
+    let process_group = i32::try_from(child.id())
+        .map_err(|_| RunnerError::new("typed command process ID exceeds the supported range"))?;
+    let kill_result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if kill_result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(RunnerError::new(format!(
+                "failed to terminate {context} command group: {error}"
+            )));
+        }
+    }
+    match completed_status {
+        Some(status) => Ok(status),
+        None => child.wait().map_err(|error| {
+            RunnerError::new(format!("failed to reap {context} command: {error}"))
+        }),
+    }
+}
+
 fn execute_invocation_with_timeout(
     invocation: &CommandInvocation<'_>,
     timeout: Duration,
@@ -155,15 +238,16 @@ fn execute_invocation_with_timeout(
     };
 
     std::thread::scope(|scope| {
+        let (output_sender, output_receiver) = std::sync::mpsc::channel();
+        let stdout_sender = output_sender.clone();
         let stdout_reader = scope.spawn(move || {
-            let mut output = Vec::new();
-            let mut stdout = stdout;
-            stdout.read_to_end(&mut output).map(|_| output)
+            let result = read_command_pipe(CommandPipe::Stdout, stdout);
+            let _ = stdout_sender.send((CommandPipe::Stdout, result));
         });
+        let stderr_sender = output_sender;
         let stderr_reader = scope.spawn(move || {
-            let mut output = Vec::new();
-            let mut stderr = stderr;
-            stderr.read_to_end(&mut output).map(|_| output)
+            let result = read_command_pipe(CommandPipe::Stderr, stderr);
+            let _ = stderr_sender.send((CommandPipe::Stderr, result));
         });
         let stdin_writer = stdin.zip(invocation.stdin).map(|(mut stdin, input)| {
             scope.spawn(move || {
@@ -175,40 +259,38 @@ fn execute_invocation_with_timeout(
 
         let started = Instant::now();
         let mut completed_status = None;
-        let (status, timed_out) = loop {
+        let mut stdout_result = None;
+        let mut stderr_result = None;
+        let (status, timed_out, output_failed) = loop {
             if completed_status.is_none() {
                 completed_status = child.try_wait().map_err(|error| {
                     RunnerError::new(format!("failed to poll typed command: {error}"))
                 })?;
             }
+            while let Ok((pipe, result)) = output_receiver.try_recv() {
+                match pipe {
+                    CommandPipe::Stdout => stdout_result = Some(result),
+                    CommandPipe::Stderr => stderr_result = Some(result),
+                }
+            }
+            let output_failed = stdout_result.as_ref().is_some_and(Result::is_err)
+                || stderr_result.as_ref().is_some_and(Result::is_err);
+            if output_failed {
+                let status =
+                    terminate_command_group(&mut child, completed_status, "output-limited typed")?;
+                break (status, false, true);
+            }
             let stdin_finished = stdin_writer
                 .as_ref()
                 .is_none_or(std::thread::ScopedJoinHandle::is_finished);
             if let Some(status) = completed_status {
-                if stdin_finished && stdout_reader.is_finished() && stderr_reader.is_finished() {
-                    break (status, false);
+                if stdin_finished && stdout_result.is_some() && stderr_result.is_some() {
+                    break (status, false, false);
                 }
             }
             if started.elapsed() >= timeout {
-                let process_group = i32::try_from(child.id()).map_err(|_| {
-                    RunnerError::new("typed command process ID exceeds the supported range")
-                })?;
-                let kill_result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-                if kill_result != 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ESRCH) {
-                        return Err(RunnerError::new(format!(
-                            "failed to terminate timed out command group: {error}"
-                        )));
-                    }
-                }
-                let status = match completed_status {
-                    Some(status) => status,
-                    None => child.wait().map_err(|error| {
-                        RunnerError::new(format!("failed to reap timed out command: {error}"))
-                    })?,
-                };
-                break (status, true);
+                let status = terminate_command_group(&mut child, completed_status, "timed out")?;
+                break (status, true, false);
             }
             let remaining = timeout.saturating_sub(started.elapsed());
             std::thread::sleep(COMMAND_WAIT_POLL_INTERVAL.min(remaining));
@@ -224,24 +306,35 @@ fn execute_invocation_with_timeout(
                     })
             })
             .transpose();
-        let stdout = stdout_reader
+        stdout_reader
             .join()
-            .map_err(|_| RunnerError::new("typed command stdout reader panicked"))?
-            .map_err(|error| {
-                RunnerError::new(format!("failed to read typed command stdout: {error}"))
-            })?;
-        let stderr = stderr_reader
+            .map_err(|_| RunnerError::new("typed command stdout reader panicked"))?;
+        stderr_reader
             .join()
-            .map_err(|_| RunnerError::new("typed command stderr reader panicked"))?
-            .map_err(|error| {
-                RunnerError::new(format!("failed to read typed command stderr: {error}"))
-            })?;
+            .map_err(|_| RunnerError::new("typed command stderr reader panicked"))?;
+        while let Ok((pipe, result)) = output_receiver.try_recv() {
+            match pipe {
+                CommandPipe::Stdout => stdout_result = Some(result),
+                CommandPipe::Stderr => stderr_result = Some(result),
+            }
+        }
+        let stdout = stdout_result
+            .ok_or_else(|| RunnerError::new("typed command stdout reader returned no result"))?
+            .map_err(|error| RunnerError::new(error.to_string()))?;
+        let stderr = stderr_result
+            .ok_or_else(|| RunnerError::new("typed command stderr reader returned no result"))?
+            .map_err(|error| RunnerError::new(error.to_string()))?;
 
         if timed_out {
             return Err(RunnerError::new(format!(
                 "typed command timed out after {} ms",
                 timeout.as_millis()
             )));
+        }
+        if output_failed {
+            return Err(RunnerError::new(
+                "typed command output reader failed without a typed error",
+            ));
         }
         stdin_result?;
         Ok(CommandOutput {
@@ -3649,6 +3742,63 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "a descendant kept command output pipes open after timeout"
+        );
+    }
+
+    #[test]
+    fn command_stdout_above_the_limit_terminates_the_process_group() {
+        let invocation = CommandInvocation {
+            program: "/bin/sh",
+            args: vec!["-c", "head -c 2097152 /dev/zero"],
+            stdin: None,
+        };
+        let started = Instant::now();
+
+        let error =
+            execute_invocation_with_timeout(&invocation, Duration::from_secs(5)).unwrap_err();
+
+        assert!(error.to_string().contains("stdout exceeded"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an overflowing stdout pipe did not terminate the command promptly"
+        );
+    }
+
+    #[test]
+    fn command_stderr_above_the_limit_terminates_the_process_group() {
+        let invocation = CommandInvocation {
+            program: "/bin/sh",
+            args: vec!["-c", "head -c 2097152 /dev/zero >&2"],
+            stdin: None,
+        };
+        let started = Instant::now();
+
+        let error =
+            execute_invocation_with_timeout(&invocation, Duration::from_secs(5)).unwrap_err();
+
+        assert!(error.to_string().contains("stderr exceeded"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an overflowing stderr pipe did not terminate the command promptly"
+        );
+    }
+
+    #[test]
+    fn output_overflow_terminates_descendants_holding_the_pipe_without_hanging() {
+        let invocation = CommandInvocation {
+            program: "/bin/sh",
+            args: vec!["-c", "(head -c 2097152 /dev/zero; sleep 5) & wait"],
+            stdin: None,
+        };
+        let started = Instant::now();
+
+        let error =
+            execute_invocation_with_timeout(&invocation, Duration::from_secs(5)).unwrap_err();
+
+        assert!(error.to_string().contains("stdout exceeded"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a descendant kept the overflowing output pipe open"
         );
     }
 

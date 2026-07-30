@@ -4,11 +4,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context};
-use routelane::domain::{
+use crate::domain::{
     normalize_lane_names, validate_profile, InterfaceSelector, Lane, LaneFailurePolicy, LaneId,
     Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource, RuleTarget,
 };
+use anyhow::{bail, Context};
+
+pub const MAX_CONFIG_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -294,12 +296,7 @@ impl ConfigRepository {
         if !self.path.exists() {
             return Ok(ConfigV2::default());
         }
-        validate_existing_file(&self.path)?;
-        let mut json = String::new();
-        open_existing_file(&self.path)?
-            .read_to_string(&mut json)
-            .with_context(|| format!("could not read {}", self.path.display()))?;
-        ConfigDocument::from_json(&json)?.into_current()
+        load_config_file(&self.path)
     }
 
     pub fn save(&self, config: &ConfigV2) -> anyhow::Result<()> {
@@ -363,6 +360,31 @@ impl ConfigRepository {
         sync_directory(parent)?;
         Ok(())
     }
+}
+
+pub fn load_config_file(path: &Path) -> anyhow::Result<ConfigV2> {
+    validate_existing_file(path)?;
+    let mut file = open_existing_file_nonblocking(path)?;
+    let metadata = file.metadata()?;
+    validate_metadata(&metadata)?;
+    let maximum = u64::try_from(MAX_CONFIG_BYTES).expect("config limit fits u64");
+    if metadata.len() > maximum {
+        bail!(
+            "configuration is {} bytes; maximum is {MAX_CONFIG_BYTES}",
+            metadata.len()
+        );
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    if bytes.len() > MAX_CONFIG_BYTES {
+        bail!("configuration is larger than the maximum of {MAX_CONFIG_BYTES} bytes");
+    }
+    let json = std::str::from_utf8(&bytes).context("configuration is not valid UTF-8")?;
+    ConfigDocument::from_json(json)?.into_current()
 }
 
 struct TemporaryPath {
@@ -432,6 +454,19 @@ fn open_existing_file(path: &Path) -> anyhow::Result<File> {
     Ok(file)
 }
 
+fn open_existing_file_nonblocking(path: &Path) -> anyhow::Result<File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    options
+        .open(path)
+        .with_context(|| format!("could not safely open {}", path.display()))
+}
+
 fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -493,7 +528,7 @@ fn config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use routelane::domain::RuleAction;
+    use crate::domain::RuleAction;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     #[test]

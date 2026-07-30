@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
-use routelane::domain::Profile;
+use routelane::config::{load_config_file, ConfigV2};
+use routelane::domain::{validate_profile, Profile};
 use routelane::ipc::{
     socket_path, DaemonClient, DaemonEnvelope, DaemonRequest, DaemonResponse, DaemonResult,
 };
@@ -9,10 +11,9 @@ use routelane::ipc::{
 const EXIT_USAGE: i32 = 2;
 const EXIT_CONFIG: i32 = 3;
 const EXIT_DAEMON: i32 = 4;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ERROR_CHARS: usize = 768;
-const USAGE: &str =
-    "Usage:\n  routelanectl status [--json]\n  routelanectl apply-profile <config.json>\n  routelanectl deactivate";
+const USAGE: &str = "Usage:\n  routelanectl status [--json]\n  routelanectl apply-profile <config.json> [--profile <id-or-name>]\n  routelanectl deactivate";
 
 #[tokio::main]
 async fn main() {
@@ -32,11 +33,12 @@ async fn main() {
 }
 
 async fn run(args: Vec<String>) -> Result<String, CliError> {
-    let (request, output) = parse_command(&args)?;
+    let deadline = tokio::time::Instant::now() + OPERATION_TIMEOUT;
+    let (request, output) = parse_command(&args, deadline).await?;
     let path = socket_path().map_err(|error| CliError::daemon(error.to_string()))?;
     let client = DaemonClient::new(path);
     let envelope = DaemonEnvelope::new(uuid::Uuid::new_v4().to_string(), request);
-    let response = tokio::time::timeout(REQUEST_TIMEOUT, client.send(envelope))
+    let response = tokio::time::timeout_at(deadline, client.send(envelope))
         .await
         .map_err(|_| CliError::daemon("IPC_TIMEOUT: daemon request timed out"))?
         .map_err(|error| CliError::daemon(error.to_string()))?;
@@ -51,7 +53,10 @@ enum OutputFormat {
     Deactivated,
 }
 
-fn parse_command(args: &[String]) -> Result<(DaemonRequest, OutputFormat), CliError> {
+async fn parse_command(
+    args: &[String],
+    deadline: tokio::time::Instant,
+) -> Result<(DaemonRequest, OutputFormat), CliError> {
     match args {
         [command] if command == "status" => {
             Ok((DaemonRequest::GetStatus, OutputFormat::StatusText))
@@ -59,10 +64,15 @@ fn parse_command(args: &[String]) -> Result<(DaemonRequest, OutputFormat), CliEr
         [command, option] if command == "status" && option == "--json" => {
             Ok((DaemonRequest::GetStatus, OutputFormat::StatusJson))
         }
-        [command, path] if command == "apply-profile" => Ok((
-            DaemonRequest::ApplyProfile(read_profile(Path::new(path))?),
-            OutputFormat::Applied,
-        )),
+        [command, path] if command == "apply-profile" => {
+            let profile = load_selected_profile(Path::new(path), None, deadline).await?;
+            Ok((DaemonRequest::ApplyProfile(profile), OutputFormat::Applied))
+        }
+        [command, path, flag, selector] if command == "apply-profile" && flag == "--profile" => {
+            let profile =
+                load_selected_profile(Path::new(path), Some(selector.as_str()), deadline).await?;
+            Ok((DaemonRequest::ApplyProfile(profile), OutputFormat::Applied))
+        }
         [command] if command == "deactivate" => {
             Ok((DaemonRequest::Deactivate, OutputFormat::Deactivated))
         }
@@ -70,15 +80,84 @@ fn parse_command(args: &[String]) -> Result<(DaemonRequest, OutputFormat), CliEr
     }
 }
 
-fn read_profile(path: &Path) -> Result<Profile, CliError> {
-    let bytes = std::fs::read(path).map_err(|error| {
-        CliError::config(format!(
-            "could not read profile {}: {error}",
-            path.display()
-        ))
-    })?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| CliError::config(format!("invalid profile JSON: {error}")))
+async fn load_selected_profile(
+    path: &Path,
+    selector: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<Profile, CliError> {
+    let path = path.to_owned();
+    let document = tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || load_config_file(&path)),
+    )
+    .await
+    .map_err(|_| CliError::config("configuration read timed out"))?
+    .map_err(|error| CliError::config(format!("configuration reader failed: {error}")))?
+    .map_err(|error| CliError::config(error.to_string()))?;
+    select_profile(document, selector)
+}
+
+fn select_profile(mut document: ConfigV2, selector: Option<&str>) -> Result<Profile, CliError> {
+    validate_profile_identities(&document)?;
+    let selected_index = match selector {
+        Some(selector) => {
+            let matches = document
+                .profiles
+                .iter()
+                .enumerate()
+                .filter(|(_, profile)| profile.id.as_str() == selector || profile.name == selector)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [index] => *index,
+                [] => {
+                    return Err(CliError::config(format!(
+                        "profile selector '{selector}' was not found"
+                    )));
+                }
+                _ => {
+                    return Err(CliError::config(format!(
+                        "profile selector '{selector}' is ambiguous"
+                    )));
+                }
+            }
+        }
+        None => match document.profiles.len() {
+            1 => 0,
+            0 => return Err(CliError::config("configuration contains no profiles")),
+            _ => {
+                return Err(CliError::config(
+                    "configuration contains multiple profiles; use --profile <id-or-name>",
+                ));
+            }
+        },
+    };
+
+    let mut profile = document.profiles.swap_remove(selected_index);
+    profile.enabled = true;
+    validate_profile(&profile)
+        .map_err(|error| CliError::config(format!("invalid profile: {error:?}")))?;
+    Ok(profile)
+}
+
+fn validate_profile_identities(document: &ConfigV2) -> Result<(), CliError> {
+    let mut ids = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for profile in &document.profiles {
+        if !ids.insert(profile.id.as_str()) {
+            return Err(CliError::config(format!(
+                "duplicate profile id '{}'",
+                profile.id.as_str()
+            )));
+        }
+        if !names.insert(profile.name.as_str()) {
+            return Err(CliError::config(format!(
+                "duplicate profile name '{}'",
+                profile.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn format_response(response: DaemonResponse, output: OutputFormat) -> Result<String, CliError> {

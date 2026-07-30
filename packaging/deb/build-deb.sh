@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
 PACKAGE_NAME="routelane"
-MAINTAINER="RouteLane Maintainers <maintainers@example.com>"
+MAINTAINER="RouteLane Project <mfatiho@users.noreply.github.com>"
 
 cd "${REPO_ROOT}"
 
@@ -113,6 +113,11 @@ REQUIRED_PATHS=(
 )
 
 PACKAGE_CONTENTS="$(dpkg-deb --contents "${OUTPUT_DEB}")"
+ACTUAL_MAINTAINER="$(dpkg-deb --field "${OUTPUT_DEB}" Maintainer)"
+if [[ "${ACTUAL_MAINTAINER}" != "${MAINTAINER}" ]]; then
+    echo "error: package Maintainer field is '${ACTUAL_MAINTAINER}'" >&2
+    exit 1
+fi
 for required_path in "${REQUIRED_PATHS[@]}"; do
     if ! grep -Fq " ${required_path}" <<<"${PACKAGE_CONTENTS}"; then
         echo "error: package is missing ${required_path#./}" >&2

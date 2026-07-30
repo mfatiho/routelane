@@ -11,11 +11,14 @@ use routelane::domain::{Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource
 use routelane::health::HealthReport;
 use routelane::ipc::{DaemonEvent, DaemonRequest, DaemonStatus};
 
-use crate::config::{ConfigRepository, Language, PersistenceRequest, PersistenceWorker};
 use crate::models::{DaemonToUi, UiToDaemon};
+use crate::ui::i18n::LanguageTexts;
 use crate::ui::rule_row::{create_rule_row, set_rule_enabled_request, RuleEdit, RuleRowContext};
 use crate::ui::settings::build_settings_dialog;
 use crate::ui::tray::{spawn_tray, TrayCommand, APP_ICON_NAME};
+use routelane::config::{
+    ConfigRepository, ConfigV2, Language, PersistenceRequest, PersistenceWorker,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthDiagnosticView {
@@ -97,7 +100,7 @@ fn health_sections(
 }
 
 fn reconcile_profiles(
-    document: &mut crate::config::ConfigV2,
+    document: &mut ConfigV2,
     selected: &mut Profile,
     mut canonical: Vec<Profile>,
 ) {
@@ -714,7 +717,7 @@ fn apply_request(profile: &Profile) -> DaemonRequest {
     DaemonRequest::ApplyProfile(candidate)
 }
 
-fn store_profile(document: &mut crate::config::ConfigV2, current: Profile) {
+fn store_profile(document: &mut ConfigV2, current: Profile) {
     if let Some(stored) = document
         .profiles
         .iter_mut()
@@ -823,6 +826,8 @@ mod tests {
         reconcile_profiles, refreshed_interface_selection, status_is_active,
         switch_state_after_persistence_failure,
     };
+    use crate::ui::i18n::LanguageTexts;
+    use routelane::config::ConfigV2;
     use routelane::domain::{HealthState, LaneId, ProfileId};
     use routelane::health::{
         Diagnostic, DiagnosticCode, DiagnosticSubject, HealthReport, LaneHealth, Severity,
@@ -887,7 +892,7 @@ mod tests {
     fn configuration_failure_is_visible_and_not_presented_as_an_empty_config() {
         let view = configuration_error_view(
             "configuration is not owned by the current user",
-            crate::config::Language::En.texts(),
+            routelane::config::Language::En.texts(),
         );
         assert_eq!(view.aggregate, "ConfigurationError");
         assert!(view.diagnostics[0].technical_detail.contains("not owned"));
@@ -912,7 +917,7 @@ mod tests {
         let (config, daemon) = health_sections(
             Some("invalid JSON"),
             daemon,
-            crate::config::Language::En.texts(),
+            routelane::config::Language::En.texts(),
         );
 
         assert_eq!(config.unwrap().aggregate, "ConfigurationError");
@@ -921,7 +926,7 @@ mod tests {
 
     #[test]
     fn configuration_validation_summary_is_localized() {
-        let view = configuration_error_view("ayrıntı", crate::config::Language::Tr.texts());
+        let view = configuration_error_view("ayrıntı", routelane::config::Language::Tr.texts());
 
         assert_eq!(
             view.diagnostics[0].summary,
@@ -938,14 +943,14 @@ mod tests {
         let old = super::empty_default_profile();
         let mut canonical = old.clone();
         canonical.name = "Daemon canonical".to_owned();
-        let mut document = crate::config::ConfigV2 {
+        let mut document = ConfigV2 {
             profiles: vec![old.clone()],
             ..Default::default()
         };
         let mut selected = old;
 
         reconcile_profiles(&mut document, &mut selected, vec![canonical.clone()]);
-        document.language = crate::config::Language::En;
+        document.language = routelane::config::Language::En;
 
         assert_eq!(selected, canonical);
         assert_eq!(document.profiles[0], canonical);
@@ -960,7 +965,7 @@ mod tests {
         let mut alpha = selected.clone();
         alpha.id = ProfileId::from("alpha");
         alpha.name = "Alpha".to_owned();
-        let mut document = crate::config::ConfigV2::default();
+        let mut document = ConfigV2::default();
 
         reconcile_profiles(
             &mut document,
