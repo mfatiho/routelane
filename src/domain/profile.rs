@@ -65,6 +65,8 @@ pub enum DomainError {
     TooManyLanes { actual: usize, maximum: usize },
     TooManyRules { actual: usize, maximum: usize },
     DuplicateLaneId(LaneId),
+    EmptyLaneName(LaneId),
+    DuplicateLaneName(String),
     DuplicateRuleId(RuleId),
     UnknownLane(LaneId),
     SelfReferentialFallback(LaneId),
@@ -87,9 +89,17 @@ pub fn validate_profile(profile: &Profile) -> Result<(), DomainError> {
     }
 
     let mut lane_ids = BTreeSet::new();
+    let mut lane_names = BTreeSet::new();
     for lane in &profile.lanes {
         if !lane_ids.insert(lane.id.clone()) {
             return Err(DomainError::DuplicateLaneId(lane.id.clone()));
+        }
+        let normalized_name = lane.name.trim().to_lowercase();
+        if normalized_name.is_empty() {
+            return Err(DomainError::EmptyLaneName(lane.id.clone()));
+        }
+        if !lane_names.insert(normalized_name.clone()) {
+            return Err(DomainError::DuplicateLaneName(normalized_name));
         }
     }
 
@@ -136,6 +146,17 @@ pub fn validate_profile(profile: &Profile) -> Result<(), DomainError> {
     }
 
     Ok(())
+}
+
+pub fn normalize_lane_names(profile: &mut Profile) {
+    for lane in &mut profile.lanes {
+        let trimmed = lane.name.trim();
+        lane.name = if trimmed.is_empty() {
+            lane.id.as_str().to_owned()
+        } else {
+            trimmed.to_owned()
+        };
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +258,27 @@ mod tests {
         assert_eq!(
             validate_profile(&profile),
             Err(DomainError::DuplicateRuleId(RuleId::from("duplicate")))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_and_case_insensitive_duplicate_lane_names() {
+        let mut empty = fixture_profile(vec![fixture_lane("a", "tun0")], vec![]);
+        empty.lanes[0].name = "   ".to_owned();
+        assert_eq!(
+            validate_profile(&empty),
+            Err(DomainError::EmptyLaneName(LaneId::from("a")))
+        );
+
+        let mut duplicate = fixture_profile(
+            vec![fixture_lane("a", "tun0"), fixture_lane("b", "tun1")],
+            vec![],
+        );
+        duplicate.lanes[0].name = "Work".to_owned();
+        duplicate.lanes[1].name = " work ".to_owned();
+        assert_eq!(
+            validate_profile(&duplicate),
+            Err(DomainError::DuplicateLaneName("work".to_owned()))
         );
     }
 }

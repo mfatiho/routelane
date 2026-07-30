@@ -18,6 +18,13 @@ pub fn add_lane(
     let interface = interface.trim();
     anyhow::ensure!(!name.is_empty(), "lane name must not be empty");
     anyhow::ensure!(!interface.is_empty(), "lane interface must not be empty");
+    anyhow::ensure!(
+        !profile
+            .lanes
+            .iter()
+            .any(|lane| lane.name.trim().eq_ignore_ascii_case(name)),
+        "lane name already exists"
+    );
     let id = LaneId::from(format!("lane-{}", uuid::Uuid::new_v4()).as_str());
     profile.lanes.push(Lane {
         id: id.clone(),
@@ -27,6 +34,47 @@ pub fn add_lane(
         failure_policy,
     });
     Ok(id)
+}
+
+pub fn rename_lane(profile: &mut Profile, lane_id: &LaneId, name: &str) -> anyhow::Result<()> {
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "lane name must not be empty");
+    anyhow::ensure!(
+        !profile
+            .lanes
+            .iter()
+            .any(|lane| &lane.id != lane_id && lane.name.trim().eq_ignore_ascii_case(name)),
+        "lane name already exists"
+    );
+    let lane = profile
+        .lanes
+        .iter_mut()
+        .find(|lane| &lane.id == lane_id)
+        .ok_or_else(|| anyhow::anyhow!("lane not found"))?;
+    lane.name = name.to_owned();
+    Ok(())
+}
+
+fn set_lane_interface(profile: &mut Profile, lane_id: &LaneId, interface: &str) -> bool {
+    if let Some(lane) = profile.lanes.iter_mut().find(|lane| &lane.id == lane_id) {
+        lane.interface = InterfaceSelector::from(interface);
+        true
+    } else {
+        false
+    }
+}
+
+fn set_lane_failure_policy(
+    profile: &mut Profile,
+    lane_id: &LaneId,
+    failure_policy: LaneFailurePolicy,
+) -> bool {
+    if let Some(lane) = profile.lanes.iter_mut().find(|lane| &lane.id == lane_id) {
+        lane.failure_policy = failure_policy;
+        true
+    } else {
+        false
+    }
 }
 
 pub fn delete_lane(profile: &mut Profile, lane_id: &LaneId) {
@@ -196,13 +244,11 @@ fn add_lane_editor(
         let profile = profile.clone();
         let on_change = on_change.clone();
         name.connect_changed(move |entry| {
-            if let Some(lane) = profile
-                .borrow_mut()
-                .lanes
-                .iter_mut()
-                .find(|lane| lane.id == lane_id)
-            {
-                lane.name = entry.text().to_string();
+            let changed = {
+                let mut profile = profile.borrow_mut();
+                rename_lane(&mut profile, &lane_id, entry.text().as_str()).is_ok()
+            };
+            if changed {
                 on_change();
             }
         });
@@ -216,13 +262,11 @@ fn add_lane_editor(
             let Some(selected) = interfaces.get(dropdown.selected() as usize) else {
                 return;
             };
-            if let Some(lane) = profile
-                .borrow_mut()
-                .lanes
-                .iter_mut()
-                .find(|lane| lane.id == lane_id)
-            {
-                lane.interface = InterfaceSelector::from(selected.as_str());
+            let changed = {
+                let mut profile = profile.borrow_mut();
+                set_lane_interface(&mut profile, &lane_id, selected)
+            };
+            if changed {
                 on_change();
             }
         });
@@ -232,13 +276,15 @@ fn add_lane_editor(
         let profile = profile.clone();
         let on_change = on_change.clone();
         policy.connect_selected_notify(move |dropdown| {
-            if let Some(lane) = profile
-                .borrow_mut()
-                .lanes
-                .iter_mut()
-                .find(|lane| lane.id == lane_id)
-            {
-                lane.failure_policy = policy_from_index(dropdown.selected());
+            let changed = {
+                let mut profile = profile.borrow_mut();
+                set_lane_failure_policy(
+                    &mut profile,
+                    &lane_id,
+                    policy_from_index(dropdown.selected()),
+                )
+            };
+            if changed {
                 on_change();
             }
         });
@@ -248,7 +294,10 @@ fn add_lane_editor(
         let profile = profile.clone();
         let group = group.clone();
         delete.connect_clicked(move |_| {
-            delete_lane(&mut profile.borrow_mut(), &lane_id);
+            {
+                let mut profile = profile.borrow_mut();
+                delete_lane(&mut profile, &lane_id);
+            }
             group.remove(&row);
             on_change();
         });
@@ -284,7 +333,7 @@ fn system_interfaces() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{add_lane, delete_lane};
+    use super::{add_lane, delete_lane, rename_lane};
     use routelane::domain::{
         InterfaceSelector, LaneFailurePolicy, Profile, ProfileId, Rule, RuleAction, RuleId,
         RuleSource, RuleTarget,
@@ -329,5 +378,14 @@ mod tests {
 
         assert!(profile.lanes.is_empty());
         assert!(profile.rules.is_empty());
+    }
+
+    #[test]
+    fn lane_names_are_trimmed_and_unique_case_insensitively() {
+        let mut profile = profile();
+        let first = add_lane(&mut profile, " Work ", "tun0", LaneFailurePolicy::Inactive).unwrap();
+        assert_eq!(profile.lanes[0].name, "Work");
+        assert!(add_lane(&mut profile, "work", "tun1", LaneFailurePolicy::Inactive).is_err());
+        assert!(rename_lane(&mut profile, &first, "  ").is_err());
     }
 }

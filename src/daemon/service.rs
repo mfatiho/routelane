@@ -17,7 +17,9 @@ use crate::backend::{
     KernelPlan, ResolutionSnapshot, RestoreResponse, TopologySnapshot,
 };
 use crate::dns::periodic::resolve_domain;
-use crate::domain::{validate_profile, HealthState, Profile, ProfileId, RuleId, RuleTarget};
+use crate::domain::{
+    normalize_lane_names, validate_profile, HealthState, Profile, ProfileId, RuleId, RuleTarget,
+};
 use crate::health::{
     evaluate_health, Diagnostic, DiagnosticCode, DiagnosticSubject, HealthReport, Severity,
     SuggestedAction,
@@ -852,8 +854,15 @@ impl ConfigRepository for AtomicJsonConfigRepository {
         if json.len() as u64 > MAX_CONFIG_BYTES {
             return Err(DaemonError::config("desired profile file is too large"));
         }
-        serde_json::from_slice(&json)
-            .map_err(|error| DaemonError::config(format!("decode desired profile: {error}")))
+        let mut desired: Option<Profile> = serde_json::from_slice(&json)
+            .map_err(|error| DaemonError::config(format!("decode desired profile: {error}")))?;
+        if let Some(profile) = &mut desired {
+            normalize_lane_names(profile);
+            validate_profile(profile).map_err(|error| {
+                DaemonError::config(format!("validate desired profile: {error:?}"))
+            })?;
+        }
+        Ok(desired)
     }
 
     fn save(&self, desired: Option<&Profile>) -> Result<(), DaemonError> {

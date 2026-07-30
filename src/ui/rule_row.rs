@@ -1,13 +1,11 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
-use async_channel::Sender;
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
 use routelane::domain::{LaneId, ProfileId, Rule, RuleAction, RuleId};
 use routelane::ipc::DaemonRequest;
 
-use crate::models::UiToDaemon;
 use crate::ui::i18n::Texts;
 
 pub fn set_rule_enabled_request(
@@ -22,16 +20,26 @@ pub fn set_rule_enabled_request(
     }
 }
 
-pub fn create_rule_row(
-    rule: &Rule,
-    profile_id: ProfileId,
-    lanes: &[(LaneId, String)],
-    sender: Sender<UiToDaemon>,
-    routing_active: Rc<Cell<bool>>,
-    texts: Texts,
-    on_change: Rc<dyn Fn(Rule)>,
-    on_delete: Rc<dyn Fn(RuleId)>,
-) -> adw::ActionRow {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleEdit {
+    Definition,
+    Enabled(bool),
+}
+
+pub struct RuleRowContext {
+    pub lanes: Vec<(LaneId, String)>,
+    pub texts: Texts,
+    pub on_change: Rc<dyn Fn(Rule, RuleEdit)>,
+    pub on_delete: Rc<dyn Fn(RuleId)>,
+}
+
+pub fn create_rule_row(rule: &Rule, context: RuleRowContext) -> adw::ActionRow {
+    let RuleRowContext {
+        lanes,
+        texts,
+        on_change,
+        on_delete,
+    } = context;
     let row = adw::ActionRow::new();
     row.set_title(&target_label(rule));
 
@@ -85,25 +93,15 @@ pub fn create_rule_row(
     row.add_suffix(&action);
     row.add_suffix(&lane_select);
     row.add_suffix(&delete);
-    row.set_subtitle(&action_label(&rule.action, lanes, rule.priority));
+    row.set_subtitle(&action_label(&rule.action, &lanes, rule.priority));
     let rule_state = Rc::new(RefCell::new(rule.clone()));
 
     {
-        let rule_id = rule.id.clone();
-        let profile_id = profile_id.clone();
-        let sender = sender.clone();
         let changed = rule_state.clone();
         let on_change = on_change.clone();
         enabled.connect_state_set(move |_, state| {
             changed.borrow_mut().enabled = state;
-            on_change(changed.borrow().clone());
-            if routing_active.get() {
-                let request = set_rule_enabled_request(profile_id.clone(), rule_id.clone(), state);
-                let sender = sender.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    sender.send(UiToDaemon::Request(request)).await.ok();
-                });
-            }
+            on_change(changed.borrow().clone(), RuleEdit::Enabled(state));
             glib::signal::Inhibit(false)
         });
     }
@@ -112,7 +110,7 @@ pub fn create_rule_row(
         let on_change = on_change.clone();
         priority.connect_value_changed(move |spin| {
             changed.borrow_mut().priority = spin.value_as_int().max(1) as u32;
-            on_change(changed.borrow().clone());
+            on_change(changed.borrow().clone(), RuleEdit::Definition);
         });
     }
     {
@@ -131,7 +129,7 @@ pub fn create_rule_row(
             };
             lane_select_for_action
                 .set_visible(matches!(changed.borrow().action, RuleAction::Route(_)));
-            on_change(changed.borrow().clone());
+            on_change(changed.borrow().clone(), RuleEdit::Definition);
         });
     }
     {
@@ -141,7 +139,7 @@ pub fn create_rule_row(
         lane_select.connect_selected_notify(move |dropdown| {
             if let Some((lane_id, _)) = lanes.get(dropdown.selected() as usize) {
                 changed.borrow_mut().action = RuleAction::Route(lane_id.clone());
-                on_change(changed.borrow().clone());
+                on_change(changed.borrow().clone(), RuleEdit::Definition);
             }
         });
     }

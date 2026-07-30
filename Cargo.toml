@@ -11,7 +11,7 @@ path = "src/lib.rs"
 name = "routelane"
 path = "src/main.rs"
 
-# Privileged helper — pkexec ile tek seferlik ayrıcalık yükseltmesi için
+# Privileged helper — system D-Bus üzerinden Polkit yetkilendirmesi için
 [[bin]]
 name = "routelane-helper"
 path = "src/bin/routelane_helper.rs"

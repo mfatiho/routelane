@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use routelane::domain::{
-    InterfaceSelector, Lane, LaneFailurePolicy, LaneId, Profile, ProfileId, Rule, RuleAction,
-    RuleId, RuleSource, RuleTarget,
+    normalize_lane_names, validate_profile, InterfaceSelector, Lane, LaneFailurePolicy, LaneId,
+    Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource, RuleTarget,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -35,6 +35,7 @@ impl Language {
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PersistedState {
     #[serde(default)]
     pub language: Language,
@@ -45,6 +46,7 @@ pub struct PersistedState {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PersistedRule {
     pub target_str: String,
     pub is_domain: bool,
@@ -54,6 +56,7 @@ pub struct PersistedRule {
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigV2 {
     pub schema_version: u32,
     #[serde(default)]
@@ -72,19 +75,30 @@ impl ConfigDocument {
     pub fn from_json(json: &str) -> anyhow::Result<Self> {
         let value: serde_json::Value =
             serde_json::from_str(json).context("configuration is not valid JSON")?;
-        match value
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-        {
-            Some(version) if version == u64::from(CURRENT_SCHEMA_VERSION) => {
-                let current =
-                    serde_json::from_value(value).context("version 2 configuration is invalid")?;
-                Ok(Self::V2(current))
+        let object = value
+            .as_object()
+            .context("configuration root must be an object")?;
+        if let Some(raw_version) = object.get("schema_version") {
+            match raw_version.as_u64() {
+                Some(version) if version == u64::from(CURRENT_SCHEMA_VERSION) => {
+                    let current = serde_json::from_value(value)
+                        .context("version 2 configuration is invalid")?;
+                    Ok(Self::V2(current))
+                }
+                Some(version) => bail!("unsupported configuration schema version {version}"),
+                None => bail!("schema_version must be the integer {CURRENT_SCHEMA_VERSION}"),
             }
-            Some(version) => bail!("unsupported configuration schema version {version}"),
-            None => serde_json::from_value(value)
+        } else {
+            let recognized = object
+                .keys()
+                .all(|key| matches!(key.as_str(), "language" | "alt_interface" | "rules"))
+                && (object.contains_key("alt_interface") || object.contains_key("rules"));
+            if !recognized {
+                bail!("configuration does not match the legacy schema");
+            }
+            serde_json::from_value(value)
                 .map(Self::Legacy)
-                .context("legacy configuration is invalid"),
+                .context("legacy configuration is invalid")
         }
     }
 
@@ -96,6 +110,9 @@ impl ConfigDocument {
         current.schema_version = CURRENT_SCHEMA_VERSION;
         for profile in &mut current.profiles {
             profile.enabled = false;
+            normalize_lane_names(profile);
+            validate_profile(profile)
+                .map_err(|error| anyhow::anyhow!("invalid profile after migration: {error:?}"))?;
         }
         Ok(current)
     }
@@ -214,6 +231,56 @@ pub struct ConfigRepository {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct PersistenceRequest {
+    pub generation: u64,
+    pub config: ConfigV2,
+}
+
+impl PersistenceRequest {
+    pub fn new(generation: u64, config: ConfigV2) -> Self {
+        Self { generation, config }
+    }
+}
+
+#[derive(Debug)]
+pub struct PersistenceResult {
+    pub generation: u64,
+    pub result: Result<(), String>,
+}
+
+pub struct PersistenceWorker {
+    pub requests: async_channel::Sender<PersistenceRequest>,
+    pub results: async_channel::Receiver<PersistenceResult>,
+}
+
+impl PersistenceWorker {
+    pub fn spawn(repository: ConfigRepository) -> Self {
+        let (requests, request_receiver) = async_channel::bounded::<PersistenceRequest>(1);
+        let (result_sender, results) = async_channel::bounded::<PersistenceResult>(1);
+        std::thread::Builder::new()
+            .name("routelane-config-writer".to_owned())
+            .spawn(move || {
+                while let Ok(request) = request_receiver.recv_blocking() {
+                    let result = repository
+                        .save(&request.config)
+                        .map_err(|error| error.to_string());
+                    if result_sender
+                        .send_blocking(PersistenceResult {
+                            generation: request.generation,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("configuration persistence worker could not start");
+        Self { requests, results }
+    }
+}
+
 impl ConfigRepository {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
@@ -259,7 +326,8 @@ impl ConfigRepository {
                 .unwrap_or("config"),
             uuid::Uuid::new_v4()
         ));
-        write_private_file(&temp_path, &bytes)?;
+        let mut temporary = TemporaryPath::new(temp_path);
+        write_private_file(temporary.path(), &bytes)?;
 
         let backup = self.path.with_extension("json.bak");
         if self.path.exists() {
@@ -271,23 +339,56 @@ impl ConfigRepository {
                     .unwrap_or("config"),
                 uuid::Uuid::new_v4()
             ));
-            copy_private_file(&self.path, &backup_temp)?;
-            std::fs::rename(&backup_temp, &backup).with_context(|| {
+            let mut backup_temporary = TemporaryPath::new(backup_temp);
+            copy_private_file(&self.path, backup_temporary.path())?;
+            std::fs::rename(backup_temporary.path(), &backup).with_context(|| {
                 format!(
                     "could not atomically replace configuration backup {}",
                     backup.display()
                 )
             })?;
+            backup_temporary.commit();
         }
 
-        std::fs::rename(&temp_path, &self.path).with_context(|| {
+        std::fs::rename(temporary.path(), &self.path).with_context(|| {
             format!(
                 "could not atomically replace configuration {}",
                 self.path.display()
             )
         })?;
+        temporary.commit();
         sync_directory(parent)?;
         Ok(())
+    }
+}
+
+struct TemporaryPath {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl TemporaryPath {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TemporaryPath {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -481,5 +582,59 @@ mod tests {
         let error = ConfigRepository::new(path).load().unwrap_err();
 
         assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn schema_version_is_strict_and_never_falls_back_to_legacy() {
+        for invalid in [
+            r#"{"schema_version":"2","language":"tr","profiles":[]}"#,
+            r#"{"schema_version":3,"language":"tr","profiles":[]}"#,
+            r#"{"schema_version":2.0,"language":"tr","profiles":[]}"#,
+            r#"{"language":"tr","profiles":[]}"#,
+        ] {
+            assert!(ConfigDocument::from_json(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn invalid_v2_load_never_changes_the_original_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let invalid = br#"{"schema_version":"2","profiles":[BROKEN]}"#;
+        std::fs::write(&path, invalid).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(ConfigRepository::new(&path).load().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), invalid);
+        assert!(!path.with_extension("json.bak").exists());
+    }
+
+    #[test]
+    fn persistence_worker_serializes_rapid_edits_in_generation_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let worker = PersistenceWorker::spawn(ConfigRepository::new(&path));
+        let first = ConfigV2 {
+            language: Language::Tr,
+            ..ConfigV2::default()
+        };
+        let mut second = first.clone();
+        second.language = Language::En;
+
+        worker
+            .requests
+            .send_blocking(PersistenceRequest::new(1, first))
+            .unwrap();
+        worker
+            .requests
+            .send_blocking(PersistenceRequest::new(2, second))
+            .unwrap();
+
+        assert_eq!(worker.results.recv_blocking().unwrap().generation, 1);
+        assert_eq!(worker.results.recv_blocking().unwrap().generation, 2);
+        assert_eq!(
+            ConfigRepository::new(path).load().unwrap().language,
+            Language::En
+        );
     }
 }
