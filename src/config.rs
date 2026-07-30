@@ -116,6 +116,7 @@ impl ConfigDocument {
             validate_profile(profile)
                 .map_err(|error| anyhow::anyhow!("invalid profile after migration: {error:?}"))?;
         }
+        validate_config_profiles(&current.profiles)?;
         Ok(current)
     }
 }
@@ -307,6 +308,7 @@ impl ConfigRepository {
             validate_profile(profile)
                 .map_err(|error| anyhow::anyhow!("refusing to save invalid profile: {error:?}"))?;
         }
+        validate_config_profiles(&current.profiles)?;
         let bytes = serde_json::to_vec_pretty(&current)?;
 
         let parent = self
@@ -360,6 +362,21 @@ impl ConfigRepository {
         sync_directory(parent)?;
         Ok(())
     }
+}
+
+fn validate_config_profiles(profiles: &[Profile]) -> anyhow::Result<()> {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut names = std::collections::BTreeSet::new();
+    for profile in profiles {
+        if !ids.insert(profile.id.clone()) {
+            bail!("duplicate profile id '{}'", profile.id.as_str());
+        }
+        let canonical_name = profile.name.trim().to_lowercase();
+        if !names.insert(canonical_name) {
+            bail!("duplicate profile name '{}'", profile.name);
+        }
+    }
+    Ok(())
 }
 
 pub fn load_config_file(path: &Path) -> anyhow::Result<ConfigV2> {
@@ -710,5 +727,41 @@ mod tests {
         assert!(ConfigRepository::new(&path).save(&invalid).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert!(!path.with_extension("json.bak").exists());
+    }
+
+    #[test]
+    fn duplicate_profile_ids_and_names_are_rejected_before_atomic_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let original = br#"{"schema_version":2,"language":"tr","profiles":[]}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let profile = Profile {
+            id: ProfileId::from("work"),
+            name: "Work".to_owned(),
+            enabled: false,
+            lanes: vec![],
+            rules: vec![],
+        };
+        let mut duplicate_id = profile.clone();
+        duplicate_id.name = "Privacy".to_owned();
+        let duplicate_name = Profile {
+            id: ProfileId::from("privacy"),
+            name: " work ".to_owned(),
+            ..profile.clone()
+        };
+
+        for profiles in [
+            vec![profile.clone(), duplicate_id],
+            vec![profile.clone(), duplicate_name],
+        ] {
+            let document = ConfigV2 {
+                profiles,
+                ..Default::default()
+            };
+            assert!(ConfigRepository::new(&path).save(&document).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(!path.with_extension("json.bak").exists());
+        }
     }
 }

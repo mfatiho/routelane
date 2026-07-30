@@ -99,9 +99,11 @@ fn compile_lane(lane: &Lane, topology: &TopologySnapshot, slot: u32) -> LanePlan
     LanePlan {
         id: lane.id.clone(),
         interface: interface.to_owned(),
-        gateway_v4: topology_entry.and_then(|entry| entry.gateway_v4),
-        gateway_v6: topology_entry.and_then(|entry| entry.gateway_v6),
-        availability: if topology_entry.is_some() {
+        route_v4: topology_entry.and_then(|entry| entry.route_v4),
+        route_v6: topology_entry.and_then(|entry| entry.route_v6),
+        availability: if topology_entry
+            .is_some_and(|entry| entry.route_v4.is_some() || entry.route_v6.is_some())
+        {
             LaneAvailability::Available
         } else {
             LaneAvailability::Unavailable

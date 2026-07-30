@@ -96,37 +96,37 @@ fn inspect_lane(
         return;
     }
 
-    if lane.gateway_v4.is_none() && lane.gateway_v6.is_none() {
+    if lane.route_v4.is_none() && lane.route_v6.is_none() {
         degrade(lane, lanes);
         diagnostics.push(Diagnostic::new(
             DiagnosticCode::LaneGatewayUnreachable,
-            format!("Lane {} has no supported gateway", lane.id.as_str()),
-            "the available lane has neither an IPv4 nor an IPv6 gateway",
+            format!("Lane {} has no supported route", lane.id.as_str()),
+            "the available lane has neither IPv4 nor IPv6 default-route evidence",
             Severity::Warning,
             DiagnosticSubject::Lane(lane.id.clone()),
             Some(SuggestedAction::new(
-                "Configure a supported gateway and reapply the active profile.",
+                "Configure a supported default route and reapply the active profile.",
             )),
         ));
         return;
     }
 
-    if let Some(gateway) = lane.gateway_v4 {
+    if let Some(route) = lane.route_v4 {
         inspect_family(
             lane,
             snapshot,
             IpFamily::V4,
-            IpAddr::V4(gateway),
+            route.gateway().copied().map(IpAddr::V4),
             lanes,
             diagnostics,
         );
     }
-    if let Some(gateway) = lane.gateway_v6 {
+    if let Some(route) = lane.route_v6 {
         inspect_family(
             lane,
             snapshot,
             IpFamily::V6,
-            IpAddr::V6(gateway),
+            route.gateway().copied().map(IpAddr::V6),
             lanes,
             diagnostics,
         );
@@ -137,7 +137,7 @@ fn inspect_family(
     lane: &LanePlan,
     snapshot: &KernelSnapshot,
     family: IpFamily,
-    gateway: IpAddr,
+    gateway: Option<IpAddr>,
     lanes: &mut LaneHealth,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -145,22 +145,25 @@ fn inspect_family(
         IpFamily::V4 => "IPv4",
         IpFamily::V6 => "IPv6",
     };
-    if !snapshot.gateway_reachable(&lane.interface, gateway) {
+    if !snapshot.route_reachable(&lane.interface, family, gateway) {
         degrade(lane, lanes);
         diagnostics.push(Diagnostic::new(
             DiagnosticCode::LaneGatewayUnreachable,
             format!(
-                "Lane {} {family_name} gateway is unavailable",
+                "Lane {} {family_name} default route is unavailable",
                 lane.id.as_str()
             ),
             format!(
-                "gateway {gateway} is not reachable through interface {:?}",
-                lane.interface
+                "default route via {} is not reachable through interface {:?}",
+                gateway
+                    .map(|gateway| gateway.to_string())
+                    .unwrap_or_else(|| "device-only link".to_owned()),
+                lane.interface,
             ),
             Severity::Warning,
             DiagnosticSubject::Lane(lane.id.clone()),
             Some(SuggestedAction::new(
-                "Restore the gateway route or select another lane.",
+                "Restore the default route or select another lane.",
             )),
         ));
     }

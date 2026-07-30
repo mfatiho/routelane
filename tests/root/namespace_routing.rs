@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use ipnet::IpNet;
 use routelane::backend::{
     CompiledAction, CompiledRule, CompiledTarget, KernelPlan, LaneAvailability, LanePlan,
-    MARK_BASE, RULE_PRIORITY_BASE, TABLE_BASE,
+    RouteMode, MARK_BASE, RULE_PRIORITY_BASE, TABLE_BASE,
 };
 use routelane::domain::{LaneFailurePolicy, LaneId, ProfileId, RuleId};
 use serde_json::{json, Value};
@@ -672,6 +672,12 @@ fn plan(
             ),
             rule("direct-b", 40, "198.18.0.10/32", CompiledAction::Direct),
             rule("block-c", 50, "192.0.2.99/32", CompiledAction::Block),
+            CompiledRule {
+                id: RuleId::from("catch-all-direct"),
+                priority: 100,
+                target: CompiledTarget::Any,
+                action: CompiledAction::Direct,
+            },
         ],
     }
 }
@@ -680,8 +686,8 @@ fn lane(id: &str, interface: &str, gateway: &str, offset: u32) -> LanePlan {
     LanePlan {
         id: LaneId::from(id),
         interface: interface.to_owned(),
-        gateway_v4: Some(gateway.parse().unwrap()),
-        gateway_v6: None,
+        route_v4: Some(RouteMode::Via(gateway.parse().unwrap())),
+        route_v6: None,
         availability: LaneAvailability::Available,
         table: TABLE_BASE + offset,
         mark: MARK_BASE + offset,

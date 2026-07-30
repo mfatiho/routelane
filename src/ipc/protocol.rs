@@ -27,6 +27,8 @@ impl DaemonEnvelope {
 #[serde(tag = "method", content = "parameters")]
 pub enum DaemonRequest {
     GetStatus,
+    /// Returns the daemon's partial desired/applied profile snapshot. Clients
+    /// merge these profiles by ID; absence never authorizes local deletion.
     ListProfiles,
     ApplyProfile(Profile),
     SetRuleEnabled {
@@ -70,6 +72,7 @@ impl DaemonResponse {
 #[serde(tag = "kind", content = "value")]
 pub enum DaemonResult {
     Status(DaemonStatus),
+    /// Partial profile snapshot for merge/upsert, not an authoritative catalog.
     Profiles(Vec<Profile>),
     Applied(ApplyProfileResult),
     Deactivated,

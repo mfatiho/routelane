@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use ipnet::IpNet;
 use routelane::backend::{
     render_ruleset, CompiledAction, CompiledRule, CompiledTarget, KernelPlan, LaneAvailability,
-    LanePlan, NftRenderError, TableMode,
+    LanePlan, NftRenderError, RouteMode, TableMode,
 };
 use routelane::domain::{LaneFailurePolicy, LaneId, ProfileId, RuleId};
 
@@ -14,8 +14,8 @@ fn fixture_kernel_plan_with_all_actions() -> KernelPlan {
         lanes: vec![LanePlan {
             id: LaneId::from("privacy"),
             interface: "wg-privacy".into(),
-            gateway_v4: Some(Ipv4Addr::new(10, 0, 0, 1)),
-            gateway_v6: Some("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+            route_v4: Some(RouteMode::Via(Ipv4Addr::new(10, 0, 0, 1))),
+            route_v6: Some(RouteMode::Via("2001:db8::1".parse::<Ipv6Addr>().unwrap())),
             availability: LaneAvailability::Available,
             table: 20_001,
             mark: 0x524c0002,
@@ -82,6 +82,41 @@ fn direct_rule_counts_the_mark_reset_before_returning() {
     assert!(
         rendered.contains("ip daddr 198.51.100.7 meta mark set 0x00000000 counter return"),
         "Direct observability requires its counter before the terminal return"
+    );
+}
+
+#[test]
+fn routed_rule_returns_after_marking_so_first_matching_rule_wins() {
+    let mut plan = fixture_kernel_plan_with_all_actions();
+    plan.rules = vec![
+        CompiledRule {
+            id: RuleId::from("specific-route"),
+            priority: 10,
+            target: CompiledTarget::Network("203.0.113.7/32".parse::<IpNet>().unwrap()),
+            action: CompiledAction::Mark(0x524c0002),
+        },
+        CompiledRule {
+            id: RuleId::from("catch-all-direct"),
+            priority: 100,
+            target: CompiledTarget::Any,
+            action: CompiledAction::Direct,
+        },
+    ];
+
+    let rendered = render_ruleset(&plan, TableMode::Create).expect("render overlapping rules");
+    let specific = rendered
+        .lines()
+        .find(|line| line.contains("203.0.113.7"))
+        .expect("specific route rule");
+    let catch_all = rendered.lines().last().expect("catch-all rule");
+
+    assert_eq!(
+        specific,
+        "add rule inet routelane output ip daddr 203.0.113.7 meta mark set 0x524c0002 counter return"
+    );
+    assert_eq!(
+        catch_all,
+        "add rule inet routelane output meta mark set 0x00000000 counter return"
     );
 }
 

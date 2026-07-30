@@ -46,13 +46,28 @@ impl KernelPlan {
 pub struct LanePlan {
     pub id: LaneId,
     pub interface: String,
-    pub gateway_v4: Option<Ipv4Addr>,
-    pub gateway_v6: Option<Ipv6Addr>,
+    pub route_v4: Option<RouteMode<Ipv4Addr>>,
+    pub route_v6: Option<RouteMode<Ipv6Addr>>,
     pub availability: LaneAvailability,
     pub table: u32,
     pub mark: u32,
     pub rule_priority: u32,
     pub failure_policy: LaneFailurePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteMode<A> {
+    Via(A),
+    Device,
+}
+
+impl<A> RouteMode<A> {
+    pub fn gateway(&self) -> Option<&A> {
+        match self {
+            Self::Via(gateway) => Some(gateway),
+            Self::Device => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,10 +120,20 @@ impl TopologySnapshot {
         self.interfaces.insert(
             interface.into(),
             InterfaceTopology {
-                gateway_v4,
-                gateway_v6,
+                route_v4: gateway_v4.map(RouteMode::Via),
+                route_v6: gateway_v6.map(RouteMode::Via),
             },
         );
+    }
+
+    pub fn insert_routes(
+        &mut self,
+        interface: impl Into<String>,
+        route_v4: Option<RouteMode<Ipv4Addr>>,
+        route_v6: Option<RouteMode<Ipv6Addr>>,
+    ) {
+        self.interfaces
+            .insert(interface.into(), InterfaceTopology { route_v4, route_v6 });
     }
 
     pub(crate) fn interface(&self, interface: &str) -> Option<&InterfaceTopology> {
@@ -118,8 +143,8 @@ impl TopologySnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InterfaceTopology {
-    pub gateway_v4: Option<Ipv4Addr>,
-    pub gateway_v6: Option<Ipv6Addr>,
+    pub route_v4: Option<RouteMode<Ipv4Addr>>,
+    pub route_v6: Option<RouteMode<Ipv6Addr>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -33,7 +33,7 @@ const STATE_FILE: &str = "/run/routelane/applied-plan.json";
 const O_NOFOLLOW: i32 = 0o400000;
 const MAX_LANES: usize = 100;
 const MAX_RULES: usize = 10_000;
-const ROUTING_CRASH_MODEL_VERSION: &str = "exact-command-prefix-v2";
+const ROUTING_CRASH_MODEL_VERSION: &str = "exact-command-prefix-v3";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_COMMAND_PIPE_BYTES: usize = 1024 * 1024;
@@ -778,6 +778,7 @@ where
         Ok(InspectResponse {
             generation: self.current.as_ref().map(|state| state.generation),
             plan_hash: self.current.as_ref().map(|state| state.plan_hash),
+            applied_plan: self.current.as_ref().map(|state| state.plan().clone()),
             routelane_table_present: snapshot.has_nft_table("inet", "routelane"),
             snapshot,
             diagnostics: vec![],
@@ -1374,11 +1375,12 @@ fn unowned_requested_resource_present(
         .iter()
         .filter(|lane| lane.availability == super::LaneAvailability::Available)
     {
-        if let Some(gateway) = lane.gateway_v4 {
+        if let Some(route) = lane.route_v4 {
+            let gateway = route.gateway().map(ToString::to_string);
             if route_present(
                 &ipv4_routes,
                 lane.table,
-                &gateway.to_string(),
+                gateway.as_deref(),
                 &lane.interface,
             ) && !current.is_some_and(|plan| plan_has_route(plan, IpFamily::V4, lane))
             {
@@ -1390,11 +1392,12 @@ fn unowned_requested_resource_present(
                 return Ok(true);
             }
         }
-        if let Some(gateway) = lane.gateway_v6 {
+        if let Some(route) = lane.route_v6 {
+            let gateway = route.gateway().map(ToString::to_string);
             if route_present(
                 &ipv6_routes,
                 lane.table,
-                &gateway.to_string(),
+                gateway.as_deref(),
                 &lane.interface,
             ) && !current.is_some_and(|plan| plan_has_route(plan, IpFamily::V6, lane))
             {
@@ -1797,6 +1800,7 @@ fn nft_rule_object(rule: &super::CompiledRule) -> serde_json::Value {
                 }
             }));
             expressions.push(serde_json::json!({"counter": {}}));
+            expressions.push(serde_json::json!({"return": null}));
         }
         CompiledAction::Direct => {
             expressions.push(serde_json::json!({
@@ -1924,22 +1928,24 @@ fn captured_plan_present(
         .iter()
         .filter(|lane| lane.availability == super::LaneAvailability::Available)
     {
-        if let Some(gateway) = lane.gateway_v4 {
+        if let Some(route) = lane.route_v4 {
+            let gateway = route.gateway().map(ToString::to_string);
             if !route_present(
                 &ipv4_routes,
                 lane.table,
-                &gateway.to_string(),
+                gateway.as_deref(),
                 &lane.interface,
             ) || !rule_present(&ipv4_rules, lane.rule_priority, lane.table, lane.mark)
             {
                 return Ok(false);
             }
         }
-        if let Some(gateway) = lane.gateway_v6 {
+        if let Some(route) = lane.route_v6 {
+            let gateway = route.gateway().map(ToString::to_string);
             if !route_present(
                 &ipv6_routes,
                 lane.table,
-                &gateway.to_string(),
+                gateway.as_deref(),
                 &lane.interface,
             ) || !rule_present(&ipv6_rules, lane.rule_priority, lane.table, lane.mark)
             {
@@ -2126,7 +2132,7 @@ enum PendingNftPhase {
 struct RouteOwnership {
     family: u8,
     table: u32,
-    gateway: String,
+    gateway: Option<String>,
     interface: String,
 }
 
@@ -2409,8 +2415,8 @@ fn push_routing_fingerprint(
 
 fn lane_route_ownership(lane: &super::LanePlan, family: IpFamily) -> Option<RouteOwnership> {
     let gateway = match family {
-        IpFamily::V4 => lane.gateway_v4?.to_string(),
-        IpFamily::V6 => lane.gateway_v6?.to_string(),
+        IpFamily::V4 => lane.route_v4?.gateway().map(ToString::to_string),
+        IpFamily::V6 => lane.route_v6?.gateway().map(ToString::to_string),
     };
     Some(RouteOwnership {
         family: family_number(family),
@@ -2473,7 +2479,13 @@ fn collect_live_routes(
             || !absent_or_exact_string(route.get("type"), "unicast")
             || !absent_or_exact_u32(route.get("metric"), if family == 4 { 0 } else { 1024 })
             || !absent_or_exact_string(route.get("protocol"), "boot")
-            || !absent_or_exact_string(route.get("scope"), "global")
+            || !route_scope_is_exact(
+                route.get("scope"),
+                route
+                    .get("gateway")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none(),
+            )
             || route.get("prefsrc").is_some()
             || !absent_or_empty_array(route.get("flags"))
             || (family == 4 && route.get("pref").is_some())
@@ -2489,8 +2501,7 @@ fn collect_live_routes(
             gateway: route
                 .get("gateway")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| PrivilegedError::new("live RouteLane route is missing its gateway"))?
-                .to_owned(),
+                .map(str::to_owned),
             interface: route
                 .get("dev")
                 .and_then(serde_json::Value::as_str)
@@ -2559,6 +2570,12 @@ fn collect_live_rules(
 
 fn absent_or_exact_string(value: Option<&serde_json::Value>, expected: &str) -> bool {
     value.is_none_or(|value| value.as_str() == Some(expected))
+}
+
+fn route_scope_is_exact(value: Option<&serde_json::Value>, gatewayless: bool) -> bool {
+    value.is_none_or(|value| {
+        value.as_str() == Some("global") || (gatewayless && value.as_str() == Some("link"))
+    })
 }
 
 fn absent_or_exact_u32(value: Option<&serde_json::Value>, expected: u32) -> bool {
@@ -2725,11 +2742,16 @@ fn normalize_nft_document(value: &mut serde_json::Value) {
     }
 }
 
-fn route_present(routes: &[serde_json::Value], table: u32, gateway: &str, interface: &str) -> bool {
+fn route_present(
+    routes: &[serde_json::Value],
+    table: u32,
+    gateway: Option<&str>,
+    interface: &str,
+) -> bool {
     routes.iter().any(|route| {
         route.get("dst").and_then(serde_json::Value::as_str) == Some("default")
             && json_u32(route.get("table")) == Some(table)
-            && route.get("gateway").and_then(serde_json::Value::as_str) == Some(gateway)
+            && route.get("gateway").and_then(serde_json::Value::as_str) == gateway
             && route.get("dev").and_then(serde_json::Value::as_str) == Some(interface)
     })
 }
@@ -2776,10 +2798,10 @@ fn remove_old_policy_rules(
         .iter()
         .filter(|lane| lane.availability == super::LaneAvailability::Available)
     {
-        if lane.gateway_v4.is_some() && !plan_has_policy_rule(next, IpFamily::V4, lane) {
+        if lane.route_v4.is_some() && !plan_has_policy_rule(next, IpFamily::V4, lane) {
             delete_one_rule_if_present(executor, IpFamily::V4, lane)?;
         }
-        if lane.gateway_v6.is_some() && !plan_has_policy_rule(next, IpFamily::V6, lane) {
+        if lane.route_v6.is_some() && !plan_has_policy_rule(next, IpFamily::V6, lane) {
             delete_one_rule_if_present(executor, IpFamily::V6, lane)?;
         }
     }
@@ -2793,8 +2815,8 @@ fn plan_has_policy_rule(plan: &KernelPlan, family: IpFamily, expected: &super::L
             && lane.mark == expected.mark
             && lane.rule_priority == expected.rule_priority
             && match family {
-                IpFamily::V4 => lane.gateway_v4.is_some(),
-                IpFamily::V6 => lane.gateway_v6.is_some(),
+                IpFamily::V4 => lane.route_v4.is_some(),
+                IpFamily::V6 => lane.route_v6.is_some(),
             }
     })
 }
@@ -2805,8 +2827,8 @@ fn plan_has_route(plan: &KernelPlan, family: IpFamily, expected: &super::LanePla
             && lane.table == expected.table
             && lane.interface == expected.interface
             && match family {
-                IpFamily::V4 => lane.gateway_v4 == expected.gateway_v4,
-                IpFamily::V6 => lane.gateway_v6 == expected.gateway_v6,
+                IpFamily::V4 => lane.route_v4 == expected.route_v4,
+                IpFamily::V6 => lane.route_v6 == expected.route_v6,
             }
     })
 }
@@ -2892,11 +2914,11 @@ fn plan_route_keys(plan: &KernelPlan) -> Vec<(IpFamily, u32)> {
         .filter(|lane| lane.availability == super::LaneAvailability::Available)
     {
         let ipv4 = (IpFamily::V4, lane.table);
-        if lane.gateway_v4.is_some() && !keys.contains(&ipv4) {
+        if lane.route_v4.is_some() && !keys.contains(&ipv4) {
             keys.push(ipv4);
         }
         let ipv6 = (IpFamily::V6, lane.table);
-        if lane.gateway_v6.is_some() && !keys.contains(&ipv6) {
+        if lane.route_v6.is_some() && !keys.contains(&ipv6) {
             keys.push(ipv6);
         }
     }
@@ -2914,13 +2936,13 @@ fn remove_plan_policy_rules(
             .iter()
             .filter(|lane| lane.availability == super::LaneAvailability::Available)
         {
-            if lane.gateway_v4.is_some() {
+            if lane.route_v4.is_some() {
                 let rule = (IpFamily::V4, lane.rule_priority, lane.table, lane.mark);
                 if !rules.contains(&rule) {
                     rules.push(rule);
                 }
             }
-            if lane.gateway_v6.is_some() {
+            if lane.route_v6.is_some() {
                 let rule = (IpFamily::V6, lane.rule_priority, lane.table, lane.mark);
                 if !rules.contains(&rule) {
                     rules.push(rule);
@@ -2934,8 +2956,8 @@ fn remove_plan_policy_rules(
             let lane = super::LanePlan {
                 id: LaneId::from("rollback"),
                 interface: "lo".to_owned(),
-                gateway_v4: None,
-                gateway_v6: None,
+                route_v4: None,
+                route_v6: None,
                 availability: super::LaneAvailability::Available,
                 table,
                 mark,
@@ -2950,8 +2972,8 @@ fn remove_plan_policy_rules(
         let lane = super::LanePlan {
             id: LaneId::from("rollback"),
             interface: "lo".to_owned(),
-            gateway_v4: None,
-            gateway_v6: None,
+            route_v4: None,
+            route_v6: None,
             availability: super::LaneAvailability::Available,
             table,
             mark,
@@ -3264,6 +3286,7 @@ impl ApplyResponse {
 pub struct InspectResponse {
     pub generation: Option<u64>,
     pub plan_hash: Option<PlanHash>,
+    pub applied_plan: Option<KernelPlan>,
     pub routelane_table_present: bool,
     pub snapshot: KernelSnapshot,
     pub diagnostics: Vec<String>,
@@ -3274,6 +3297,7 @@ impl InspectResponse {
         Self {
             generation: None,
             plan_hash: None,
+            applied_plan: None,
             routelane_table_present: false,
             snapshot: KernelSnapshot::default(),
             diagnostics: vec![],
@@ -3458,8 +3482,8 @@ mod tests {
 
     use super::{
         authorization_result, build_pending_expectations, command_invocation,
-        execute_invocation_with_timeout, render_guarded_ruleset, render_owned_ruleset,
-        render_transaction_ruleset, run_nft_batch, validate_privileged_plan,
+        execute_invocation_with_timeout, nft_rule_object, render_guarded_ruleset,
+        render_owned_ruleset, render_transaction_ruleset, run_nft_batch, validate_privileged_plan,
         validate_root_owned_file_attributes, AppliedStateStore, ApplyResponse, AuthorizationError,
         Authorizer, CleanupResponse, CommandExecutor, CommandInvocation, CommandOutput,
         CommandPrivilegedBackend, InspectResponse, PrivilegedBackend, PrivilegedError,
@@ -3468,7 +3492,7 @@ mod tests {
     };
     use crate::backend::{
         CommandSpec, CompiledAction, CompiledRule, CompiledTarget, IpFamily, KernelPlan,
-        LaneAvailability, LanePlan, Program, ResourceState, TableMode, MARK_BASE,
+        LaneAvailability, LanePlan, Program, ResourceState, RouteMode, TableMode, MARK_BASE,
         RULE_PRIORITY_BASE, TABLE_BASE,
     };
 
@@ -3476,8 +3500,8 @@ mod tests {
         LanePlan {
             id: LaneId::from(id),
             interface: format!("wg{offset}"),
-            gateway_v4: Some(format!("10.0.{offset}.1").parse().unwrap()),
-            gateway_v6: None,
+            route_v4: Some(RouteMode::Via(format!("10.0.{offset}.1").parse().unwrap())),
+            route_v6: None,
             availability: LaneAvailability::Available,
             table: TABLE_BASE + offset,
             mark: MARK_BASE + offset,
@@ -3504,6 +3528,33 @@ mod tests {
         let mut plan = fixture_valid_plan();
         plan.lanes.push(fixture_lane("work", 1));
         plan
+    }
+
+    #[test]
+    fn privileged_nft_renderer_makes_mark_action_terminal_after_counter() {
+        let mut plan = fixture_valid_plan();
+        let rule = plan.rules.remove(0);
+
+        assert_eq!(
+            nft_rule_object(&rule)["rule"]["expr"],
+            serde_json::json!([
+                {
+                    "match": {
+                        "op": "==",
+                        "left": {"payload": {"protocol": "ip", "field": "daddr"}},
+                        "right": {"prefix": {"addr": "203.0.113.0", "len": 24}}
+                    }
+                },
+                {
+                    "mangle": {
+                        "key": {"meta": {"key": "mark"}},
+                        "value": MARK_BASE
+                    }
+                },
+                {"counter": {}},
+                {"return": null}
+            ])
+        );
     }
 
     #[test]
@@ -3823,6 +3874,7 @@ mod tests {
     struct FakeKernelState {
         commands: Vec<CommandSpec>,
         has_route: bool,
+        gatewayless_route: bool,
         has_rule: bool,
         has_table: bool,
         nft_objects: Option<Vec<serde_json::Value>>,
@@ -3864,13 +3916,18 @@ mod tests {
                     {
                         let mut body = Vec::new();
                         if state.has_route && spec.family == Some(IpFamily::V4) {
-                            body.push(serde_json::json!({
+                            let mut route = serde_json::json!({
                                 "dst": "default",
-                                "gateway": "10.0.0.1",
                                 "dev": "wg0",
                                 "table": 20_000,
                                 "flags": [],
-                            }));
+                            });
+                            if state.gatewayless_route {
+                                route["scope"] = serde_json::json!("link");
+                            } else {
+                                route["gateway"] = serde_json::json!("10.0.0.1");
+                            }
+                            body.push(route);
                         }
                         if state.foreign_reserved_route && spec.family == Some(IpFamily::V4) {
                             body.push(serde_json::json!({
@@ -3898,6 +3955,8 @@ mod tests {
                     }
                     ["route", "replace", ..] => {
                         state.has_route = true;
+                        state.gatewayless_route =
+                            !spec.args.iter().any(|argument| argument == "via");
                         Ok(CommandOutput::success(vec![]))
                     }
                     ["rule", "add", ..] => {
@@ -3915,6 +3974,7 @@ mod tests {
                             ));
                         }
                         state.has_route = false;
+                        state.gatewayless_route = false;
                         Ok(CommandOutput::success(vec![]))
                     }
                     _ => Err(crate::backend::RunnerError::new(format!(
@@ -4217,6 +4277,62 @@ mod tests {
                         })
                     })
         }));
+    }
+
+    #[test]
+    fn command_backend_applies_and_inspects_exact_gatewayless_route() {
+        let state = Arc::new(Mutex::new(FakeKernelState::default()));
+        let executor = FakeCommandExecutor {
+            state: Arc::clone(&state),
+        };
+        let mut backend = CommandPrivilegedBackend::new(executor);
+        let mut plan = fixture_valid_plan();
+        plan.lanes[0].route_v4 = Some(RouteMode::Device);
+
+        let response = backend.apply(&plan).unwrap();
+        let inspection = backend.inspect().unwrap();
+        let state = state.lock().unwrap();
+
+        assert_eq!(response, ApplyResponse::from_plan(&plan, vec![]));
+        assert_eq!(inspection.applied_plan, Some(plan));
+        assert!(state.gatewayless_route);
+        assert!(state.commands.iter().any(|command| {
+            command.program == Program::Ip
+                && command.family == Some(IpFamily::V4)
+                && command.args
+                    == [
+                        "route", "replace", "default", "dev", "wg0", "table", "20000",
+                    ]
+        }));
+    }
+
+    #[test]
+    fn restarted_backend_recovers_exact_gatewayless_journal_ownership() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let mut plan = fixture_valid_plan();
+        plan.lanes[0].route_v4 = Some(RouteMode::Device);
+        {
+            let mut backend = CommandPrivilegedBackend::with_store(
+                FakeCommandExecutor {
+                    state: Arc::clone(&kernel),
+                },
+                store.clone(),
+            );
+            backend.apply(&plan).unwrap();
+        }
+
+        let mut restarted = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store,
+        );
+        let inspected = restarted.inspect().unwrap();
+
+        assert_eq!(inspected.generation, Some(1));
+        assert_eq!(inspected.applied_plan, Some(plan));
+        assert!(kernel.lock().unwrap().gatewayless_route);
     }
 
     #[test]
@@ -4914,13 +5030,13 @@ mod tests {
                 super::RouteOwnership {
                     family: 4,
                     table: 20_000,
-                    gateway: "10.0.0.1".to_owned(),
+                    gateway: Some("10.0.0.1".to_owned()),
                     interface: "wg0".to_owned(),
                 },
                 super::RouteOwnership {
                     family: 4,
                     table: 20_001,
-                    gateway: "10.0.1.1".to_owned(),
+                    gateway: Some("10.0.1.1".to_owned()),
                     interface: "wg1".to_owned(),
                 },
             ]
@@ -4959,7 +5075,9 @@ mod tests {
         pending.lanes = (0..100)
             .map(|offset| {
                 let mut lane = fixture_lane(&format!("lane-{offset}"), offset);
-                lane.gateway_v6 = Some(format!("2001:db8::{:x}", offset + 1).parse().unwrap());
+                lane.route_v6 = Some(RouteMode::Via(
+                    format!("2001:db8::{:x}", offset + 1).parse().unwrap(),
+                ));
                 lane
             })
             .collect();

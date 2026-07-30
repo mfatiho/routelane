@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use routelane::backend::{
     compile_profile, Capability, CompiledAction, CompiledTarget, LaneAvailability, PlanError,
-    ResolutionSnapshot, TopologySnapshot,
+    ResolutionSnapshot, RouteMode, TopologySnapshot,
 };
 use routelane::domain::{
     ApplicationSelector, DomainError, InterfaceSelector, Lane, LaneFailurePolicy, LaneId, Profile,
@@ -345,6 +345,42 @@ fn route_rule_uses_the_mark_assigned_to_its_lane() {
     .unwrap();
 
     assert_eq!(plan.rules[0].action, CompiledAction::Mark(0x524c0001));
+}
+
+#[test]
+fn gatewayless_default_device_route_makes_wireguard_lane_available() {
+    let mut topology = TopologySnapshot::empty();
+    topology.insert_routes("wg0", Some(RouteMode::Device), Some(RouteMode::Device));
+
+    let plan = compile_profile(
+        &profile_routing_to("work"),
+        &topology,
+        &ResolutionSnapshot::empty(),
+        1,
+    )
+    .unwrap();
+
+    assert_eq!(plan.lanes[0].availability, LaneAvailability::Available);
+    assert_eq!(plan.lanes[0].route_v4, Some(RouteMode::Device));
+    assert_eq!(plan.lanes[0].route_v6, Some(RouteMode::Device));
+    assert_eq!(plan.rules[0].action, CompiledAction::Mark(0x524c0001));
+}
+
+#[test]
+fn interface_without_default_route_evidence_remains_unavailable() {
+    let mut topology = TopologySnapshot::empty();
+    topology.insert("wg0", None, None);
+
+    let plan = compile_profile(
+        &profile_routing_to("work"),
+        &topology,
+        &ResolutionSnapshot::empty(),
+        1,
+    )
+    .unwrap();
+
+    assert_eq!(plan.lanes[0].availability, LaneAvailability::Unavailable);
+    assert!(plan.rules.is_empty());
 }
 
 #[test]

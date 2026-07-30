@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -14,7 +15,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::backend::{
     compile_profile, AppliedKernelState, ApplyResponse, CleanupResponse, InspectResponse,
-    KernelPlan, ResolutionSnapshot, RestoreResponse, TopologySnapshot,
+    KernelPlan, ResolutionSnapshot, RestoreResponse, RouteMode, TopologySnapshot,
 };
 use crate::dns::periodic::resolve_domain;
 use crate::domain::{
@@ -139,6 +140,8 @@ where
 {
     state: Mutex<DaemonState>,
     mutation: Mutex<()>,
+    reconciliation: Mutex<ReconciliationGate>,
+    reconciliation_attempts: AtomicU64,
     topology: T,
     resolutions: R,
     helper: H,
@@ -159,6 +162,8 @@ where
         Ok(Self {
             state: Mutex::new(DaemonState::new(desired)),
             mutation: Mutex::new(()),
+            reconciliation: Mutex::new(ReconciliationGate::default()),
+            reconciliation_attempts: AtomicU64::new(0),
             topology,
             resolutions,
             helper,
@@ -199,7 +204,8 @@ where
         let result = match envelope.request {
             DaemonRequest::GetStatus => Ok(DaemonResult::Status(self.current_status().await)),
             DaemonRequest::ListProfiles => {
-                let profiles = self
+                let _ = self.ensure_reconciled().await;
+                let partial_profiles = self
                     .state
                     .lock()
                     .await
@@ -207,7 +213,7 @@ where
                     .clone()
                     .into_iter()
                     .collect();
-                Ok(DaemonResult::Profiles(profiles))
+                Ok(DaemonResult::Profiles(partial_profiles))
             }
             DaemonRequest::ApplyProfile(profile) => {
                 self.apply_profile(profile).await.map(DaemonResult::Applied)
@@ -233,6 +239,7 @@ where
     }
 
     pub async fn apply_profile(&self, profile: Profile) -> Result<ApplyProfileResult, DaemonError> {
+        self.ensure_reconciled().await.result?;
         let _mutation = self.mutation.lock().await;
         self.apply_profile_locked(profile).await
     }
@@ -300,7 +307,7 @@ where
             return Err(error);
         }
 
-        let health = match self.inspect_plan_health(&profile, &plan).await {
+        let health = match self.inspect_plan_health(Some(&profile), &plan).await {
             Ok(report) if report.state == HealthState::Healthy => report,
             Ok(report) => {
                 let error = DaemonError::new(
@@ -356,6 +363,7 @@ where
         rule_id: RuleId,
         enabled: bool,
     ) -> Result<ApplyProfileResult, DaemonError> {
+        self.ensure_reconciled().await.result?;
         let _mutation = self.mutation.lock().await;
         let mut profile =
             self.state.lock().await.desired.clone().ok_or_else(|| {
@@ -379,6 +387,7 @@ where
     }
 
     pub async fn deactivate(&self) -> Result<(), DaemonError> {
+        self.ensure_reconciled().await.result?;
         let _mutation = self.mutation.lock().await;
         if let Err(error) = self.helper.cleanup().await {
             self.record_failure(error.clone()).await;
@@ -556,18 +565,25 @@ where
 
     async fn inspect_plan_health(
         &self,
-        profile: &Profile,
+        profile: Option<&Profile>,
         plan: &KernelPlan,
     ) -> Result<HealthReport, DaemonError> {
-        let topology = self.topology.snapshot(profile).await?;
         let inspected = self.helper.inspect().await?;
-        Ok(evaluate_health(
-            Some(plan),
-            &inspected.snapshot.with_topology(&topology),
-        ))
+        let snapshot = match profile {
+            Some(profile) => {
+                let topology = self.topology.snapshot(profile).await?;
+                inspected.snapshot.with_topology(&topology)
+            }
+            None => inspected.snapshot,
+        };
+        Ok(evaluate_health(Some(plan), &snapshot))
     }
 
     async fn current_status(&self) -> crate::ipc::DaemonStatus {
+        let reconciliation = self.ensure_reconciled().await;
+        if reconciliation.first_wave || reconciliation.result.is_err() {
+            return self.state.lock().await.status();
+        }
         let (base, profile, plan) = {
             let state = self.state.lock().await;
             (
@@ -576,9 +592,9 @@ where
                 state.applied.as_ref().map(|applied| applied.plan().clone()),
             )
         };
-        let health = match (profile.as_ref(), plan.as_ref()) {
-            (_, None) => HealthReport::inactive(),
-            (Some(profile), Some(plan)) => match self.inspect_plan_health(profile, plan).await {
+        let health = match plan.as_ref() {
+            None => HealthReport::inactive(),
+            Some(plan) => match self.inspect_plan_health(profile.as_ref(), plan).await {
                 Ok(report) => report,
                 Err(error) => {
                     let state = if error.code() == "DAEMON_NEEDS_AUTHORIZATION" {
@@ -598,19 +614,182 @@ where
                     )
                 }
             },
-            (None, Some(_)) => HealthReport::failure(
-                HealthState::Failed,
-                DiagnosticCode::RoutingResourceConflict,
-                DiagnosticSubject::HealthInspection,
-                "Applied policy has no corresponding profile",
-                "daemon state is missing the profile required for topology inspection",
-                Some(SuggestedAction::new("Reapply a saved profile.")),
-            ),
         };
         let mut status = base.status();
         status.health = health;
         status
     }
+
+    async fn ensure_reconciled(&self) -> ReconciliationOutcome {
+        let observed_attempts = self.reconciliation_attempts.load(Ordering::Acquire);
+        let mut gate = self.reconciliation.lock().await;
+        if gate.attempts > observed_attempts {
+            return ReconciliationOutcome {
+                result: gate
+                    .last_result
+                    .clone()
+                    .expect("a completed reconciliation attempt has a result"),
+                first_wave: true,
+            };
+        }
+        if gate.completed {
+            return ReconciliationOutcome {
+                result: Ok(()),
+                first_wave: false,
+            };
+        }
+
+        let result = self.reconcile_from_helper().await;
+        gate.attempts = gate
+            .attempts
+            .checked_add(1)
+            .expect("reconciliation attempt counter exhausted");
+        gate.completed = result.is_ok();
+        gate.last_result = Some(result.clone());
+        let completed_attempts = gate.attempts;
+        drop(gate);
+        self.reconciliation_attempts
+            .store(completed_attempts, Ordering::Release);
+        ReconciliationOutcome {
+            result,
+            first_wave: true,
+        }
+    }
+
+    async fn reconcile_from_helper(&self) -> Result<(), DaemonError> {
+        let inspected = match self.helper.inspect().await {
+            Ok(inspected) => inspected,
+            Err(error) => {
+                let error = if error.code() == "DAEMON_NEEDS_AUTHORIZATION" {
+                    error
+                } else {
+                    DaemonError::new(
+                        "DAEMON_RECONCILIATION_FAILED",
+                        format!(
+                            "could not inspect persisted helper state: {}",
+                            error.message()
+                        ),
+                    )
+                };
+                let health_state = if error.code() == "DAEMON_NEEDS_AUTHORIZATION" {
+                    HealthState::NeedsAuthorization
+                } else {
+                    HealthState::Failed
+                };
+                let health = HealthReport::failure(
+                    health_state,
+                    DiagnosticCode::RoutingResourceConflict,
+                    DiagnosticSubject::HealthInspection,
+                    "RouteLane could not reconcile persisted routing state",
+                    error.to_string(),
+                    Some(SuggestedAction::new(
+                        "Authorize or repair the privileged helper before changing policy.",
+                    )),
+                );
+                let mut state = self.state.lock().await;
+                state.health = health;
+                state.last_error = Some(IpcError::from(error.clone()));
+                return Err(error);
+            }
+        };
+
+        let Some(plan) = inspected.applied_plan else {
+            if inspected.generation.is_some()
+                || inspected.plan_hash.is_some()
+                || inspected.routelane_table_present
+            {
+                return self
+                    .record_reconciliation_drift(
+                        None,
+                        "helper reported owned resources without a validated applied plan",
+                    )
+                    .await;
+            }
+            let mut state = self.state.lock().await;
+            state.applied = None;
+            state.applied_profile = None;
+            state.generation = 0;
+            state.health = HealthReport::inactive();
+            state.last_error = None;
+            return Ok(());
+        };
+
+        if inspected.generation != Some(plan.generation)
+            || inspected.plan_hash != Some(plan.content_hash())
+        {
+            return self
+                .record_reconciliation_drift(
+                    Some(&plan),
+                    "helper applied-plan metadata does not match the validated plan",
+                )
+                .await;
+        }
+
+        let health = evaluate_health(Some(&plan), &inspected.snapshot);
+        let applied_profile = {
+            let state = self.state.lock().await;
+            state
+                .desired
+                .as_ref()
+                .filter(|profile| profile.id == plan.profile_id)
+                .cloned()
+        };
+        {
+            let mut state = self.state.lock().await;
+            state.applied = Some(AppliedKernelState::from_plan(&plan));
+            state.applied_profile = applied_profile;
+            state.generation = plan.generation;
+            state.health = health.clone();
+            state.last_error = None;
+        }
+        if health.state == HealthState::Healthy {
+            Ok(())
+        } else {
+            self.record_reconciliation_drift(
+                Some(&plan),
+                "persisted helper plan does not exactly match live kernel state",
+            )
+            .await
+        }
+    }
+
+    async fn record_reconciliation_drift(
+        &self,
+        plan: Option<&KernelPlan>,
+        detail: &str,
+    ) -> Result<(), DaemonError> {
+        let error = DaemonError::new("DAEMON_RECONCILIATION_FAILED", detail);
+        let mut state = self.state.lock().await;
+        if let Some(plan) = plan {
+            state.applied = Some(AppliedKernelState::from_plan(plan));
+            state.generation = plan.generation;
+        }
+        state.health = HealthReport::failure(
+            HealthState::Failed,
+            DiagnosticCode::RoutingResourceConflict,
+            DiagnosticSubject::HealthInspection,
+            "Persisted routing state differs from the live kernel",
+            detail,
+            Some(SuggestedAction::new(
+                "Inspect RouteLane-owned routes and rules before applying another profile.",
+            )),
+        );
+        state.last_error = Some(IpcError::from(error.clone()));
+        Err(error)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReconciliationOutcome {
+    result: Result<(), DaemonError>,
+    first_wave: bool,
+}
+
+#[derive(Debug, Default)]
+struct ReconciliationGate {
+    attempts: u64,
+    completed: bool,
+    last_result: Option<Result<(), DaemonError>>,
 }
 
 fn advance_event_sequence(state: &mut DaemonState) -> u64 {
@@ -633,37 +812,52 @@ impl TopologyProvider for SystemTopologyProvider {
         }
         #[derive(Deserialize)]
         struct Route<A> {
+            dst: Option<String>,
             dev: Option<String>,
             gateway: Option<A>,
         }
 
         let links: Vec<Link> = run_ip_json(&["-j", "link", "show"]).await?;
         let routes_v4: Vec<Route<Ipv4Addr>> =
-            run_ip_json(&["-j", "-4", "route", "show", "default"]).await?;
+            run_ip_json(&["-j", "-4", "route", "show", "table", "all"]).await?;
         let routes_v6: Vec<Route<Ipv6Addr>> =
-            run_ip_json(&["-j", "-6", "route", "show", "default"]).await?;
+            run_ip_json(&["-j", "-6", "route", "show", "table", "all"]).await?;
         let mut interfaces = links
             .into_iter()
             .map(|link| (link.ifname, (None, None)))
             .collect::<BTreeMap<_, _>>();
         for route in routes_v4 {
-            if let (Some(interface), Some(gateway)) = (route.dev, route.gateway) {
-                if let Some(entry) = interfaces.get_mut(&interface) {
-                    entry.0 = Some(gateway);
+            if route.dst.as_deref() == Some("default") {
+                if let Some(interface) = route.dev {
+                    if let Some(entry) = interfaces.get_mut(&interface) {
+                        match route.gateway {
+                            Some(gateway) => entry.0 = Some(RouteMode::Via(gateway)),
+                            None => {
+                                entry.0.get_or_insert(RouteMode::Device);
+                            }
+                        }
+                    }
                 }
             }
         }
         for route in routes_v6 {
-            if let (Some(interface), Some(gateway)) = (route.dev, route.gateway) {
-                if let Some(entry) = interfaces.get_mut(&interface) {
-                    entry.1 = Some(gateway);
+            if route.dst.as_deref() == Some("default") {
+                if let Some(interface) = route.dev {
+                    if let Some(entry) = interfaces.get_mut(&interface) {
+                        match route.gateway {
+                            Some(gateway) => entry.1 = Some(RouteMode::Via(gateway)),
+                            None => {
+                                entry.1.get_or_insert(RouteMode::Device);
+                            }
+                        }
+                    }
                 }
             }
         }
 
         let mut snapshot = TopologySnapshot::empty();
-        for (interface, (gateway_v4, gateway_v6)) in interfaces {
-            snapshot.insert(interface, gateway_v4, gateway_v6);
+        for (interface, (route_v4, route_v6)) in interfaces {
+            snapshot.insert_routes(interface, route_v4, route_v6);
         }
         Ok(snapshot)
     }

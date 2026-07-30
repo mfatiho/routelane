@@ -5,8 +5,8 @@
     {
       "id": "direct",
       "interface": "enp1s0",
-      "gateway_v4": "192.0.2.1",
-      "gateway_v6": null,
+      "route_v4": {"Via": "192.0.2.1"},
+      "route_v6": null,
       "availability": "Available",
       "table": 20000,
       "mark": 1380712449,
@@ -16,8 +16,8 @@
     {
       "id": "work",
       "interface": "wg0",
-      "gateway_v4": "10.0.0.1",
-      "gateway_v6": "2001:db8::1",
+      "route_v4": {"Via": "10.0.0.1"},
+      "route_v6": {"Via": "2001:db8::1"},
       "availability": "Available",
       "table": 20001,
       "mark": 1380712450,
