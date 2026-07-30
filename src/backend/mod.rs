@@ -25,6 +25,8 @@ pub use privileged::{
     ServiceError, SystemPolkitAuthorizer, SystemPrivilegedBackend, ValidationError,
     MAX_PLAN_JSON_BYTES,
 };
+#[cfg(feature = "root-integration")]
+pub use privileged::{CommandPrivilegedBackend, FileAppliedStateStore, ProcessCommandExecutor};
 pub use transaction::{
     apply_plan, AppliedKernelState, ApplyError, ApplyStage, KernelRunner, MutationFailure,
     RunnerError,

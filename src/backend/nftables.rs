@@ -60,7 +60,7 @@ pub fn render_ruleset(plan: &KernelPlan, mode: TableMode) -> Result<String, NftR
                 writeln!(batch, " meta mark set 0x00000000 return").unwrap();
             }
             CompiledAction::Block => {
-                writeln!(batch, " reject counter").unwrap();
+                writeln!(batch, " counter reject").unwrap();
             }
         }
     }

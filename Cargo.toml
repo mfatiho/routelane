@@ -7,6 +7,9 @@ edition = "2021"
 name = "routelane"
 path = "src/lib.rs"
 
+[features]
+root-integration = []
+
 [[bin]]
 name = "routelane"
 path = "src/main.rs"
@@ -19,6 +22,11 @@ path = "src/bin/routelane_helper.rs"
 [[bin]]
 name = "routelane-daemon"
 path = "src/bin/routelane_daemon.rs"
+
+[[test]]
+name = "root"
+path = "tests/root/mod.rs"
+required-features = ["root-integration"]
 
 [dependencies]
 # Ubuntu 22.04: libgtk-4-dev (4.6.9) + libadwaita-1-dev (1.1.7)
