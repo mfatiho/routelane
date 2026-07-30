@@ -83,3 +83,20 @@ fn write_error(error: std::io::Error) -> IpcError {
         format!("could not write IPC frame: {error}"),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{read_frame, write_frame, MAX_FRAME_BYTES};
+
+    #[tokio::test]
+    async fn accepts_a_valid_json_frame_at_the_exact_size_limit() {
+        let payload = "a".repeat(MAX_FRAME_BYTES - 2);
+        let (mut writer, mut reader) = tokio::io::duplex(MAX_FRAME_BYTES + 4);
+
+        write_frame(&mut writer, &payload).await.unwrap();
+        let decoded: String = read_frame(&mut reader).await.unwrap();
+
+        assert_eq!(decoded.len(), MAX_FRAME_BYTES - 2);
+        assert_eq!(decoded, payload);
+    }
+}

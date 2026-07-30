@@ -78,21 +78,29 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
     };
     let client = DaemonClient::new(path);
 
-    if let Err(first_error) = refresh_daemon_state(&client, &to_ui, policy).await {
-        if let Err(activation_error) = activate_user_daemon(policy).await {
-            let _ = to_ui
-                .send(DaemonToUi::DaemonUnavailable(format!(
-                    "{first_error}; systemd user activation failed: {activation_error}"
-                )))
-                .await;
-        } else if let Err(error) = wait_for_daemon(&client, &to_ui, policy).await {
-            let _ = to_ui
-                .send(DaemonToUi::DaemonUnavailable(error.to_string()))
-                .await;
+    let mut subscription = match establish_subscription_and_refresh(&client, &to_ui, policy).await {
+        Ok(events) => Some(events),
+        Err(first_error) => {
+            if let Err(activation_error) = activate_user_daemon(policy).await {
+                let _ = to_ui
+                    .send(DaemonToUi::DaemonUnavailable(format!(
+                        "{first_error}; systemd user activation failed: {activation_error}"
+                    )))
+                    .await;
+                None
+            } else {
+                match wait_for_daemon(&client, &to_ui, policy).await {
+                    Ok(events) => Some(events),
+                    Err(error) => {
+                        let _ = to_ui
+                            .send(DaemonToUi::DaemonUnavailable(error.to_string()))
+                            .await;
+                        None
+                    }
+                }
+            }
         }
-    }
-
-    let mut subscription = subscribe_with_timeout(&client, policy).await.ok();
+    };
     let mut reconnect_attempt = 0;
     let mut next_reconnect = tokio::time::Instant::now();
     loop {
@@ -146,19 +154,11 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
                     std::future::pending::<()>().await;
                 }
             } => {
-                match refresh_daemon_state(&client, &to_ui, policy).await {
-                    Ok(()) => match subscribe_with_timeout(&client, policy).await {
-                        Ok(events) => {
-                            subscription = Some(events);
-                            reconnect_attempt = 0;
-                        }
-                        Err(error) => {
-                            let _ = to_ui.send(DaemonToUi::DaemonUnavailable(error.to_string())).await;
-                            next_reconnect = tokio::time::Instant::now()
-                                + policy.reconnect_delay(reconnect_attempt);
-                            reconnect_attempt = reconnect_attempt.saturating_add(1);
-                        }
-                    },
+                match establish_subscription_and_refresh(&client, &to_ui, policy).await {
+                    Ok(events) => {
+                        subscription = Some(events);
+                        reconnect_attempt = 0;
+                    }
                     Err(error) => {
                         let _ = to_ui.send(DaemonToUi::DaemonUnavailable(error.to_string())).await;
                         next_reconnect = tokio::time::Instant::now()
@@ -222,15 +222,25 @@ async fn refresh_daemon_state(
     request_profiles(client, sender, policy).await
 }
 
+async fn establish_subscription_and_refresh(
+    client: &DaemonClient,
+    sender: &Sender<DaemonToUi>,
+    policy: ConnectionPolicy,
+) -> Result<tokio::sync::mpsc::Receiver<routelane::ipc::DaemonEvent>, IpcError> {
+    let events = subscribe_with_timeout(client, policy).await?;
+    refresh_daemon_state(client, sender, policy).await?;
+    Ok(events)
+}
+
 async fn wait_for_daemon(
     client: &DaemonClient,
     sender: &Sender<DaemonToUi>,
     policy: ConnectionPolicy,
-) -> Result<(), IpcError> {
+) -> Result<tokio::sync::mpsc::Receiver<routelane::ipc::DaemonEvent>, IpcError> {
     let mut last_error = IpcError::new("IPC_CONNECT_FAILED", "daemon did not create its socket");
     for attempt in 0..6 {
-        match refresh_daemon_state(client, sender, policy).await {
-            Ok(()) => return Ok(()),
+        match establish_subscription_and_refresh(client, sender, policy).await {
+            Ok(events) => return Ok(events),
             Err(error) => last_error = error,
         }
         tokio::time::sleep(policy.reconnect_delay(attempt)).await;
@@ -302,8 +312,16 @@ fn request_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ConnectionPolicy;
+    use super::{establish_subscription_and_refresh, ConnectionPolicy};
+    use async_channel::bounded;
+    use routelane::health::HealthReport;
+    use routelane::ipc::{
+        read_frame, write_frame, DaemonClient, DaemonEnvelope, DaemonRequest, DaemonResponse,
+        DaemonResult, DaemonStatus,
+    };
     use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::net::UnixListener;
 
     #[test]
     fn connection_policy_bounds_io_and_exponential_reconnect_delay() {
@@ -313,5 +331,63 @@ mod tests {
         assert!(policy.activation_timeout <= Duration::from_secs(10));
         assert_eq!(policy.reconnect_delay(0), Duration::from_millis(250));
         assert_eq!(policy.reconnect_delay(20), policy.maximum_reconnect_delay);
+    }
+
+    #[tokio::test]
+    async fn subscription_ack_precedes_status_and_profile_snapshots() {
+        let runtime = TempDir::new().unwrap();
+        let path = runtime.path().join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (order_sender, order_receiver) = async_channel::bounded(3);
+        tokio::spawn(async move {
+            let mut subscription = None;
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let envelope: DaemonEnvelope = read_frame(&mut stream).await.unwrap();
+                order_sender.send(envelope.request.clone()).await.unwrap();
+                let result = match envelope.request {
+                    DaemonRequest::Subscribe => DaemonResult::Subscribed,
+                    DaemonRequest::GetStatus => DaemonResult::Status(DaemonStatus {
+                        generation: 0,
+                        health: HealthReport::inactive(),
+                        desired_profile_id: None,
+                        applied_profile_id: None,
+                        last_error: None,
+                    }),
+                    DaemonRequest::ListProfiles => DaemonResult::Profiles(vec![]),
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                write_frame(
+                    &mut stream,
+                    &DaemonResponse::success(envelope.request_id, result),
+                )
+                .await
+                .unwrap();
+                if matches!(envelope.request, DaemonRequest::Subscribe) {
+                    subscription = Some(stream);
+                }
+            }
+            drop(subscription);
+        });
+        let client = DaemonClient::new(path);
+        let (ui_sender, _ui_receiver) = bounded(4);
+
+        let _events =
+            establish_subscription_and_refresh(&client, &ui_sender, ConnectionPolicy::default())
+                .await
+                .unwrap();
+
+        assert_eq!(
+            order_receiver.recv().await.unwrap(),
+            DaemonRequest::Subscribe
+        );
+        assert_eq!(
+            order_receiver.recv().await.unwrap(),
+            DaemonRequest::GetStatus
+        );
+        assert_eq!(
+            order_receiver.recv().await.unwrap(),
+            DaemonRequest::ListProfiles
+        );
     }
 }

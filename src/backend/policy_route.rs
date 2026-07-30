@@ -125,22 +125,19 @@ mod tests {
     fn lane(
         id: &str,
         interface: &str,
-        gateway_v4: Option<Ipv4Addr>,
-        gateway_v6: Option<Ipv6Addr>,
+        gateways: (Option<Ipv4Addr>, Option<Ipv6Addr>),
         availability: LaneAvailability,
-        table: u32,
-        mark: u32,
-        rule_priority: u32,
+        resources: (u32, u32, u32),
     ) -> LanePlan {
         LanePlan {
             id: LaneId::from(id),
             interface: interface.to_owned(),
-            gateway_v4,
-            gateway_v6,
+            gateway_v4: gateways.0,
+            gateway_v6: gateways.1,
             availability,
-            table,
-            mark,
-            rule_priority,
+            table: resources.0,
+            mark: resources.1,
+            rule_priority: resources.2,
             failure_policy: LaneFailurePolicy::Inactive,
         }
     }
@@ -160,22 +157,19 @@ mod tests {
             lane(
                 "work",
                 "wg0",
-                Some("10.0.0.1".parse().unwrap()),
-                Some("2001:db8::1".parse().unwrap()),
+                (
+                    Some("10.0.0.1".parse().unwrap()),
+                    Some("2001:db8::1".parse().unwrap()),
+                ),
                 LaneAvailability::Available,
-                20_000,
-                0x524c0001,
-                10_000,
+                (20_000, 0x524c0001, 10_000),
             ),
             lane(
                 "privacy",
                 "wg1",
-                Some("10.1.0.1".parse().unwrap()),
-                None,
+                (Some("10.1.0.1".parse().unwrap()), None),
                 LaneAvailability::Available,
-                20_001,
-                0x524c0002,
-                10_001,
+                (20_001, 0x524c0002, 10_001),
             ),
         ]));
 
@@ -241,22 +235,19 @@ mod tests {
             lane(
                 "offline",
                 "wg0",
-                Some("10.0.0.1".parse().unwrap()),
-                Some("2001:db8::1".parse().unwrap()),
+                (
+                    Some("10.0.0.1".parse().unwrap()),
+                    Some("2001:db8::1".parse().unwrap()),
+                ),
                 LaneAvailability::Unavailable,
-                20_000,
-                0x524c0001,
-                10_000,
+                (20_000, 0x524c0001, 10_000),
             ),
             lane(
                 "v6-only",
                 "wg1",
-                None,
-                Some("2001:db8:1::1".parse().unwrap()),
+                (None, Some("2001:db8:1::1".parse().unwrap())),
                 LaneAvailability::Available,
-                20_001,
-                0x524c0002,
-                10_001,
+                (20_001, 0x524c0002, 10_001),
             ),
         ]));
 

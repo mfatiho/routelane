@@ -1,0 +1,13 @@
+[Unit]
+Description=RouteLane user routing daemon
+After=default.target
+
+[Service]
+ExecStart=/usr/bin/routelane-daemon
+Restart=on-failure
+RuntimeDirectory=routelane
+RuntimeDirectoryMode=0700
+UMask=0077
+
+[Install]
+WantedBy=default.target

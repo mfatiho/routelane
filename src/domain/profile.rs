@@ -22,6 +22,12 @@ string_id!(ProfileId);
 string_id!(LaneId);
 string_id!(InterfaceSelector);
 
+impl ProfileId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl LaneId {
     pub fn as_str(&self) -> &str {
         &self.0
@@ -265,6 +271,65 @@ mod tests {
                 actual: 101,
                 maximum: 100
             })
+        );
+    }
+
+    #[test]
+    fn rejects_more_than_ten_thousand_rules() {
+        let rules = (0..10_001)
+            .map(|n| fixture_rule(&format!("rule-{n}"), n, RuleTarget::Any, RuleAction::Direct))
+            .collect();
+
+        assert_eq!(
+            validate_profile(&fixture_profile(vec![], rules)),
+            Err(DomainError::TooManyRules {
+                actual: 10_001,
+                maximum: 10_000,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_lane_ids() {
+        let profile = fixture_profile(
+            vec![
+                fixture_lane("duplicate", "tun0"),
+                fixture_lane("duplicate", "tun1"),
+            ],
+            vec![],
+        );
+
+        assert_eq!(
+            validate_profile(&profile),
+            Err(DomainError::DuplicateLaneId(LaneId::from("duplicate")))
+        );
+    }
+
+    #[test]
+    fn rejects_missing_self_referential_and_cyclic_fallbacks() {
+        let mut missing = fixture_profile(vec![fixture_lane("a", "tun0")], vec![]);
+        missing.lanes[0].fallback_lane = Some(LaneId::from("missing"));
+        assert_eq!(
+            validate_profile(&missing),
+            Err(DomainError::UnknownLane(LaneId::from("missing")))
+        );
+
+        let mut self_referential = fixture_profile(vec![fixture_lane("a", "tun0")], vec![]);
+        self_referential.lanes[0].fallback_lane = Some(LaneId::from("a"));
+        assert_eq!(
+            validate_profile(&self_referential),
+            Err(DomainError::SelfReferentialFallback(LaneId::from("a")))
+        );
+
+        let mut cyclic = fixture_profile(
+            vec![fixture_lane("a", "tun0"), fixture_lane("b", "tun1")],
+            vec![],
+        );
+        cyclic.lanes[0].fallback_lane = Some(LaneId::from("b"));
+        cyclic.lanes[1].fallback_lane = Some(LaneId::from("a"));
+        assert_eq!(
+            validate_profile(&cyclic),
+            Err(DomainError::FallbackCycle(LaneId::from("a")))
         );
     }
 
