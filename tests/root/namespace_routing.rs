@@ -1,7 +1,7 @@
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 
 use ipnet::IpNet;
@@ -12,54 +12,278 @@ use routelane::backend::{
 use routelane::domain::{LaneFailurePolicy, LaneId, ProfileId, RuleId};
 use serde_json::{json, Value};
 
-const CLIENT: &str = "routelane-test-client";
-const GATEWAYS: [&str; 3] = [
-    "routelane-test-gateway-a",
-    "routelane-test-gateway-b",
-    "routelane-test-gateway-c",
-];
-const SINKS: [&str; 3] = [
-    "routelane-test-sink-a",
-    "routelane-test-sink-b",
-    "routelane-test-sink-c",
-];
-const NAMESPACES: [&str; 7] = [
-    CLIENT,
-    GATEWAYS[0],
-    GATEWAYS[1],
-    GATEWAYS[2],
-    SINKS[0],
-    SINKS[1],
-    SINKS[2],
-];
-const VETHS: [&str; 14] = [
-    "rlt-ca",
-    "rlt-ga-c",
-    "rlt-ga-s",
-    "rlt-sa",
-    "rlt-cb",
-    "rlt-gb-c",
-    "rlt-gb-s",
-    "rlt-sb",
-    "rlt-cc",
-    "rlt-gc-c",
-    "rlt-gc-s",
-    "rlt-sc",
-    "rlt-pre-a",
-    "rlt-pre-b",
-];
 const WORKER_ENV: &str = "ROUTELANE_ROOT_INTEGRATION_WORKER";
 const HELPER: &str = env!("CARGO_BIN_EXE_routelane-helper");
+const O_NOFOLLOW: i32 = 0o400000;
+
+#[derive(Clone, Debug)]
+struct RunNames {
+    token: String,
+    client: String,
+    gateways: [String; 3],
+    sinks: [String; 3],
+    client_interfaces: [String; 3],
+    gateway_client_interfaces: [String; 3],
+    gateway_sink_interfaces: [String; 3],
+    sink_interfaces: [String; 3],
+}
+
+impl RunNames {
+    fn from_env() -> Result<Self, String> {
+        let token = env::var("ROUTELANE_TEST_TOKEN")
+            .map_err(|_| "ROUTELANE_TEST_TOKEN is required".to_owned())?;
+        if token.len() != 6 || !token.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(
+                "root integration token must be exactly six ASCII alphanumerics".to_owned(),
+            );
+        }
+        let namespace = |role: &str| format!("routelane-test-{token}-{role}");
+        let interface = |role: &str| {
+            let name = format!("rl{token}{role}");
+            assert!(name.len() <= 15);
+            name
+        };
+        let client = namespace("client");
+        let gateways = [
+            namespace("gateway-a"),
+            namespace("gateway-b"),
+            namespace("gateway-c"),
+        ];
+        let sinks = [
+            namespace("sink-a"),
+            namespace("sink-b"),
+            namespace("sink-c"),
+        ];
+        let client_interfaces = [interface("ca"), interface("cb"), interface("cc")];
+        let gateway_client_interfaces = [interface("gac"), interface("gbc"), interface("gcc")];
+        let gateway_sink_interfaces = [interface("gas"), interface("gbs"), interface("gcs")];
+        let sink_interfaces = [interface("sa"), interface("sb"), interface("sc")];
+        Ok(Self {
+            token,
+            client,
+            gateways,
+            sinks,
+            client_interfaces,
+            gateway_client_interfaces,
+            gateway_sink_interfaces,
+            sink_interfaces,
+        })
+    }
+
+    fn namespaces(&self) -> Vec<String> {
+        std::iter::once(self.client.clone())
+            .chain(self.gateways.iter().cloned())
+            .chain(self.sinks.iter().cloned())
+            .collect()
+    }
+
+    fn creations(&self) -> Vec<Creation> {
+        let mut creations = self
+            .namespaces()
+            .into_iter()
+            .map(Creation::Namespace)
+            .collect::<Vec<_>>();
+        for lane in 0..3 {
+            creations.push(Creation::VethPair(
+                self.client_interfaces[lane].clone(),
+                self.gateway_client_interfaces[lane].clone(),
+            ));
+            creations.push(Creation::VethPair(
+                self.gateway_sink_interfaces[lane].clone(),
+                self.sink_interfaces[lane].clone(),
+            ));
+        }
+        creations
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum KernelObject {
+    Namespace(String),
+    Veth(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Creation {
+    Namespace(String),
+    VethPair(String, String),
+}
+
+impl Creation {
+    fn objects(&self) -> Vec<KernelObject> {
+        match self {
+            Self::Namespace(name) => vec![KernelObject::Namespace(name.clone())],
+            Self::VethPair(left, right) => vec![
+                KernelObject::Veth(left.clone()),
+                KernelObject::Veth(right.clone()),
+            ],
+        }
+    }
+}
+
+trait ProvisionBackend {
+    fn exists(&mut self, object: &KernelObject) -> Result<bool, String>;
+    fn create(&mut self, creation: &Creation) -> Result<Vec<KernelObject>, String>;
+    fn record(&mut self, object: &KernelObject) -> Result<(), String>;
+    fn delete(&mut self, object: &KernelObject);
+}
+
+fn provision_owned(
+    desired: &[Creation],
+    backend: &mut impl ProvisionBackend,
+) -> Result<Vec<KernelObject>, String> {
+    for object in desired.iter().flat_map(Creation::objects) {
+        if backend.exists(&object)? {
+            return Err(format!("root integration object collision: {object:?}"));
+        }
+    }
+
+    let mut owned = Vec::new();
+    for creation in desired {
+        let created = match backend.create(creation) {
+            Ok(created) => created,
+            Err(error) => {
+                cleanup_recorded(&mut owned, backend);
+                return Err(error);
+            }
+        };
+        for object in created {
+            owned.push(object.clone());
+            if let Err(error) = backend.record(&object) {
+                cleanup_recorded(&mut owned, backend);
+                return Err(error);
+            }
+        }
+    }
+    Ok(owned)
+}
+
+fn cleanup_recorded(owned: &mut Vec<KernelObject>, backend: &mut impl ProvisionBackend) {
+    for object in owned.drain(..).rev() {
+        backend.delete(&object);
+    }
+}
+
+struct SystemProvisionBackend {
+    registry: File,
+}
+
+impl SystemProvisionBackend {
+    fn from_env(names: &RunNames) -> Result<Self, String> {
+        let path = env::var("ROUTELANE_TEST_REGISTRY")
+            .map_err(|_| "ROUTELANE_TEST_REGISTRY is required".to_owned())?;
+        let expected = format!("/tmp/routelane-test-registry.{}", names.token);
+        if path != expected {
+            return Err("root integration registry path does not match the run token".to_owned());
+        }
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|error| format!("inspect registry: {error}"))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return Err(
+                "registry must be a root-owned, non-symlink, single-link 0600 file".to_owned(),
+            );
+        }
+        let registry = OpenOptions::new()
+            .append(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| format!("open registry without following symlinks: {error}"))?;
+        Ok(Self { registry })
+    }
+
+    fn clear_registry(&mut self) {
+        self.registry
+            .set_len(0)
+            .expect("truncate owned-resource registry after cleanup");
+        self.registry
+            .sync_all()
+            .expect("sync cleared owned-resource registry");
+    }
+}
+
+impl ProvisionBackend for SystemProvisionBackend {
+    fn exists(&mut self, object: &KernelObject) -> Result<bool, String> {
+        let output = match object {
+            KernelObject::Namespace(_) => {
+                command_output(Command::new("/usr/sbin/ip").args(["netns", "list"]))
+            }
+            KernelObject::Veth(name) => {
+                let output = command_output(
+                    Command::new("/usr/sbin/ip").args(["link", "show", "dev", name]),
+                );
+                return Ok(output.status.success());
+            }
+        };
+        if !output.status.success() {
+            return Err(format!(
+                "list network namespaces for collision preflight: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let KernelObject::Namespace(name) = object else {
+            unreachable!()
+        };
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .any(|existing| existing == name))
+    }
+
+    fn create(&mut self, creation: &Creation) -> Result<Vec<KernelObject>, String> {
+        let output = match creation {
+            Creation::Namespace(name) => {
+                command_output(Command::new("/usr/sbin/ip").args(["netns", "add", name]))
+            }
+            Creation::VethPair(left, right) => command_output(
+                Command::new("/usr/sbin/ip")
+                    .args(["link", "add", left, "type", "veth", "peer", "name", right]),
+            ),
+        };
+        if output.status.success() {
+            Ok(creation.objects())
+        } else {
+            Err(format!(
+                "create exact root integration object {creation:?}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
+    fn record(&mut self, object: &KernelObject) -> Result<(), String> {
+        match object {
+            KernelObject::Namespace(name) => writeln!(self.registry, "namespace {name}"),
+            KernelObject::Veth(name) => writeln!(self.registry, "veth {name}"),
+        }
+        .and_then(|()| self.registry.sync_data())
+        .map_err(|error| format!("record owned root integration object: {error}"))
+    }
+
+    fn delete(&mut self, object: &KernelObject) {
+        let _ = match object {
+            KernelObject::Namespace(name) => Command::new("/usr/sbin/ip")
+                .args(["netns", "del", name])
+                .output(),
+            KernelObject::Veth(name) => Command::new("/usr/sbin/ip")
+                .args(["link", "del", name])
+                .output(),
+        };
+    }
+}
 
 #[test]
 fn real_helper_routes_three_lanes_and_preserves_generation_one_on_activate_failure() {
-    require_root_capabilities();
-    let _topology = NamespaceHarness::create();
+    let names = require_root_capabilities();
+    let _topology = NamespaceHarness::create(names.clone());
 
     let current_exe = env::current_exe().expect("resolve root integration test binary");
     let output = checked_output(
         Command::new("/usr/sbin/ip")
-            .args(["netns", "exec", CLIENT])
+            .args(["netns", "exec", &names.client])
             .arg(current_exe)
             .args([
                 "--exact",
@@ -84,11 +308,12 @@ fn root_worker_exercises_real_helper_transport() {
         return;
     }
 
-    let generation_one = plan(1, "203.0.113.10/32");
-    let generation_two = plan(2, "203.0.113.11/32");
+    let names = RunNames::from_env().expect("validated run-specific names");
+    let generation_one = plan(1, "203.0.113.10/32", &names, false);
+    let generation_two = plan(2, "203.0.113.11/32", &names, true);
     let production_state_before = state_fingerprint("/run/routelane/applied-plan.json");
     let state_directory = tempfile::Builder::new()
-        .prefix("routelane-test-state-")
+        .prefix(&format!("routelane-test-{}-state-", names.token))
         .tempdir_in("/tmp")
         .expect("create isolated helper journal directory");
     fs::set_permissions(state_directory.path(), fs::Permissions::from_mode(0o700))
@@ -116,17 +341,19 @@ fn root_worker_exercises_real_helper_transport() {
     assert_eq!(inspected["generation"], 1);
     assert_eq!(inspected["routelane_table_present"], true);
 
-    assert_probe_reaches_only("203.0.113.10", 0);
-    assert_probe_reaches_only("198.51.100.10", 1);
-    assert_probe_reaches_only("192.0.2.10", 2);
-    assert_probe_reaches_only("198.18.0.10", 1);
+    assert_probe_reaches_only("203.0.113.10", 0, &names, None);
+    assert_probe_reaches_only("198.51.100.10", 1, &names, None);
+    assert_probe_reaches_only("192.0.2.10", 2, &names, None);
+    let direct_before = nft_counter("198.18.0.10");
+    assert_probe_reaches_only("198.18.0.10", 1, &names, Some(MARK_BASE));
+    assert!(nft_counter("198.18.0.10") > direct_before);
 
     let routed_before = nft_counter("203.0.113.10");
-    assert_probe_reaches_only("203.0.113.10", 0);
+    assert_probe_reaches_only("203.0.113.10", 0, &names, None);
     assert!(nft_counter("203.0.113.10") > routed_before);
 
     let block_before = nft_counter("192.0.2.99");
-    let sink_before = sink_rx_packets();
+    let sink_before = sink_rx_packets(&names);
     let blocked = command_output(Command::new("/usr/bin/ping").args([
         "-n",
         "-c",
@@ -139,7 +366,7 @@ fn root_worker_exercises_real_helper_transport() {
         !blocked.status.success(),
         "block target unexpectedly replied"
     );
-    assert_eq!(sink_rx_packets(), sink_before);
+    assert_eq!(sink_rx_packets(&names), sink_before);
     assert!(nft_counter("192.0.2.99") > block_before);
 
     helper.ok(json!({"method": "set_fail_point", "value": "activate_nft"}));
@@ -153,8 +380,9 @@ fn root_worker_exercises_real_helper_transport() {
 
     let after_rollback = helper.ok(json!({"method": "inspect"}));
     assert_eq!(after_rollback["generation"], 1);
+    assert_generation_one_routing_restored(&names);
     let counter_after_rollback = nft_counter("203.0.113.10");
-    assert_probe_reaches_only("203.0.113.10", 0);
+    assert_probe_reaches_only("203.0.113.10", 0, &names, None);
     assert!(nft_counter("203.0.113.10") > counter_after_rollback);
 
     helper.ok(json!({
@@ -171,6 +399,7 @@ fn root_worker_exercises_real_helper_transport() {
 
     let cleaned = helper.ok(json!({"method": "cleanup"}));
     assert_eq!(cleaned["cleaned"], true);
+    assert_managed_resources_absent();
     let empty = helper.ok(json!({"method": "inspect"}));
     assert_eq!(empty["generation"], Value::Null);
     assert_eq!(empty["routelane_table_present"], false);
@@ -185,7 +414,7 @@ fn root_worker_exercises_real_helper_transport() {
     );
 }
 
-fn require_root_capabilities() {
+fn require_root_capabilities() -> RunNames {
     assert_eq!(
         unsafe { libc::geteuid() },
         0,
@@ -203,115 +432,63 @@ fn require_root_capabilities() {
             "ROOT_INTEGRATION_SKIP: required executable is unavailable: {binary}"
         );
     }
-
-    let preflight = "routelane-test-preflight";
-    let _ = Command::new("/usr/sbin/ip")
-        .args(["netns", "del", preflight])
-        .output();
-    let created = command_output(Command::new("/usr/sbin/ip").args(["netns", "add", preflight]));
-    assert!(
-        created.status.success(),
-        "ROOT_INTEGRATION_SKIP: network namespace capability unavailable: {}",
-        String::from_utf8_lossy(&created.stderr).trim()
-    );
-    let _preflight = ExplicitNamespace(preflight);
-    let nft = command_output(Command::new("/usr/sbin/ip").args([
-        "netns",
-        "exec",
-        preflight,
-        "/usr/sbin/nft",
-        "list",
-        "ruleset",
-    ]));
-    assert!(
-        nft.status.success(),
-        "ROOT_INTEGRATION_SKIP: nftables capability unavailable inside namespace: {}",
-        String::from_utf8_lossy(&nft.stderr).trim()
-    );
-    let forwarding = command_output(Command::new("/usr/sbin/ip").args([
-        "netns",
-        "exec",
-        preflight,
-        "/usr/sbin/sysctl",
-        "-q",
-        "-w",
-        "net.ipv4.ip_forward=1",
-    ]));
-    assert!(
-        forwarding.status.success(),
-        "ROOT_INTEGRATION_SKIP: IPv4 forwarding is unavailable inside namespace: {}",
-        String::from_utf8_lossy(&forwarding.stderr).trim()
-    );
-    let veth = command_output(Command::new("/usr/sbin/ip").args([
-        "link",
-        "add",
-        "rlt-pre-a",
-        "type",
-        "veth",
-        "peer",
-        "name",
-        "rlt-pre-b",
-    ]));
-    let _ = Command::new("/usr/sbin/ip")
-        .args(["link", "del", "rlt-pre-a"])
-        .output();
-    assert!(
-        veth.status.success(),
-        "ROOT_INTEGRATION_SKIP: veth capability unavailable: {}",
-        String::from_utf8_lossy(&veth.stderr).trim()
-    );
+    let names = RunNames::from_env().expect("script supplied safe run-specific names");
+    let _registry = SystemProvisionBackend::from_env(&names)
+        .expect("script supplied secure exclusive registry");
+    names
 }
 
-struct ExplicitNamespace(&'static str);
-
-impl Drop for ExplicitNamespace {
-    fn drop(&mut self) {
-        let _ = Command::new("/usr/sbin/ip")
-            .args(["netns", "del", self.0])
-            .output();
-    }
+struct NamespaceHarness {
+    names: RunNames,
+    backend: SystemProvisionBackend,
+    owned: Vec<KernelObject>,
 }
-
-struct NamespaceHarness;
 
 impl NamespaceHarness {
-    fn create() -> Self {
-        cleanup_explicit_objects();
-        for namespace in NAMESPACES {
-            run_ip(["netns", "add", namespace]);
-            run_ip(["-n", namespace, "link", "set", "lo", "up"]);
+    fn create(names: RunNames) -> Self {
+        let mut backend =
+            SystemProvisionBackend::from_env(&names).expect("open secure owned-resource registry");
+        let owned = provision_owned(&names.creations(), &mut backend)
+            .unwrap_or_else(|error| panic!("provision collision-safe topology: {error}"));
+        let harness = Self {
+            names,
+            backend,
+            owned,
+        };
+        for namespace in harness.names.namespaces() {
+            run_ip(["-n", &namespace, "link", "set", "lo", "up"]);
         }
-
         for lane in 0..3 {
-            create_lane(lane);
+            create_lane(lane, &harness.names);
         }
         run_ip([
             "-n",
-            CLIENT,
+            &harness.names.client,
             "route",
             "add",
             "default",
             "via",
             "10.10.2.1",
             "dev",
-            "rlt-cb",
+            &harness.names.client_interfaces[1],
         ]);
-        Self
+        harness
     }
 }
 
 impl Drop for NamespaceHarness {
     fn drop(&mut self) {
-        cleanup_explicit_objects();
+        cleanup_recorded(&mut self.owned, &mut self.backend);
+        self.backend.clear_registry();
     }
 }
 
-fn create_lane(lane: usize) {
+fn create_lane(lane: usize, names: &RunNames) {
     let letter = ["a", "b", "c"][lane];
-    let client_if = ["rlt-ca", "rlt-cb", "rlt-cc"][lane];
-    let gateway_client_if = ["rlt-ga-c", "rlt-gb-c", "rlt-gc-c"][lane];
-    let gateway_sink_if = ["rlt-ga-s", "rlt-gb-s", "rlt-gc-s"][lane];
-    let sink_if = ["rlt-sa", "rlt-sb", "rlt-sc"][lane];
+    let client_if = &names.client_interfaces[lane];
+    let gateway_client_if = &names.gateway_client_interfaces[lane];
+    let gateway_sink_if = &names.gateway_sink_interfaces[lane];
+    let sink_if = &names.sink_interfaces[lane];
     let client_address = format!("10.10.{}.2/24", lane + 1);
     let client_gateway = format!("10.10.{}.1", lane + 1);
     let gateway_client_address = format!("{client_gateway}/24");
@@ -321,46 +498,57 @@ fn create_lane(lane: usize) {
     let sink_ip = format!("10.20.{}.2", lane + 1);
     let client_network = format!("10.10.{}.0/24", lane + 1);
     let targets: &[&str] = match lane {
-        0 => &["203.0.113.10/32", "203.0.113.11/32"],
+        0 => &["203.0.113.10/32", "203.0.113.11/32", "198.18.0.10/32"],
         1 => &["198.51.100.10/32", "198.18.0.10/32"],
         _ => &["192.0.2.10/32", "192.0.2.99/32"],
     };
 
+    run_ip(["link", "set", client_if, "netns", &names.client]);
     run_ip([
         "link",
-        "add",
-        client_if,
-        "type",
-        "veth",
-        "peer",
-        "name",
+        "set",
         gateway_client_if,
+        "netns",
+        &names.gateways[lane],
     ]);
-    run_ip(["link", "set", client_if, "netns", CLIENT]);
-    run_ip(["link", "set", gateway_client_if, "netns", GATEWAYS[lane]]);
     run_ip([
         "link",
-        "add",
+        "set",
         gateway_sink_if,
-        "type",
-        "veth",
-        "peer",
-        "name",
-        sink_if,
+        "netns",
+        &names.gateways[lane],
     ]);
-    run_ip(["link", "set", gateway_sink_if, "netns", GATEWAYS[lane]]);
-    run_ip(["link", "set", sink_if, "netns", SINKS[lane]]);
+    run_ip(["link", "set", sink_if, "netns", &names.sinks[lane]]);
 
-    configure_interface(CLIENT, client_if, &client_address);
-    configure_interface(GATEWAYS[lane], gateway_client_if, &gateway_client_address);
-    configure_interface(GATEWAYS[lane], gateway_sink_if, &gateway_sink_address);
-    configure_interface(SINKS[lane], sink_if, &sink_address);
+    configure_interface(&names.client, client_if, &client_address);
+    configure_interface(
+        &names.gateways[lane],
+        gateway_client_if,
+        &gateway_client_address,
+    );
+    configure_interface(
+        &names.gateways[lane],
+        gateway_sink_if,
+        &gateway_sink_address,
+    );
+    configure_interface(&names.sinks[lane], sink_if, &sink_address);
+    if lane == 0 {
+        run_ip([
+            "-n",
+            &names.gateways[lane],
+            "addr",
+            "add",
+            "10.10.1.254/24",
+            "dev",
+            gateway_client_if,
+        ]);
+    }
 
     checked_output(
         Command::new("/usr/sbin/ip").args([
             "netns",
             "exec",
-            GATEWAYS[lane],
+            &names.gateways[lane],
             "/usr/sbin/sysctl",
             "-q",
             "-w",
@@ -370,7 +558,7 @@ fn create_lane(lane: usize) {
     );
     run_ip([
         "-n",
-        SINKS[lane],
+        &names.sinks[lane],
         "route",
         "add",
         &client_network,
@@ -380,11 +568,11 @@ fn create_lane(lane: usize) {
         sink_if,
     ]);
     for target in targets {
-        run_ip(["-n", SINKS[lane], "addr", "add", target, "dev", "lo"]);
+        run_ip(["-n", &names.sinks[lane], "addr", "add", target, "dev", "lo"]);
         let target_ip = target.trim_end_matches("/32");
         run_ip([
             "-n",
-            GATEWAYS[lane],
+            &names.gateways[lane],
             "route",
             "add",
             target,
@@ -396,7 +584,7 @@ fn create_lane(lane: usize) {
         if target_ip == "198.18.0.10" || target_ip == "192.0.2.99" {
             run_ip([
                 "-n",
-                CLIENT,
+                &names.client,
                 "route",
                 "add",
                 target,
@@ -414,34 +602,37 @@ fn configure_interface(namespace: &str, interface: &str, address: &str) {
     run_ip(["-n", namespace, "link", "set", interface, "up"]);
 }
 
-fn cleanup_explicit_objects() {
-    for namespace in NAMESPACES {
-        let _ = Command::new("/usr/sbin/ip")
-            .args(["netns", "del", namespace])
-            .output();
-    }
-    for veth in VETHS {
-        let _ = Command::new("/usr/sbin/ip")
-            .args(["link", "del", veth])
-            .output();
-    }
-}
-
-fn plan(generation: u64, lane_a_target: &str) -> KernelPlan {
+fn plan(
+    generation: u64,
+    lane_a_target: &str,
+    names: &RunNames,
+    generation_two_resources: bool,
+) -> KernelPlan {
+    let lane_a_offset = if generation_two_resources { 10 } else { 0 };
+    let lane_a_gateway = if generation_two_resources {
+        "10.10.1.254"
+    } else {
+        "10.10.1.1"
+    };
     KernelPlan {
         generation,
         profile_id: ProfileId::from("root-integration"),
         lanes: vec![
-            lane("lane-a", "rlt-ca", "10.10.1.1", 0),
-            lane("lane-b", "rlt-cb", "10.10.2.1", 1),
-            lane("lane-c", "rlt-cc", "10.10.3.1", 2),
+            lane(
+                "lane-a",
+                &names.client_interfaces[0],
+                lane_a_gateway,
+                lane_a_offset,
+            ),
+            lane("lane-b", &names.client_interfaces[1], "10.10.2.1", 1),
+            lane("lane-c", &names.client_interfaces[2], "10.10.3.1", 2),
         ],
         rules: vec![
             rule(
                 "route-a",
                 10,
                 lane_a_target,
-                CompiledAction::Mark(MARK_BASE),
+                CompiledAction::Mark(MARK_BASE + lane_a_offset),
             ),
             rule(
                 "route-b",
@@ -484,47 +675,56 @@ fn rule(id: &str, priority: u32, target: &str, action: CompiledAction) -> Compil
     }
 }
 
-fn assert_probe_reaches_only(target: &str, expected_sink: usize) {
-    let before = sink_rx_packets();
-    let output =
-        command_output(Command::new("/usr/bin/ping").args(["-n", "-c", "1", "-W", "2", target]));
+fn assert_probe_reaches_only(
+    target: &str,
+    expected_sink: usize,
+    names: &RunNames,
+    initial_mark: Option<u32>,
+) {
+    let before = sink_rx_packets(names);
+    let mut command = Command::new("/usr/bin/ping");
+    command.args(["-n", "-c", "1", "-W", "2"]);
+    if let Some(mark) = initial_mark {
+        command.args(["-m", &mark.to_string()]);
+    }
+    let output = command_output(command.arg(target));
     assert!(
         output.status.success(),
         "probe to {target} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let after = sink_rx_packets();
+    let after = sink_rx_packets(names);
     for lane in 0..3 {
         if lane == expected_sink {
             assert!(
                 after[lane] > before[lane],
                 "sink {} did not receive probe for {target}",
-                SINKS[lane]
+                names.sinks[lane]
             );
         } else {
             assert_eq!(
                 after[lane], before[lane],
                 "sink {} unexpectedly received probe for {target}",
-                SINKS[lane]
+                names.sinks[lane]
             );
         }
     }
 }
 
-fn sink_rx_packets() -> [u64; 3] {
+fn sink_rx_packets(names: &RunNames) -> [u64; 3] {
     std::array::from_fn(|lane| {
         let output = checked_output(
             Command::new("/usr/sbin/ip").args([
                 "netns",
                 "exec",
-                SINKS[lane],
+                &names.sinks[lane],
                 "/usr/sbin/ip",
                 "-j",
                 "-s",
                 "link",
                 "show",
                 "dev",
-                ["rlt-sa", "rlt-sb", "rlt-sc"][lane],
+                &names.sink_interfaces[lane],
             ]),
             "read sink receive counters",
         );
@@ -558,6 +758,98 @@ fn nft_counter(target: &str) -> u64 {
             .expect("matched RouteLane rule has a packet counter");
     }
     panic!("no RouteLane nftables rule found for {target}");
+}
+
+fn assert_generation_one_routing_restored(names: &RunNames) {
+    let routes = ip_json(&["-j", "-4", "route", "show", "table", "all"]);
+    assert!(routes.as_array().unwrap().iter().any(|route| {
+        json_u32(&route["table"]) == Some(TABLE_BASE)
+            && route["dst"].as_str() == Some("default")
+            && route["gateway"].as_str() == Some("10.10.1.1")
+            && route["dev"].as_str() == Some(names.client_interfaces[0].as_str())
+    }));
+    assert!(
+        routes
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|route| json_u32(&route["table"]) != Some(TABLE_BASE + 10)),
+        "generation-two route table survived rollback"
+    );
+
+    let rules = ip_json(&["-j", "-4", "rule", "show"]);
+    assert!(rule_present(
+        &rules,
+        RULE_PRIORITY_BASE,
+        TABLE_BASE,
+        MARK_BASE
+    ));
+    assert!(!rule_present(
+        &rules,
+        RULE_PRIORITY_BASE + 10,
+        TABLE_BASE + 10,
+        MARK_BASE + 10
+    ));
+}
+
+fn assert_managed_resources_absent() {
+    let routes = ip_json(&["-j", "-4", "route", "show", "table", "all"]);
+    assert!(
+        routes.as_array().unwrap().iter().all(|route| {
+            json_u32(&route["table"])
+                .is_none_or(|table| !(TABLE_BASE..=routelane::backend::TABLE_MAX).contains(&table))
+        }),
+        "Cleanup left a route in the managed table range"
+    );
+    let rules = ip_json(&["-j", "-4", "rule", "show"]);
+    assert!(
+        rules.as_array().unwrap().iter().all(|rule| {
+            let priority_is_managed = json_u32(&rule["priority"]).is_some_and(|priority| {
+                (RULE_PRIORITY_BASE..=routelane::backend::RULE_PRIORITY_MAX).contains(&priority)
+            });
+            let mark_is_managed = json_u32(&rule["fwmark"])
+                .is_some_and(|mark| (MARK_BASE..=routelane::backend::MARK_MAX).contains(&mark));
+            !priority_is_managed && !mark_is_managed
+        }),
+        "Cleanup left a policy rule in a managed priority or mark range"
+    );
+    let tables = checked_output(
+        Command::new("/usr/sbin/nft").args(["-j", "list", "tables"]),
+        "list nftables tables after cleanup",
+    );
+    let tables: Value = serde_json::from_slice(&tables.stdout).unwrap();
+    assert!(
+        tables["nftables"].as_array().unwrap().iter().all(|object| {
+            object["table"]["family"].as_str() != Some("inet")
+                || object["table"]["name"].as_str() != Some("routelane")
+        }),
+        "Cleanup left the inet/routelane table"
+    );
+}
+
+fn ip_json(args: &[&str]) -> Value {
+    let output = checked_output(
+        Command::new("/usr/sbin/ip").args(args),
+        "read IP JSON state",
+    );
+    serde_json::from_slice(&output.stdout).expect("ip command returned JSON")
+}
+
+fn rule_present(rules: &Value, priority: u32, table: u32, mark: u32) -> bool {
+    rules.as_array().unwrap().iter().any(|rule| {
+        json_u32(&rule["priority"]) == Some(priority)
+            && json_u32(&rule["table"]) == Some(table)
+            && json_u32(&rule["fwmark"]) == Some(mark)
+    })
+}
+
+fn json_u32(value: &Value) -> Option<u32> {
+    value.as_u64().map(|value| value as u32).or_else(|| {
+        let text = value.as_str()?.split('/').next()?;
+        text.strip_prefix("0x")
+            .map(|hex| u32::from_str_radix(hex, 16).ok())
+            .unwrap_or_else(|| text.parse().ok())
+    })
 }
 
 struct HelperProcess {
@@ -663,4 +955,84 @@ fn checked_output(command: &mut Command, context: &str) -> Output {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     output
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::{provision_owned, Creation, KernelObject, ProvisionBackend};
+
+    #[derive(Default)]
+    struct FakeBackend {
+        collision: Option<KernelObject>,
+        fail_at: Option<usize>,
+        creates: Vec<Creation>,
+        records: Vec<KernelObject>,
+        deletes: Vec<KernelObject>,
+    }
+
+    impl ProvisionBackend for FakeBackend {
+        fn exists(&mut self, object: &KernelObject) -> Result<bool, String> {
+            Ok(self.collision.as_ref() == Some(object))
+        }
+
+        fn create(&mut self, creation: &Creation) -> Result<Vec<KernelObject>, String> {
+            if self.fail_at == Some(self.creates.len()) {
+                return Err("injected partial creation failure".to_owned());
+            }
+            self.creates.push(creation.clone());
+            Ok(creation.objects())
+        }
+
+        fn record(&mut self, object: &KernelObject) -> Result<(), String> {
+            self.records.push(object.clone());
+            Ok(())
+        }
+
+        fn delete(&mut self, object: &KernelObject) {
+            self.deletes.push(object.clone());
+        }
+    }
+
+    fn desired() -> Vec<Creation> {
+        vec![
+            Creation::Namespace("routelane-test-token-client".to_owned()),
+            Creation::VethPair("rltoken-ca".to_owned(), "rltoken-ga".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn collision_fails_before_create_record_or_delete() {
+        let mut backend = FakeBackend {
+            collision: Some(KernelObject::Namespace(
+                "routelane-test-token-client".to_owned(),
+            )),
+            ..FakeBackend::default()
+        };
+
+        let error = provision_owned(&desired(), &mut backend).unwrap_err();
+
+        assert!(error.contains("collision"));
+        assert!(backend.creates.is_empty());
+        assert!(backend.records.is_empty());
+        assert!(backend.deletes.is_empty());
+    }
+
+    #[test]
+    fn partial_creation_deletes_only_objects_recorded_as_owned() {
+        let mut backend = FakeBackend {
+            fail_at: Some(1),
+            ..FakeBackend::default()
+        };
+
+        let error = provision_owned(&desired(), &mut backend).unwrap_err();
+
+        assert!(error.contains("partial creation"));
+        assert_eq!(
+            backend.records,
+            vec![KernelObject::Namespace(
+                "routelane-test-token-client".to_owned()
+            )]
+        );
+        assert_eq!(backend.deletes, backend.records);
+    }
 }

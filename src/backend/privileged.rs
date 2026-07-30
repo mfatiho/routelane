@@ -1277,6 +1277,12 @@ where
         if std::env::var_os("ROUTELANE_TEST_FAIL_POINT").as_deref()
             == Some(std::ffi::OsStr::new("activate_nft"))
         {
+            let captured = capture_snapshot(self.executor)?;
+            if !captured_plan_present(&captured, next)? {
+                return Err(RunnerError::new(
+                    "root integration fail point reached before candidate routes and rules were prepared",
+                ));
+            }
             return Err(RunnerError::new(
                 "root integration fail point before activate_nft",
             ));
@@ -1591,6 +1597,7 @@ fn nft_rule_object(rule: &super::CompiledRule) -> serde_json::Value {
                     "value": 0,
                 }
             }));
+            expressions.push(serde_json::json!({"counter": {}}));
             expressions.push(serde_json::json!({"return": null}));
         }
         CompiledAction::Block => {
