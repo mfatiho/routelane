@@ -1,4 +1,4 @@
-use crate::config::Language;
+use routelane::config::Language;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Texts {
@@ -45,8 +45,12 @@ pub struct Texts {
     pub lane_interface_empty: &'static str,
 }
 
-impl Language {
-    pub fn texts(self) -> Texts {
+pub trait LanguageTexts {
+    fn texts(self) -> Texts;
+}
+
+impl LanguageTexts for Language {
+    fn texts(self) -> Texts {
         match self {
             Self::Tr => Texts {
                 inactive: "Yönlendirme devre dışı",

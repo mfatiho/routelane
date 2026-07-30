@@ -5,9 +5,10 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use crate::config::Language;
+use crate::ui::i18n::LanguageTexts;
 use glib::Sender;
 use ksni::blocking::TrayMethods;
+use routelane::config::Language;
 
 pub const APP_ID: &str = "io.github.routelane";
 pub const APP_ICON_NAME: &str = "network-workgroup-symbolic";

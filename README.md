@@ -107,29 +107,42 @@ systemctl --user start routelane-daemon.service
 routelanectl status
 routelanectl status --json
 routelanectl apply-profile ./profile.json
+routelanectl apply-profile ./config.json --profile Work
 routelanectl deactivate
 ```
 
 `routelanectl` uses the same canonical daemon IPC client as the GUI. Its Phase
 1 surface is intentionally limited to the commands above.
 
-A direct `apply-profile` input is one validated profile:
+`apply-profile` reads the same schema-version-2 configuration document as the
+desktop application. When the document has one profile, no selector is needed.
+For multiple profiles, `--profile <id-or-name>` is required; missing, duplicate,
+ambiguous, or unknown selectors fail locally before daemon contact. Bare
+profile JSON is not accepted. Input must be a current-user-owned regular file
+without group/other write permission and is capped at 1 MiB; symlinks, FIFOs,
+devices, and oversized files are rejected.
 
 ```json
 {
-  "id": "work",
-  "name": "Work",
-  "enabled": true,
-  "lanes": [
+  "schema_version": 2,
+  "language": "en",
+  "profiles": [
     {
-      "id": "vpn",
-      "name": "VPN",
-      "interface": "wg0",
-      "fallback_lane": null,
-      "failure_policy": "Inactive"
+      "id": "work",
+      "name": "Work",
+      "enabled": false,
+      "lanes": [
+        {
+          "id": "vpn",
+          "name": "VPN",
+          "interface": "wg0",
+          "fallback_lane": null,
+          "failure_policy": "Inactive"
+        }
+      ],
+      "rules": []
     }
-  ],
-  "rules": []
+  ]
 }
 ```
 

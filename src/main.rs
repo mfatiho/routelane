@@ -1,4 +1,3 @@
-mod config;
 mod models;
 mod ui;
 
@@ -314,10 +313,11 @@ fn request_id() -> String {
 mod tests {
     use super::{establish_subscription_and_refresh, ConnectionPolicy};
     use async_channel::bounded;
+    use routelane::domain::{Profile, ProfileId};
     use routelane::health::HealthReport;
     use routelane::ipc::{
-        read_frame, write_frame, DaemonClient, DaemonEnvelope, DaemonRequest, DaemonResponse,
-        DaemonResult, DaemonStatus,
+        read_frame, write_frame, DaemonClient, DaemonEnvelope, DaemonEvent, DaemonRequest,
+        DaemonResponse, DaemonResult, DaemonStatus,
     };
     use std::time::Duration;
     use tempfile::TempDir;
@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscription_ack_precedes_status_and_profile_snapshots() {
+    async fn event_after_subscription_ack_is_buffered_before_authoritative_snapshots() {
         let runtime = TempDir::new().unwrap();
         let path = runtime.path().join("daemon.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -348,13 +348,19 @@ mod tests {
                 let result = match envelope.request {
                     DaemonRequest::Subscribe => DaemonResult::Subscribed,
                     DaemonRequest::GetStatus => DaemonResult::Status(DaemonStatus {
-                        generation: 0,
+                        generation: 2,
                         health: HealthReport::inactive(),
                         desired_profile_id: None,
                         applied_profile_id: None,
                         last_error: None,
                     }),
-                    DaemonRequest::ListProfiles => DaemonResult::Profiles(vec![]),
+                    DaemonRequest::ListProfiles => DaemonResult::Profiles(vec![Profile {
+                        id: ProfileId::from("canonical"),
+                        name: "Canonical".to_owned(),
+                        enabled: false,
+                        lanes: vec![],
+                        rules: vec![],
+                    }]),
                     other => panic!("unexpected request: {other:?}"),
                 };
                 write_frame(
@@ -364,15 +370,24 @@ mod tests {
                 .await
                 .unwrap();
                 if matches!(envelope.request, DaemonRequest::Subscribe) {
+                    write_frame(
+                        &mut stream,
+                        &DaemonEvent::StateChanged {
+                            generation: 1,
+                            health: HealthReport::applying(),
+                        },
+                    )
+                    .await
+                    .unwrap();
                     subscription = Some(stream);
                 }
             }
             drop(subscription);
         });
         let client = DaemonClient::new(path);
-        let (ui_sender, _ui_receiver) = bounded(4);
+        let (ui_sender, ui_receiver) = bounded(4);
 
-        let _events =
+        let mut events =
             establish_subscription_and_refresh(&client, &ui_sender, ConnectionPolicy::default())
                 .await
                 .unwrap();
@@ -389,5 +404,20 @@ mod tests {
             order_receiver.recv().await.unwrap(),
             DaemonRequest::ListProfiles
         );
+        assert!(matches!(
+            events.recv().await,
+            Some(DaemonEvent::StateChanged { generation: 1, .. })
+        ));
+        assert!(matches!(
+            ui_receiver.recv().await.unwrap(),
+            crate::models::DaemonToUi::Status(DaemonStatus { generation: 2, .. })
+        ));
+        match ui_receiver.recv().await.unwrap() {
+            crate::models::DaemonToUi::Profiles(profiles) => {
+                assert_eq!(profiles.len(), 1);
+                assert_eq!(profiles[0].id, ProfileId::from("canonical"));
+            }
+            other => panic!("unexpected UI snapshot: {other:?}"),
+        }
     }
 }

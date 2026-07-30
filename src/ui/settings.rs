@@ -8,8 +8,8 @@ use routelane::domain::{
     RuleAction,
 };
 
-use crate::config::Language;
 use crate::ui::i18n::Texts;
+use routelane::config::Language;
 
 pub fn add_lane(
     profile: &mut Profile,
@@ -399,6 +399,7 @@ fn system_interfaces() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{add_lane, delete_lane, lane_edit_error_text, rename_lane, LaneEditError};
+    use crate::ui::i18n::LanguageTexts;
     use routelane::domain::{
         InterfaceSelector, LaneFailurePolicy, Profile, ProfileId, Rule, RuleAction, RuleId,
         RuleSource, RuleTarget,
@@ -461,14 +462,14 @@ mod tests {
         assert_eq!(
             lane_edit_error_text(
                 LaneEditError::DuplicateName,
-                crate::config::Language::Tr.texts(),
+                routelane::config::Language::Tr.texts(),
             ),
             "Rota adı benzersiz olmalıdır"
         );
         assert_eq!(
             lane_edit_error_text(
                 LaneEditError::EmptyInterface,
-                crate::config::Language::En.texts(),
+                routelane::config::Language::En.texts(),
             ),
             "Lane interface must not be empty"
         );
