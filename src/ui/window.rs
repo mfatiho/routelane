@@ -133,6 +133,21 @@ fn status_is_active(status: &DaemonStatus) -> bool {
     status.applied_profile_id.is_some()
 }
 
+fn accept_connection_epoch(
+    last_epoch: &Cell<Option<u64>>,
+    last_generation: &Cell<Option<u64>>,
+    last_sequence: &Cell<Option<u64>>,
+    epoch: u64,
+) -> bool {
+    if last_epoch.get().is_some_and(|current| epoch <= current) {
+        return false;
+    }
+    last_epoch.set(Some(epoch));
+    last_generation.set(None);
+    last_sequence.set(None);
+    true
+}
+
 fn accept_daemon_status_revision(
     last_generation: &Cell<Option<u64>>,
     last_sequence: &Cell<Option<u64>>,
@@ -229,6 +244,7 @@ pub fn build_window(
     let last_applied_profile_id = Rc::new(RefCell::new(None::<ProfileId>));
     let last_daemon_generation = Rc::new(Cell::new(None::<u64>));
     let last_event_sequence = Rc::new(Cell::new(None::<u64>));
+    let last_connection_epoch = Rc::new(Cell::new(None::<u64>));
     let settings = gtk::Button::builder()
         .icon_name("preferences-system-symbolic")
         .tooltip_text(texts.settings_title)
@@ -542,6 +558,14 @@ pub fn build_window(
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = receiver.recv().await {
                 match event {
+                    DaemonToUi::ConnectionEstablished { epoch } => {
+                        accept_connection_epoch(
+                            &last_connection_epoch,
+                            &last_daemon_generation,
+                            &last_event_sequence,
+                            epoch,
+                        );
+                    }
                     DaemonToUi::Status(status) => {
                         if !accept_daemon_status_revision(
                             &last_daemon_generation,
@@ -887,9 +911,10 @@ fn refreshed_interface_selection(previous_name: Option<&str>, names: &[String]) 
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_daemon_event_revision, accept_daemon_status_revision, configuration_error_view,
-        daemon_unavailable_view, health_sections, health_view, reconcile_profiles,
-        refreshed_interface_selection, status_is_active, switch_state_after_persistence_failure,
+        accept_connection_epoch, accept_daemon_event_revision, accept_daemon_status_revision,
+        configuration_error_view, daemon_unavailable_view, health_sections, health_view,
+        reconcile_profiles, refreshed_interface_selection, status_is_active,
+        switch_state_after_persistence_failure,
     };
     use crate::ui::i18n::LanguageTexts;
     use routelane::config::ConfigV2;
@@ -1023,6 +1048,77 @@ mod tests {
         ));
         assert_eq!(last_generation.get(), Some(3));
         assert_eq!(last_sequence.get(), Some(7));
+    }
+
+    #[test]
+    fn only_a_new_connection_epoch_resets_daemon_revision_guards() {
+        let last_epoch = std::cell::Cell::new(None);
+        let last_generation = std::cell::Cell::new(Some(5));
+        let last_sequence = std::cell::Cell::new(Some(21));
+
+        assert!(accept_connection_epoch(
+            &last_epoch,
+            &last_generation,
+            &last_sequence,
+            1,
+        ));
+        assert_eq!(last_generation.get(), None);
+        assert_eq!(last_sequence.get(), None);
+        assert!(accept_daemon_status_revision(
+            &last_generation,
+            &last_sequence,
+            5,
+            20,
+        ));
+        assert!(accept_daemon_event_revision(
+            &last_generation,
+            &last_sequence,
+            5,
+            21,
+        ));
+
+        assert!(!accept_connection_epoch(
+            &last_epoch,
+            &last_generation,
+            &last_sequence,
+            1,
+        ));
+        assert!(!accept_connection_epoch(
+            &last_epoch,
+            &last_generation,
+            &last_sequence,
+            0,
+        ));
+        assert_eq!(last_generation.get(), Some(5));
+        assert_eq!(last_sequence.get(), Some(21));
+
+        assert!(accept_connection_epoch(
+            &last_epoch,
+            &last_generation,
+            &last_sequence,
+            2,
+        ));
+        assert_eq!(last_generation.get(), None);
+        assert_eq!(last_sequence.get(), None);
+        assert!(accept_daemon_status_revision(
+            &last_generation,
+            &last_sequence,
+            0,
+            0,
+        ));
+
+        assert!(accept_connection_epoch(
+            &last_epoch,
+            &last_generation,
+            &last_sequence,
+            3,
+        ));
+        assert!(accept_daemon_status_revision(
+            &last_generation,
+            &last_sequence,
+            0,
+            0,
+        ));
     }
 
     #[test]
