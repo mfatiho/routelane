@@ -64,6 +64,17 @@ fn replace_batch_deletes_and_recreates_only_routelane_table() {
 }
 
 #[test]
+fn block_counter_precedes_the_terminal_reject_verdict() {
+    let rendered = render_ruleset(&fixture_kernel_plan_with_all_actions(), TableMode::Create)
+        .expect("render block rule");
+
+    assert!(
+        rendered.contains("ip6 daddr 2001:db8:dead::/48 counter reject"),
+        "a terminal reject before the counter prevents the block metric from increasing"
+    );
+}
+
+#[test]
 fn rejects_interface_value_that_cannot_be_a_kernel_interface() {
     let mut plan = fixture_kernel_plan_with_all_actions();
     plan.lanes[0].interface = "wg0\nflush ruleset".into();

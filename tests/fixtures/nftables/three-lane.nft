@@ -2,4 +2,4 @@ add table inet routelane
 add chain inet routelane output { type route hook output priority mangle; policy accept; }
 add rule inet routelane output ip daddr 203.0.113.0/24 meta mark set 0x524c0002 counter
 add rule inet routelane output ip daddr 198.51.100.7 meta mark set 0x00000000 return
-add rule inet routelane output ip6 daddr 2001:db8:dead::/48 reject counter
+add rule inet routelane output ip6 daddr 2001:db8:dead::/48 counter reject

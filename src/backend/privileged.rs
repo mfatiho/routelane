@@ -276,6 +276,34 @@ impl Default for FileAppliedStateStore {
     }
 }
 
+#[cfg(feature = "root-integration")]
+impl FileAppliedStateStore {
+    pub fn isolated_root_integration(directory: PathBuf) -> Result<Self, PrivilegedError> {
+        let valid_name = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("routelane-test-"));
+        if directory.parent() != Some(Path::new("/tmp")) || !valid_name {
+            return Err(state_error(
+                "root integration state directory must be an explicit /tmp/routelane-test-* path",
+            ));
+        }
+        let metadata = fs::symlink_metadata(&directory)
+            .map_err(|error| state_error(format!("inspect root integration directory: {error}")))?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o777 != 0o700
+        {
+            return Err(state_error(
+                "root integration state directory must be a root-owned real 0700 directory",
+            ));
+        }
+        let path = directory.join("applied-plan.json");
+        Ok(Self { directory, path })
+    }
+}
+
 impl AppliedStateStore for FileAppliedStateStore {
     fn load(&mut self) -> Result<Option<StoredAppliedState>, PrivilegedError> {
         ensure_root_owned_directory(&self.directory)?;
@@ -1245,6 +1273,14 @@ where
     }
 
     fn activate_nft(&mut self, next: &KernelPlan) -> Result<(), RunnerError> {
+        #[cfg(feature = "root-integration")]
+        if std::env::var_os("ROUTELANE_TEST_FAIL_POINT").as_deref()
+            == Some(std::ffi::OsStr::new("activate_nft"))
+        {
+            return Err(RunnerError::new(
+                "root integration fail point before activate_nft",
+            ));
+        }
         let batch = render_guarded_ruleset(next)?;
         run_nft_batch(
             self.executor,
@@ -1558,8 +1594,8 @@ fn nft_rule_object(rule: &super::CompiledRule) -> serde_json::Value {
             expressions.push(serde_json::json!({"return": null}));
         }
         CompiledAction::Block => {
-            expressions.push(serde_json::json!({"reject": {}}));
             expressions.push(serde_json::json!({"counter": {}}));
+            expressions.push(serde_json::json!({"reject": {}}));
         }
     }
     serde_json::json!({
