@@ -95,30 +95,34 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
         }
     };
     let client = DaemonClient::new(path);
+    let mut connection_epoch = 0;
 
-    let mut subscription = match establish_subscription_and_refresh(&client, &to_ui, policy).await {
-        Ok(events) => Some(events),
-        Err(first_error) => {
-            if let Err(activation_error) = activate_user_daemon(policy).await {
-                let _ = to_ui
-                    .send(DaemonToUi::DaemonUnavailable(format!(
-                        "{first_error}; systemd user activation failed: {activation_error}"
-                    )))
-                    .await;
-                None
-            } else {
-                match wait_for_daemon(&client, &to_ui, policy).await {
-                    Ok(events) => Some(events),
-                    Err(error) => {
-                        let _ = to_ui
-                            .send(DaemonToUi::DaemonUnavailable(error.to_string()))
-                            .await;
-                        None
+    let mut subscription =
+        match establish_subscription_and_refresh(&client, &to_ui, policy, &mut connection_epoch)
+            .await
+        {
+            Ok(events) => Some(events),
+            Err(first_error) => {
+                if let Err(activation_error) = activate_user_daemon(policy).await {
+                    let _ = to_ui
+                        .send(DaemonToUi::DaemonUnavailable(format!(
+                            "{first_error}; systemd user activation failed: {activation_error}"
+                        )))
+                        .await;
+                    None
+                } else {
+                    match wait_for_daemon(&client, &to_ui, policy, &mut connection_epoch).await {
+                        Ok(events) => Some(events),
+                        Err(error) => {
+                            let _ = to_ui
+                                .send(DaemonToUi::DaemonUnavailable(error.to_string()))
+                                .await;
+                            None
+                        }
                     }
                 }
             }
-        }
-    };
+        };
     let mut reconnect_attempt = 0;
     let mut next_reconnect = tokio::time::Instant::now();
     loop {
@@ -132,7 +136,7 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
                             Ok(response) => forward_response(response, &to_ui).await,
                             Err(error) => {
                                 let _ = to_ui.send(DaemonToUi::DaemonUnavailable(error.to_string())).await;
-                                subscription = None;
+                                close_subscription(&mut subscription);
                                 next_reconnect = tokio::time::Instant::now()
                                     + policy.reconnect_delay(reconnect_attempt);
                                 reconnect_attempt = reconnect_attempt.saturating_add(1);
@@ -153,7 +157,7 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
                         let _ = to_ui.send(DaemonToUi::Event(event)).await;
                     }
                     None => {
-                        subscription = None;
+                        close_subscription(&mut subscription);
                         let _ = to_ui
                             .send(DaemonToUi::DaemonUnavailable(
                                 "daemon event subscription disconnected".to_owned(),
@@ -172,7 +176,12 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
                     std::future::pending::<()>().await;
                 }
             } => {
-                match establish_subscription_and_refresh(&client, &to_ui, policy).await {
+                match establish_subscription_and_refresh(
+                    &client,
+                    &to_ui,
+                    policy,
+                    &mut connection_epoch,
+                ).await {
                     Ok(events) => {
                         subscription = Some(events);
                         reconnect_attempt = 0;
@@ -241,8 +250,13 @@ async fn establish_subscription_and_refresh(
     client: &DaemonClient,
     sender: &Sender<DaemonToUi>,
     policy: ConnectionPolicy,
+    connection_epoch: &mut u64,
 ) -> Result<EventSubscription, IpcError> {
     let receiver = subscribe_with_timeout(client, policy).await?;
+    let epoch = advance_connection_epoch(connection_epoch);
+    let _ = sender
+        .send(DaemonToUi::ConnectionEstablished { epoch })
+        .await;
     let (_, minimum_sequence) = refresh_daemon_state(client, sender, policy).await?;
     Ok(EventSubscription {
         receiver,
@@ -254,16 +268,28 @@ async fn wait_for_daemon(
     client: &DaemonClient,
     sender: &Sender<DaemonToUi>,
     policy: ConnectionPolicy,
+    connection_epoch: &mut u64,
 ) -> Result<EventSubscription, IpcError> {
     let mut last_error = IpcError::new("IPC_CONNECT_FAILED", "daemon did not create its socket");
     for attempt in 0..6 {
-        match establish_subscription_and_refresh(client, sender, policy).await {
+        match establish_subscription_and_refresh(client, sender, policy, connection_epoch).await {
             Ok(events) => return Ok(events),
             Err(error) => last_error = error,
         }
         tokio::time::sleep(policy.reconnect_delay(attempt)).await;
     }
     Err(last_error)
+}
+
+fn advance_connection_epoch(epoch: &mut u64) -> u64 {
+    *epoch = epoch
+        .checked_add(1)
+        .expect("daemon connection epoch exhausted");
+    *epoch
+}
+
+fn close_subscription(subscription: &mut Option<EventSubscription>) {
+    subscription.take();
 }
 
 fn daemon_event_sequence(event: &routelane::ipc::DaemonEvent) -> u64 {
@@ -337,7 +363,10 @@ fn request_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{establish_subscription_and_refresh, ConnectionPolicy};
+    use super::{
+        advance_connection_epoch, close_subscription, establish_subscription_and_refresh,
+        ConnectionPolicy, EventSubscription,
+    };
     use crate::models::DaemonToUi;
     use async_channel::bounded;
     use routelane::domain::{Profile, ProfileId};
@@ -409,10 +438,15 @@ mod tests {
         });
         let client = DaemonClient::new(path);
         let (ui_sender, ui_receiver) = bounded(4);
-        let mut events =
-            establish_subscription_and_refresh(&client, &ui_sender, ConnectionPolicy::default())
-                .await
-                .unwrap();
+        let mut connection_epoch = 0;
+        let mut events = establish_subscription_and_refresh(
+            &client,
+            &ui_sender,
+            ConnectionPolicy::default(),
+            &mut connection_epoch,
+        )
+        .await
+        .unwrap();
         let mut delivered = Vec::new();
         tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events.recv().await {
@@ -422,6 +456,7 @@ mod tests {
         .await
         .unwrap();
         let ui = vec![
+            ui_receiver.recv().await.unwrap(),
             ui_receiver.recv().await.unwrap(),
             ui_receiver.recv().await.unwrap(),
         ];
@@ -443,6 +478,39 @@ mod tests {
         assert_eq!(policy.reconnect_delay(20), policy.maximum_reconnect_delay);
     }
 
+    #[test]
+    fn connection_epoch_is_monotonic_for_each_successful_subscription() {
+        let mut epoch = 0;
+
+        assert_eq!(advance_connection_epoch(&mut epoch), 1);
+        assert_eq!(advance_connection_epoch(&mut epoch), 2);
+        assert_eq!(epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn closing_a_subscription_drops_the_previous_event_receiver() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let mut subscription = Some(EventSubscription {
+            receiver,
+            minimum_sequence: 0,
+        });
+
+        close_subscription(&mut subscription);
+
+        assert!(subscription.is_none());
+        assert!(
+            sender
+                .send(DaemonEvent::StateChanged {
+                    sequence: 1,
+                    generation: 1,
+                    health: HealthReport::applying(),
+                })
+                .await
+                .is_err(),
+            "the old socket reader must not retain a live event receiver"
+        );
+    }
+
     #[tokio::test]
     async fn buffered_event_not_newer_than_snapshot_is_discarded() {
         let (events, ui, order) = run_snapshot_scenario(vec![5]).await;
@@ -458,10 +526,14 @@ mod tests {
         assert!(events.is_empty());
         assert!(matches!(
             &ui[0],
-            DaemonToUi::Status(DaemonStatus { generation: 2, .. })
+            DaemonToUi::ConnectionEstablished { epoch: 1 }
         ));
         assert!(matches!(
             &ui[1],
+            DaemonToUi::Status(DaemonStatus { generation: 2, .. })
+        ));
+        assert!(matches!(
+            &ui[2],
             DaemonToUi::Profiles(profiles)
                 if profiles.len() == 1 && profiles[0].id == ProfileId::from("canonical")
         ));
@@ -481,6 +553,10 @@ mod tests {
         assert_eq!(sequences, vec![6, 7]);
         assert!(matches!(
             &ui[0],
+            DaemonToUi::ConnectionEstablished { epoch: 1 }
+        ));
+        assert!(matches!(
+            &ui[1],
             DaemonToUi::Status(DaemonStatus { generation: 2, .. })
         ));
     }
@@ -538,13 +614,22 @@ mod tests {
         });
         let client = DaemonClient::new(path);
         let (ui_sender, ui_receiver) = bounded(4);
+        let mut connection_epoch = 0;
 
-        let error =
-            establish_subscription_and_refresh(&client, &ui_sender, ConnectionPolicy::default())
-                .await
-                .unwrap_err();
+        let error = establish_subscription_and_refresh(
+            &client,
+            &ui_sender,
+            ConnectionPolicy::default(),
+            &mut connection_epoch,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.code, "CONFIG_SNAPSHOT_FAILED");
+        assert!(matches!(
+            ui_receiver.recv().await.unwrap(),
+            DaemonToUi::ConnectionEstablished { epoch: 1 }
+        ));
         assert!(
             tokio::time::timeout(Duration::from_millis(50), ui_receiver.recv())
                 .await
