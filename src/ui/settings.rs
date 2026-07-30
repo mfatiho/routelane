@@ -3,7 +3,9 @@ use std::rc::Rc;
 
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
-use routelane::domain::{InterfaceSelector, Lane, LaneFailurePolicy, LaneId, Profile, RuleAction};
+use routelane::domain::{
+    canonical_lane_name, InterfaceSelector, Lane, LaneFailurePolicy, LaneId, Profile, RuleAction,
+};
 
 use crate::config::Language;
 use crate::ui::i18n::Texts;
@@ -14,21 +16,14 @@ pub fn add_lane(
     interface: &str,
     failure_policy: LaneFailurePolicy,
 ) -> anyhow::Result<LaneId> {
-    let name = name.trim();
+    let name =
+        canonical_lane_name(profile, None, name).map_err(|error| anyhow::anyhow!("{error:?}"))?;
     let interface = interface.trim();
-    anyhow::ensure!(!name.is_empty(), "lane name must not be empty");
     anyhow::ensure!(!interface.is_empty(), "lane interface must not be empty");
-    anyhow::ensure!(
-        !profile
-            .lanes
-            .iter()
-            .any(|lane| lane.name.trim().eq_ignore_ascii_case(name)),
-        "lane name already exists"
-    );
     let id = LaneId::from(format!("lane-{}", uuid::Uuid::new_v4()).as_str());
     profile.lanes.push(Lane {
         id: id.clone(),
-        name: name.to_owned(),
+        name,
         interface: InterfaceSelector::from(interface),
         fallback_lane: None,
         failure_policy,
@@ -37,21 +32,14 @@ pub fn add_lane(
 }
 
 pub fn rename_lane(profile: &mut Profile, lane_id: &LaneId, name: &str) -> anyhow::Result<()> {
-    let name = name.trim();
-    anyhow::ensure!(!name.is_empty(), "lane name must not be empty");
-    anyhow::ensure!(
-        !profile
-            .lanes
-            .iter()
-            .any(|lane| &lane.id != lane_id && lane.name.trim().eq_ignore_ascii_case(name)),
-        "lane name already exists"
-    );
+    let name = canonical_lane_name(profile, Some(lane_id), name)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     let lane = profile
         .lanes
         .iter_mut()
         .find(|lane| &lane.id == lane_id)
         .ok_or_else(|| anyhow::anyhow!("lane not found"))?;
-    lane.name = name.to_owned();
+    lane.name = name;
     Ok(())
 }
 
@@ -144,34 +132,44 @@ pub fn build_settings_dialog(
         let group = group.clone();
         let profile = profile.clone();
         let interfaces = interfaces.clone();
+        let add_row = add.clone();
         button.connect_clicked(move |_| {
             let Some(interface_name) = interfaces.get(interface.selected() as usize) else {
+                add_row.set_subtitle("Select a network interface");
                 return;
             };
             let failure_policy = policy_from_index(policy.selected());
-            let lane = {
+            let lane_result = {
                 let mut profile = profile.borrow_mut();
-                let Ok(id) = add_lane(
+                add_lane(
                     &mut profile,
                     name.text().as_str(),
                     interface_name,
                     failure_policy,
-                ) else {
-                    return;
-                };
-                profile.lanes.iter().find(|lane| lane.id == id).cloned()
+                )
+                .map(|id| profile.lanes.iter().find(|lane| lane.id == id).cloned())
             };
-            if let Some(lane) = lane {
-                add_lane_editor(
-                    &group,
-                    &lane,
-                    &interfaces,
-                    profile.clone(),
-                    on_change.clone(),
-                    texts,
-                );
-                name.set_text("");
-                on_change();
+            match lane_result {
+                Ok(Some(lane)) => {
+                    add_row.set_subtitle("");
+                    name.remove_css_class("error");
+                    add_lane_editor(
+                        &group,
+                        &lane,
+                        &interfaces,
+                        profile.clone(),
+                        on_change.clone(),
+                        texts,
+                    );
+                    name.set_text("");
+                    on_change();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    add_row.set_subtitle(&error.to_string());
+                    name.add_css_class("error");
+                    name.set_text("");
+                }
             }
         });
     }
@@ -243,13 +241,48 @@ fn add_lane_editor(
         let lane_id = lane.id.clone();
         let profile = profile.clone();
         let on_change = on_change.clone();
+        let row = row.clone();
+        let resetting = Rc::new(std::cell::Cell::new(false));
         name.connect_changed(move |entry| {
-            let changed = {
+            if resetting.get() {
+                return;
+            }
+            let result = {
                 let mut profile = profile.borrow_mut();
-                rename_lane(&mut profile, &lane_id, entry.text().as_str()).is_ok()
+                rename_lane(&mut profile, &lane_id, entry.text().as_str()).map(|()| {
+                    profile
+                        .lanes
+                        .iter()
+                        .find(|lane| lane.id == lane_id)
+                        .map(|lane| lane.name.clone())
+                        .unwrap_or_default()
+                })
             };
-            if changed {
-                on_change();
+            match result {
+                Ok(canonical) => {
+                    row.set_subtitle("");
+                    entry.remove_css_class("error");
+                    if entry.text().as_str() != canonical {
+                        resetting.set(true);
+                        entry.set_text(&canonical);
+                        resetting.set(false);
+                    }
+                    on_change();
+                }
+                Err(error) => {
+                    let canonical = profile
+                        .borrow()
+                        .lanes
+                        .iter()
+                        .find(|lane| lane.id == lane_id)
+                        .map(|lane| lane.name.clone())
+                        .unwrap_or_default();
+                    row.set_subtitle(&error.to_string());
+                    entry.add_css_class("error");
+                    resetting.set(true);
+                    entry.set_text(&canonical);
+                    resetting.set(false);
+                }
             }
         });
     }
@@ -387,5 +420,7 @@ mod tests {
         assert_eq!(profile.lanes[0].name, "Work");
         assert!(add_lane(&mut profile, "work", "tun1", LaneFailurePolicy::Inactive).is_err());
         assert!(rename_lane(&mut profile, &first, "  ").is_err());
+        assert!(add_lane(&mut profile, "Wörk", "tun1", LaneFailurePolicy::Inactive).is_ok());
+        assert!(add_lane(&mut profile, "wÖRK", "tun2", LaneFailurePolicy::Inactive).is_err());
     }
 }

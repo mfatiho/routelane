@@ -82,6 +82,43 @@ pub fn configuration_error_view(detail: impl Into<String>) -> ConnectionHealthVi
     }
 }
 
+fn health_sections(
+    config_error: Option<&str>,
+    daemon: ConnectionHealthView,
+) -> (Option<ConnectionHealthView>, ConnectionHealthView) {
+    (config_error.map(configuration_error_view), daemon)
+}
+
+fn reconcile_profiles(
+    document: &mut crate::config::ConfigV2,
+    selected: &mut Profile,
+    mut canonical: Vec<Profile>,
+) {
+    if canonical.is_empty() {
+        return;
+    }
+    canonical.sort_by(|left, right| left.id.cmp(&right.id));
+    let previous_selected_id = selected.id.clone();
+    let selection = canonical
+        .iter()
+        .find(|profile| profile.id == selected.id)
+        .cloned()
+        .unwrap_or_else(|| canonical[0].clone());
+    for profile in canonical {
+        store_profile(document, profile);
+    }
+    if selection.id != previous_selected_id {
+        document
+            .profiles
+            .retain(|profile| profile.id != previous_selected_id);
+    }
+    *selected = selection;
+}
+
+fn switch_state_after_persistence_failure(applied_profile_id: Option<&ProfileId>) -> bool {
+    applied_profile_id.is_some()
+}
+
 fn status_is_active(status: &DaemonStatus) -> bool {
     status.applied_profile_id.is_some()
 }
@@ -139,18 +176,36 @@ pub fn build_window(
         .build();
     let updating_switch = Rc::new(Cell::new(false));
     let routing_active = Rc::new(Cell::new(false));
+    let last_applied_profile_id = Rc::new(RefCell::new(None::<ProfileId>));
     let settings = gtk::Button::builder()
         .icon_name("preferences-system-symbolic")
         .tooltip_text(texts.settings_title)
         .build();
     settings.add_css_class("flat");
     let editable = load_error.is_none();
+    let config_writable = Rc::new(Cell::new(editable));
     active.set_sensitive(editable);
     settings.set_sensitive(editable);
     header.pack_end(&settings);
     header.pack_end(&active);
 
     let page = adw::PreferencesPage::new();
+    let config_error_group = adw::PreferencesGroup::builder()
+        .title("Configuration")
+        .build();
+    let config_error_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let config_error_row = adw::ActionRow::new();
+    config_error_row.set_child(Some(&config_error_content));
+    config_error_group.add(&config_error_row);
+    let (initial_config_error, initial_daemon_health) = health_sections(
+        load_error.as_deref(),
+        health_view(&HealthReport::inactive(), None),
+    );
+    config_error_group.set_visible(initial_config_error.is_some());
+    if let Some(error) = initial_config_error {
+        render_health(&config_error_content, &error, texts);
+    }
+    page.add(&config_error_group);
     let health_group = adw::PreferencesGroup::builder()
         .title(texts.health_title)
         .build();
@@ -158,11 +213,7 @@ pub fn build_window(
     let health_row = adw::ActionRow::new();
     health_row.set_child(Some(&health_content));
     health_group.add(&health_row);
-    let initial_health = load_error
-        .as_ref()
-        .map(configuration_error_view)
-        .unwrap_or_else(|| health_view(&HealthReport::inactive(), None));
-    render_health(&health_content, &initial_health, texts);
+    render_health(&health_content, &initial_daemon_health, texts);
     page.add(&health_group);
 
     let rules_group = adw::PreferencesGroup::builder()
@@ -242,8 +293,12 @@ pub fn build_window(
         let pending = pending_actions.clone();
         let sender = sender.clone();
         let toast_overlay = toast_overlay.clone();
-        let health_content = health_content.clone();
+        let config_error_content = config_error_content.clone();
+        let config_error_group = config_error_group.clone();
         let active = active.clone();
+        let updating_switch = updating_switch.clone();
+        let last_applied_profile_id = last_applied_profile_id.clone();
+        let config_writable = config_writable.clone();
         let settings = settings.clone();
         let add = add.clone();
         let rules_group = rules_group.clone();
@@ -260,13 +315,29 @@ pub fn build_window(
                         }
                     }
                     Err(error) => {
+                        config_writable.set(false);
+                        let restored_active = switch_state_after_persistence_failure(
+                            last_applied_profile_id.borrow().as_ref(),
+                        );
+                        updating_switch.set(true);
+                        active.set_active(restored_active);
+                        updating_switch.set(false);
                         active.set_sensitive(false);
                         settings.set_sensitive(false);
                         add.set_sensitive(false);
                         rules_group.set_sensitive(false);
-                        render_health(&health_content, &configuration_error_view(&error), texts);
+                        config_error_group.set_visible(true);
+                        render_health(
+                            &config_error_content,
+                            &configuration_error_view(&error),
+                            texts,
+                        );
                         toast_overlay
                             .add_toast(&adw::Toast::builder().title(&error).timeout(7).build());
+                        sender
+                            .send(UiToDaemon::Request(DaemonRequest::GetStatus))
+                            .await
+                            .ok();
                     }
                 }
             }
@@ -411,13 +482,18 @@ pub fn build_window(
         let health_content = health_content.clone();
         let profile = profile.clone();
         let rule_list = rule_list.clone();
+        let document = document.clone();
+        let persist_document = persist_document.clone();
+        let last_applied_profile_id = last_applied_profile_id.clone();
+        let config_writable = config_writable.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = receiver.recv().await {
                 match event {
                     DaemonToUi::Status(status) => {
                         let is_active = status_is_active(&status);
+                        *last_applied_profile_id.borrow_mut() = status.applied_profile_id.clone();
                         routing_active.set(is_active);
-                        active.set_sensitive(editable);
+                        active.set_sensitive(config_writable.get());
                         updating_switch.set(true);
                         active.set_active(is_active);
                         updating_switch.set(false);
@@ -490,7 +566,7 @@ pub fn build_window(
                     }
                     DaemonToUi::Deactivated => {
                         routing_active.set(false);
-                        active.set_sensitive(editable);
+                        active.set_sensitive(config_writable.get());
                         updating_switch.set(true);
                         active.set_active(false);
                         updating_switch.set(false);
@@ -502,8 +578,13 @@ pub fn build_window(
                     }
                     DaemonToUi::Profiles(profiles) => {
                         log::debug!("daemon returned {} profile(s)", profiles.len());
-                        if let Some(canonical) = profiles.into_iter().next() {
-                            *profile.borrow_mut() = canonical;
+                        if !profiles.is_empty() {
+                            {
+                                let mut document = document.borrow_mut();
+                                let mut selected = profile.borrow_mut();
+                                reconcile_profiles(&mut document, &mut selected, profiles);
+                            }
+                            persist_document(PostSaveAction::None);
                             rebuild_rule_rows(&rule_list);
                         }
                     }
@@ -730,8 +811,9 @@ fn refreshed_interface_selection(previous_name: Option<&str>, names: &[String]) 
 #[cfg(test)]
 mod tests {
     use super::{
-        configuration_error_view, daemon_unavailable_view, health_view,
-        refreshed_interface_selection, status_is_active,
+        configuration_error_view, daemon_unavailable_view, health_sections, health_view,
+        reconcile_profiles, refreshed_interface_selection, status_is_active,
+        switch_state_after_persistence_failure,
     };
     use routelane::domain::{HealthState, LaneId, ProfileId};
     use routelane::health::{
@@ -811,5 +893,72 @@ mod tests {
         };
 
         assert!(status_is_active(&status));
+    }
+
+    #[test]
+    fn configuration_error_remains_visible_after_daemon_status() {
+        let daemon = health_view(&HealthReport::inactive(), Some(9));
+        let (config, daemon) = health_sections(Some("invalid JSON"), daemon);
+
+        assert_eq!(config.unwrap().aggregate, "ConfigurationError");
+        assert_eq!(daemon.aggregate, "Inactive");
+    }
+
+    #[test]
+    fn canonical_profile_survives_a_later_language_save() {
+        let old = super::empty_default_profile();
+        let mut canonical = old.clone();
+        canonical.name = "Daemon canonical".to_owned();
+        let mut document = crate::config::ConfigV2 {
+            profiles: vec![old.clone()],
+            ..Default::default()
+        };
+        let mut selected = old;
+
+        reconcile_profiles(&mut document, &mut selected, vec![canonical.clone()]);
+        document.language = crate::config::Language::En;
+
+        assert_eq!(selected, canonical);
+        assert_eq!(document.profiles[0], canonical);
+    }
+
+    #[test]
+    fn profile_reconciliation_prefers_matching_id_then_deterministic_lowest_id() {
+        let mut selected = super::empty_default_profile();
+        selected.id = ProfileId::from("selected");
+        let mut matching = selected.clone();
+        matching.name = "Matching".to_owned();
+        let mut alpha = selected.clone();
+        alpha.id = ProfileId::from("alpha");
+        alpha.name = "Alpha".to_owned();
+        let mut document = crate::config::ConfigV2::default();
+
+        reconcile_profiles(
+            &mut document,
+            &mut selected,
+            vec![alpha.clone(), matching.clone()],
+        );
+        assert_eq!(selected, matching);
+
+        selected.id = ProfileId::from("missing");
+        document.profiles.push(selected.clone());
+        reconcile_profiles(&mut document, &mut selected, vec![matching, alpha.clone()]);
+        assert_eq!(selected, alpha);
+        assert!(!document
+            .profiles
+            .iter()
+            .any(|profile| profile.id == ProfileId::from("missing")));
+
+        let unchanged = selected.clone();
+        reconcile_profiles(&mut document, &mut selected, vec![]);
+        assert_eq!(selected, unchanged);
+    }
+
+    #[test]
+    fn failed_persistence_restores_switch_from_last_daemon_status() {
+        assert!(!switch_state_after_persistence_failure(None));
+        assert!(switch_state_after_persistence_failure(Some(
+            &ProfileId::from("applied")
+        )));
     }
 }

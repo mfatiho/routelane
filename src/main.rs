@@ -78,7 +78,7 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
     };
     let client = DaemonClient::new(path);
 
-    if let Err(first_error) = request_status(&client, &to_ui, policy).await {
+    if let Err(first_error) = refresh_daemon_state(&client, &to_ui, policy).await {
         if let Err(activation_error) = activate_user_daemon(policy).await {
             let _ = to_ui
                 .send(DaemonToUi::DaemonUnavailable(format!(
@@ -146,7 +146,7 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
                     std::future::pending::<()>().await;
                 }
             } => {
-                match request_status(&client, &to_ui, policy).await {
+                match refresh_daemon_state(&client, &to_ui, policy).await {
                     Ok(()) => match subscribe_with_timeout(&client, policy).await {
                         Ok(events) => {
                             subscription = Some(events);
@@ -192,6 +192,36 @@ async fn request_status(
     }
 }
 
+async fn request_profiles(
+    client: &DaemonClient,
+    sender: &Sender<DaemonToUi>,
+    policy: ConnectionPolicy,
+) -> Result<(), IpcError> {
+    let response = send_with_timeout(client, DaemonRequest::ListProfiles, policy).await?;
+    if let Some(error) = response.error {
+        return Err(error);
+    }
+    match response.result {
+        Some(DaemonResult::Profiles(profiles)) => {
+            let _ = sender.send(DaemonToUi::Profiles(profiles)).await;
+            Ok(())
+        }
+        _ => Err(IpcError::new(
+            "IPC_INVALID_RESPONSE",
+            "profile request returned an unexpected response",
+        )),
+    }
+}
+
+async fn refresh_daemon_state(
+    client: &DaemonClient,
+    sender: &Sender<DaemonToUi>,
+    policy: ConnectionPolicy,
+) -> Result<(), IpcError> {
+    request_status(client, sender, policy).await?;
+    request_profiles(client, sender, policy).await
+}
+
 async fn wait_for_daemon(
     client: &DaemonClient,
     sender: &Sender<DaemonToUi>,
@@ -199,7 +229,7 @@ async fn wait_for_daemon(
 ) -> Result<(), IpcError> {
     let mut last_error = IpcError::new("IPC_CONNECT_FAILED", "daemon did not create its socket");
     for attempt in 0..6 {
-        match request_status(client, sender, policy).await {
+        match refresh_daemon_state(client, sender, policy).await {
             Ok(()) => return Ok(()),
             Err(error) => last_error = error,
         }
