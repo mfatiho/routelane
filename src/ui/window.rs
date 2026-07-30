@@ -69,14 +69,17 @@ pub fn daemon_unavailable_view(detail: impl Into<String>) -> ConnectionHealthVie
     }
 }
 
-pub fn configuration_error_view(detail: impl Into<String>) -> ConnectionHealthView {
+pub fn configuration_error_view(
+    detail: impl Into<String>,
+    texts: crate::ui::i18n::Texts,
+) -> ConnectionHealthView {
     ConnectionHealthView {
         aggregate: "ConfigurationError".to_owned(),
         apply_generation: None,
         lanes: Vec::new(),
         diagnostics: vec![HealthDiagnosticView {
-            summary: "RouteLane configuration could not be loaded".to_owned(),
-            action: Some("Fix file ownership, permissions, or JSON before editing".to_owned()),
+            summary: texts.configuration_error_summary.to_owned(),
+            action: Some(texts.configuration_error_action.to_owned()),
             technical_detail: detail.into(),
         }],
     }
@@ -85,8 +88,12 @@ pub fn configuration_error_view(detail: impl Into<String>) -> ConnectionHealthVi
 fn health_sections(
     config_error: Option<&str>,
     daemon: ConnectionHealthView,
+    texts: crate::ui::i18n::Texts,
 ) -> (Option<ConnectionHealthView>, ConnectionHealthView) {
-    (config_error.map(configuration_error_view), daemon)
+    (
+        config_error.map(|error| configuration_error_view(error, texts)),
+        daemon,
+    )
 }
 
 fn reconcile_profiles(
@@ -191,7 +198,7 @@ pub fn build_window(
 
     let page = adw::PreferencesPage::new();
     let config_error_group = adw::PreferencesGroup::builder()
-        .title("Configuration")
+        .title(texts.configuration_title)
         .build();
     let config_error_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let config_error_row = adw::ActionRow::new();
@@ -200,6 +207,7 @@ pub fn build_window(
     let (initial_config_error, initial_daemon_health) = health_sections(
         load_error.as_deref(),
         health_view(&HealthReport::inactive(), None),
+        texts,
     );
     config_error_group.set_visible(initial_config_error.is_some());
     if let Some(error) = initial_config_error {
@@ -329,7 +337,7 @@ pub fn build_window(
                         config_error_group.set_visible(true);
                         render_health(
                             &config_error_content,
-                            &configuration_error_view(&error),
+                            &configuration_error_view(&error, texts),
                             texts,
                         );
                         toast_overlay
@@ -877,7 +885,10 @@ mod tests {
 
     #[test]
     fn configuration_failure_is_visible_and_not_presented_as_an_empty_config() {
-        let view = configuration_error_view("configuration is not owned by the current user");
+        let view = configuration_error_view(
+            "configuration is not owned by the current user",
+            crate::config::Language::En.texts(),
+        );
         assert_eq!(view.aggregate, "ConfigurationError");
         assert!(view.diagnostics[0].technical_detail.contains("not owned"));
     }
@@ -898,10 +909,28 @@ mod tests {
     #[test]
     fn configuration_error_remains_visible_after_daemon_status() {
         let daemon = health_view(&HealthReport::inactive(), Some(9));
-        let (config, daemon) = health_sections(Some("invalid JSON"), daemon);
+        let (config, daemon) = health_sections(
+            Some("invalid JSON"),
+            daemon,
+            crate::config::Language::En.texts(),
+        );
 
         assert_eq!(config.unwrap().aggregate, "ConfigurationError");
         assert_eq!(daemon.aggregate, "Inactive");
+    }
+
+    #[test]
+    fn configuration_validation_summary_is_localized() {
+        let view = configuration_error_view("ayrıntı", crate::config::Language::Tr.texts());
+
+        assert_eq!(
+            view.diagnostics[0].summary,
+            "RouteLane yapılandırması yüklenemedi"
+        );
+        assert_eq!(
+            view.diagnostics[0].action.as_deref(),
+            Some("Düzenlemeden önce dosya sahipliğini, izinleri veya JSON içeriğini düzeltin")
+        );
     }
 
     #[test]

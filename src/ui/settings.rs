@@ -4,7 +4,8 @@ use std::rc::Rc;
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
 use routelane::domain::{
-    canonical_lane_name, InterfaceSelector, Lane, LaneFailurePolicy, LaneId, Profile, RuleAction,
+    canonical_lane_name, DomainError, InterfaceSelector, Lane, LaneFailurePolicy, LaneId, Profile,
+    RuleAction,
 };
 
 use crate::config::Language;
@@ -15,11 +16,12 @@ pub fn add_lane(
     name: &str,
     interface: &str,
     failure_policy: LaneFailurePolicy,
-) -> anyhow::Result<LaneId> {
-    let name =
-        canonical_lane_name(profile, None, name).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+) -> Result<LaneId, LaneEditError> {
+    let name = canonical_lane_name(profile, None, name).map_err(LaneEditError::from)?;
     let interface = interface.trim();
-    anyhow::ensure!(!interface.is_empty(), "lane interface must not be empty");
+    if interface.is_empty() {
+        return Err(LaneEditError::EmptyInterface);
+    }
     let id = LaneId::from(format!("lane-{}", uuid::Uuid::new_v4()).as_str());
     profile.lanes.push(Lane {
         id: id.clone(),
@@ -31,16 +33,46 @@ pub fn add_lane(
     Ok(id)
 }
 
-pub fn rename_lane(profile: &mut Profile, lane_id: &LaneId, name: &str) -> anyhow::Result<()> {
-    let name = canonical_lane_name(profile, Some(lane_id), name)
-        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+pub fn rename_lane(
+    profile: &mut Profile,
+    lane_id: &LaneId,
+    name: &str,
+) -> Result<(), LaneEditError> {
+    let name = canonical_lane_name(profile, Some(lane_id), name).map_err(LaneEditError::from)?;
     let lane = profile
         .lanes
         .iter_mut()
         .find(|lane| &lane.id == lane_id)
-        .ok_or_else(|| anyhow::anyhow!("lane not found"))?;
+        .ok_or(LaneEditError::NotFound)?;
     lane.name = name;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneEditError {
+    EmptyName,
+    DuplicateName,
+    EmptyInterface,
+    NotFound,
+}
+
+impl From<DomainError> for LaneEditError {
+    fn from(error: DomainError) -> Self {
+        match error {
+            DomainError::EmptyLaneName(_) => Self::EmptyName,
+            DomainError::DuplicateLaneName(_) => Self::DuplicateName,
+            _ => Self::NotFound,
+        }
+    }
+}
+
+fn lane_edit_error_text(error: LaneEditError, texts: Texts) -> &'static str {
+    match error {
+        LaneEditError::EmptyName => texts.lane_name_empty,
+        LaneEditError::DuplicateName => texts.lane_name_duplicate,
+        LaneEditError::EmptyInterface => texts.lane_interface_empty,
+        LaneEditError::NotFound => texts.lane_not_found,
+    }
 }
 
 fn set_lane_interface(profile: &mut Profile, lane_id: &LaneId, interface: &str) -> bool {
@@ -135,7 +167,7 @@ pub fn build_settings_dialog(
         let add_row = add.clone();
         button.connect_clicked(move |_| {
             let Some(interface_name) = interfaces.get(interface.selected() as usize) else {
-                add_row.set_subtitle("Select a network interface");
+                add_row.set_subtitle(texts.select_interface);
                 return;
             };
             let failure_policy = policy_from_index(policy.selected());
@@ -166,7 +198,7 @@ pub fn build_settings_dialog(
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    add_row.set_subtitle(&error.to_string());
+                    add_row.set_subtitle(lane_edit_error_text(error, texts));
                     name.add_css_class("error");
                     name.set_text("");
                 }
@@ -277,7 +309,7 @@ fn add_lane_editor(
                         .find(|lane| lane.id == lane_id)
                         .map(|lane| lane.name.clone())
                         .unwrap_or_default();
-                    row.set_subtitle(&error.to_string());
+                    row.set_subtitle(lane_edit_error_text(error, texts));
                     entry.add_css_class("error");
                     resetting.set(true);
                     entry.set_text(&canonical);
@@ -366,7 +398,7 @@ fn system_interfaces() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{add_lane, delete_lane, rename_lane};
+    use super::{add_lane, delete_lane, lane_edit_error_text, rename_lane, LaneEditError};
     use routelane::domain::{
         InterfaceSelector, LaneFailurePolicy, Profile, ProfileId, Rule, RuleAction, RuleId,
         RuleSource, RuleTarget,
@@ -422,5 +454,23 @@ mod tests {
         assert!(rename_lane(&mut profile, &first, "  ").is_err());
         assert!(add_lane(&mut profile, "Wörk", "tun1", LaneFailurePolicy::Inactive).is_ok());
         assert!(add_lane(&mut profile, "wÖRK", "tun2", LaneFailurePolicy::Inactive).is_err());
+    }
+
+    #[test]
+    fn lane_validation_messages_follow_the_selected_language() {
+        assert_eq!(
+            lane_edit_error_text(
+                LaneEditError::DuplicateName,
+                crate::config::Language::Tr.texts(),
+            ),
+            "Rota adı benzersiz olmalıdır"
+        );
+        assert_eq!(
+            lane_edit_error_text(
+                LaneEditError::EmptyInterface,
+                crate::config::Language::En.texts(),
+            ),
+            "Lane interface must not be empty"
+        );
     }
 }

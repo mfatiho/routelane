@@ -4,11 +4,12 @@ use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +34,8 @@ const O_NOFOLLOW: i32 = 0o400000;
 const MAX_LANES: usize = 100;
 const MAX_RULES: usize = 10_000;
 const ROUTING_CRASH_MODEL_VERSION: &str = "exact-command-prefix-v2";
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, PartialEq, Eq)]
 struct CommandInvocation<'a> {
@@ -109,40 +112,144 @@ pub struct ProcessCommandExecutor;
 impl CommandExecutor for ProcessCommandExecutor {
     fn execute(&mut self, spec: &CommandSpec) -> Result<CommandOutput, RunnerError> {
         let invocation = command_invocation(spec)?;
-        let mut command = Command::new(invocation.program);
-        command
-            .args(&invocation.args)
-            .stdin(if invocation.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        execute_invocation_with_timeout(&invocation, COMMAND_TIMEOUT)
+    }
+}
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| RunnerError::new(format!("failed to start typed command: {error}")))?;
-        if let Some(input) = invocation.stdin {
+fn execute_invocation_with_timeout(
+    invocation: &CommandInvocation<'_>,
+    timeout: Duration,
+) -> Result<CommandOutput, RunnerError> {
+    let mut command = Command::new(invocation.program);
+    command
+        .args(&invocation.args)
+        .process_group(0)
+        .stdin(if invocation.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| RunnerError::new(format!("failed to start typed command: {error}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RunnerError::new("typed command stdout pipe is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| RunnerError::new("typed command stderr pipe is unavailable"))?;
+    let stdin = if invocation.stdin.is_some() {
+        Some(
             child
                 .stdin
-                .as_mut()
-                .ok_or_else(|| RunnerError::new("typed command stdin pipe is unavailable"))?
-                .write_all(input)
-                .map_err(|error| {
-                    RunnerError::new(format!("failed to write typed command stdin: {error}"))
-                })?;
-        }
-        let output = child.wait_with_output().map_err(|error| {
-            RunnerError::new(format!("failed to wait for typed command: {error}"))
-        })?;
+                .take()
+                .ok_or_else(|| RunnerError::new("typed command stdin pipe is unavailable"))?,
+        )
+    } else {
+        None
+    };
 
+    std::thread::scope(|scope| {
+        let stdout_reader = scope.spawn(move || {
+            let mut output = Vec::new();
+            let mut stdout = stdout;
+            stdout.read_to_end(&mut output).map(|_| output)
+        });
+        let stderr_reader = scope.spawn(move || {
+            let mut output = Vec::new();
+            let mut stderr = stderr;
+            stderr.read_to_end(&mut output).map(|_| output)
+        });
+        let stdin_writer = stdin.zip(invocation.stdin).map(|(mut stdin, input)| {
+            scope.spawn(move || {
+                stdin.write_all(input)?;
+                drop(stdin);
+                Ok::<(), std::io::Error>(())
+            })
+        });
+
+        let started = Instant::now();
+        let mut completed_status = None;
+        let (status, timed_out) = loop {
+            if completed_status.is_none() {
+                completed_status = child.try_wait().map_err(|error| {
+                    RunnerError::new(format!("failed to poll typed command: {error}"))
+                })?;
+            }
+            let stdin_finished = stdin_writer
+                .as_ref()
+                .is_none_or(std::thread::ScopedJoinHandle::is_finished);
+            if let Some(status) = completed_status {
+                if stdin_finished && stdout_reader.is_finished() && stderr_reader.is_finished() {
+                    break (status, false);
+                }
+            }
+            if started.elapsed() >= timeout {
+                let process_group = i32::try_from(child.id()).map_err(|_| {
+                    RunnerError::new("typed command process ID exceeds the supported range")
+                })?;
+                let kill_result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+                if kill_result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(RunnerError::new(format!(
+                            "failed to terminate timed out command group: {error}"
+                        )));
+                    }
+                }
+                let status = match completed_status {
+                    Some(status) => status,
+                    None => child.wait().map_err(|error| {
+                        RunnerError::new(format!("failed to reap timed out command: {error}"))
+                    })?,
+                };
+                break (status, true);
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            std::thread::sleep(COMMAND_WAIT_POLL_INTERVAL.min(remaining));
+        };
+
+        let stdin_result = stdin_writer
+            .map(|writer| {
+                writer
+                    .join()
+                    .map_err(|_| RunnerError::new("typed command stdin writer panicked"))?
+                    .map_err(|error| {
+                        RunnerError::new(format!("failed to write typed command stdin: {error}"))
+                    })
+            })
+            .transpose();
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| RunnerError::new("typed command stdout reader panicked"))?
+            .map_err(|error| {
+                RunnerError::new(format!("failed to read typed command stdout: {error}"))
+            })?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| RunnerError::new("typed command stderr reader panicked"))?
+            .map_err(|error| {
+                RunnerError::new(format!("failed to read typed command stderr: {error}"))
+            })?;
+
+        if timed_out {
+            return Err(RunnerError::new(format!(
+                "typed command timed out after {} ms",
+                timeout.as_millis()
+            )));
+        }
+        stdin_result?;
         Ok(CommandOutput {
-            success: output.status.success(),
-            stdout: output.stdout,
-            stderr: output.stderr,
+            success: status.success(),
+            stdout,
+            stderr,
         })
-    }
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,7 +516,15 @@ fn ensure_root_owned_directory(path: &Path) -> Result<(), PrivilegedError> {
 }
 
 fn validate_root_owned_file(metadata: &fs::Metadata) -> Result<(), PrivilegedError> {
-    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+    validate_root_owned_file_attributes(metadata.is_file(), metadata.uid(), metadata.mode() & 0o777)
+}
+
+fn validate_root_owned_file_attributes(
+    is_file: bool,
+    uid: u32,
+    mode: u32,
+) -> Result<(), PrivilegedError> {
+    if !is_file || uid != 0 || mode != 0o600 {
         return Err(state_error(
             "persisted state must be a root-owned, non-symlink 0600 file",
         ));
@@ -3143,18 +3258,18 @@ impl std::error::Error for ServiceError {}
 
 pub struct PrivilegedService<A, B> {
     authorizer: A,
-    backend: Mutex<B>,
+    backend: Arc<Mutex<B>>,
 }
 
 impl<A, B> PrivilegedService<A, B>
 where
     A: Authorizer,
-    B: PrivilegedBackend,
+    B: PrivilegedBackend + 'static,
 {
     pub fn new(authorizer: A, backend: B) -> Self {
         Self {
             authorizer,
-            backend: Mutex::new(backend),
+            backend: Arc::new(Mutex::new(backend)),
         }
     }
 
@@ -3177,20 +3292,12 @@ where
             .map_err(|error| ServiceError::InvalidPlanJson(error.to_string()))?;
         validate_privileged_plan(&plan).map_err(ServiceError::Validation)?;
 
-        self.backend
-            .lock()
-            .map_err(|_| ServiceError::StatePoisoned)?
-            .apply(&plan)
-            .map_err(|error| ServiceError::Backend(error.to_string()))
+        self.run_backend(move |backend| backend.apply(&plan)).await
     }
 
     pub async fn inspect(&self, sender: Option<&str>) -> Result<InspectResponse, ServiceError> {
         self.authorize(sender).await?;
-        self.backend
-            .lock()
-            .map_err(|_| ServiceError::StatePoisoned)?
-            .inspect()
-            .map_err(|error| ServiceError::Backend(error.to_string()))
+        self.run_backend(PrivilegedBackend::inspect).await
     }
 
     pub async fn restore_plan(
@@ -3202,20 +3309,13 @@ where
         self.authorize(sender).await?;
         let failed_candidate = decode_plan(failed_candidate_json)?;
         let previous = previous_json.map(decode_plan).transpose()?;
-        self.backend
-            .lock()
-            .map_err(|_| ServiceError::StatePoisoned)?
-            .restore(&failed_candidate, previous.as_ref())
-            .map_err(|error| ServiceError::Backend(error.to_string()))
+        self.run_backend(move |backend| backend.restore(&failed_candidate, previous.as_ref()))
+            .await
     }
 
     pub async fn cleanup(&self, sender: Option<&str>) -> Result<CleanupResponse, ServiceError> {
         self.authorize(sender).await?;
-        self.backend
-            .lock()
-            .map_err(|_| ServiceError::StatePoisoned)?
-            .cleanup()
-            .map_err(|error| ServiceError::Backend(error.to_string()))
+        self.run_backend(PrivilegedBackend::cleanup).await
     }
 
     async fn authorize<'a>(&self, sender: Option<&'a str>) -> Result<&'a str, ServiceError> {
@@ -3225,6 +3325,20 @@ where
             .await
             .map_err(ServiceError::Authorization)?;
         Ok(sender)
+    }
+
+    async fn run_backend<R, F>(&self, operation: F) -> Result<R, ServiceError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut B) -> Result<R, PrivilegedError> + Send + 'static,
+    {
+        let backend = Arc::clone(&self.backend);
+        tokio::task::spawn_blocking(move || {
+            let mut backend = backend.lock().map_err(|_| ServiceError::StatePoisoned)?;
+            operation(&mut backend).map_err(|error| ServiceError::Backend(error.to_string()))
+        })
+        .await
+        .map_err(|_| ServiceError::StatePoisoned)?
     }
 }
 
@@ -3245,17 +3359,19 @@ fn decode_plan(plan_json: &str) -> Result<KernelPlan, ServiceError> {
 mod tests {
     use std::future::{ready, Ready};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use crate::domain::{LaneFailurePolicy, LaneId, ProfileId, RuleId};
 
     use super::{
         authorization_result, build_pending_expectations, command_invocation,
-        render_guarded_ruleset, render_owned_ruleset, render_transaction_ruleset, run_nft_batch,
-        validate_privileged_plan, AppliedStateStore, ApplyResponse, AuthorizationError, Authorizer,
-        CleanupResponse, CommandExecutor, CommandOutput, CommandPrivilegedBackend, InspectResponse,
-        PrivilegedBackend, PrivilegedError, PrivilegedService, RestoreReceipt, RestoreResponse,
-        ServiceError, StoredAppliedState, ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES,
-        NFT_BINARY,
+        execute_invocation_with_timeout, render_guarded_ruleset, render_owned_ruleset,
+        render_transaction_ruleset, run_nft_batch, validate_privileged_plan,
+        validate_root_owned_file_attributes, AppliedStateStore, ApplyResponse, AuthorizationError,
+        Authorizer, CleanupResponse, CommandExecutor, CommandInvocation, CommandOutput,
+        CommandPrivilegedBackend, InspectResponse, PrivilegedBackend, PrivilegedError,
+        PrivilegedService, RestoreReceipt, RestoreResponse, ServiceError, StoredAppliedState,
+        ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES, NFT_BINARY,
     };
     use crate::backend::{
         CommandSpec, CompiledAction, CompiledRule, CompiledTarget, IpFamily, KernelPlan,
@@ -3484,6 +3600,56 @@ mod tests {
             stdin: None,
         };
         assert!(command_invocation(&nft_with_family).is_err());
+    }
+
+    #[test]
+    fn persisted_state_load_requires_exact_0600_mode() {
+        assert!(validate_root_owned_file_attributes(true, 0, 0o600).is_ok());
+
+        for mode in [0o400, 0o200, 0o640, 0o660, 0o700] {
+            assert!(
+                validate_root_owned_file_attributes(true, 0, mode).is_err(),
+                "mode {mode:o} must not be accepted for persisted state"
+            );
+        }
+    }
+
+    #[test]
+    fn process_commands_are_killed_after_a_bounded_timeout() {
+        let invocation = CommandInvocation {
+            program: "/bin/sleep",
+            args: vec!["5"],
+            stdin: None,
+        };
+        let started = Instant::now();
+
+        let error =
+            execute_invocation_with_timeout(&invocation, Duration::from_millis(50)).unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timed out command was not terminated promptly"
+        );
+    }
+
+    #[test]
+    fn command_timeout_terminates_descendants_holding_output_pipes() {
+        let invocation = CommandInvocation {
+            program: "/bin/sh",
+            args: vec!["-c", "sleep 5"],
+            stdin: None,
+        };
+        let started = Instant::now();
+
+        let error =
+            execute_invocation_with_timeout(&invocation, Duration::from_millis(50)).unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a descendant kept command output pipes open after timeout"
+        );
     }
 
     #[test]
@@ -5460,6 +5626,34 @@ mod tests {
         }
     }
 
+    struct BlockingBackend;
+
+    impl PrivilegedBackend for BlockingBackend {
+        fn apply(&mut self, plan: &KernelPlan) -> Result<ApplyResponse, PrivilegedError> {
+            std::thread::sleep(Duration::from_millis(250));
+            Ok(ApplyResponse::from_plan(plan, vec![]))
+        }
+
+        fn restore(
+            &mut self,
+            _failed_candidate: &KernelPlan,
+            previous: Option<&KernelPlan>,
+        ) -> Result<RestoreResponse, PrivilegedError> {
+            Ok(RestoreResponse::from_plan(previous))
+        }
+
+        fn inspect(&mut self) -> Result<InspectResponse, PrivilegedError> {
+            Ok(InspectResponse::empty())
+        }
+
+        fn cleanup(&mut self) -> Result<CleanupResponse, PrivilegedError> {
+            Ok(CleanupResponse {
+                cleaned: true,
+                diagnostics: vec![],
+            })
+        }
+    }
+
     fn fixture_service(
         authorization: Result<(), AuthorizationError>,
     ) -> (
@@ -5560,6 +5754,32 @@ mod tests {
         );
         assert_eq!(json["diagnostics"], serde_json::json!([]));
         assert_eq!(*events.lock().unwrap(), vec!["authorize", "apply"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_backend_work_does_not_block_the_async_runtime() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let service = PrivilegedService::new(
+            FakeAuthorizer {
+                result: Ok(()),
+                events,
+            },
+            BlockingBackend,
+        );
+        let plan = serde_json::to_string(&fixture_valid_plan()).unwrap();
+        let started = Instant::now();
+
+        let (response, timer_elapsed) =
+            tokio::join!(service.apply_plan(Some(":1.42"), &plan), async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                started.elapsed()
+            });
+
+        response.unwrap();
+        assert!(
+            timer_elapsed < Duration::from_millis(100),
+            "async runtime was blocked for {timer_elapsed:?}"
+        );
     }
 
     #[tokio::test]

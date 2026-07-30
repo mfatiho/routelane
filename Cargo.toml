@@ -2,6 +2,7 @@
 name = "routelane"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-only"
 
 [lib]
 name = "routelane"
@@ -22,6 +23,10 @@ path = "src/bin/routelane_helper.rs"
 [[bin]]
 name = "routelane-daemon"
 path = "src/bin/routelane_daemon.rs"
+
+[[bin]]
+name = "routelanectl"
+path = "src/bin/routelanectl.rs"
 
 [[test]]
 name = "root"

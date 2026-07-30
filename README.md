@@ -1,202 +1,182 @@
 # RouteLane
 
-RouteLane is a Linux desktop application for policy-based routing. It routes selected domains, IP addresses, or CIDR ranges through a chosen network interface while leaving the rest of the system traffic on the default route.
+RouteLane is a Linux desktop application for policy-based multi-lane routing.
+It can route selected domains, IP addresses, or CIDR ranges through different
+network interfaces while leaving unmatched traffic on the normal system route.
 
-Example use case: route ChatGPT or OpenAI traffic through a VPN interface such as `tun0`, while regular browsing continues through your normal connection.
+Phase 1 includes:
 
-## Features
+- GTK4/Libadwaita multi-lane profile management
+- `Route`, `Direct`, and independently enabled/disabled `Block` rules
+- IPv4 and IPv6 policy routing with nftables marking
+- a per-user daemon and versioned Unix-socket IPC
+- a small system D-Bus helper authorized by Polkit
+- kernel-derived Connection Health reports
+- transactional apply, rollback, ownership checks, and conflict diagnostics
 
-- GTK4 and Libadwaita desktop interface
-- Domain, IP address, and CIDR routing rules
-- Per-rule target interface selection
-- Privileged network changes handled by `routelane-helper` through Polkit
-- Kernel routing rules are removed when routing is disabled or the app exits
-- Configuration is saved to `~/.config/routelane/config.json`
-- Ubuntu `.deb` package build script
+## Architecture and security boundary
 
-## How It Works
-
-RouteLane keeps the GUI unprivileged. The desktop app stores rules, resolves domain targets, and sends routing operations to the privileged helper only when kernel routing changes are required.
+The GUI and `routelanectl` are unprivileged clients. They talk only to the
+per-user daemon. The daemon compiles and validates profiles, then asks the
+system helper to inspect or mutate the reserved RouteLane kernel resources.
 
 ```text
-GTK / Libadwaita UI
+GTK UI / routelanectl
         |
-        | routing commands
+        | versioned user Unix socket (0600)
         v
-Tokio routing engine
+routelane-daemon
         |
-        | pkexec
+        | system D-Bus + Polkit action io.github.routelane.apply
         v
-routelane-helper (root)
+routelane-helper (root, D-Bus activated)
         |
-        v
-ip rule / ip route
+        +-- nftables table inet routelane
+        +-- routing tables 20000..20099
+        +-- rule priorities 10000..10099
+        +-- marks 0x524c0001..0x524c0064
 ```
 
-Routing has two main states:
+The helper accepts typed plans rather than arbitrary commands. Before every
+mutation it validates limits, exact resource ownership, generation, plan hash,
+and live kernel state. A failed replacement is rolled back to the previous
+generation. State journals are private root-owned files under `/run/routelane`.
+The helper is activated through system D-Bus; it has no enable/install target
+and is not intended to be started directly.
 
-| State | Kernel routing state | Behavior |
-| --- | --- | --- |
-| Off | Empty | Rules are kept in the app configuration only. |
-| On | Active | Rules are applied to the kernel through `routelane-helper`. |
+RouteLane does not use an external “what is my IP” service for health checks.
+Connection Health compares the desired plan with lossless local interface,
+route, rule, nftables, ownership, and conflict evidence.
 
-## Requirements
-
-Runtime requirements on Ubuntu or a compatible distribution:
-
-- `libgtk-4-1`
-- `libadwaita-1-0`
-- `policykit-1`
-- `iproute2`
+## Build
 
 Build requirements:
 
-- Rust stable toolchain with `cargo`
-- `libgtk-4-dev`
-- `libadwaita-1-dev`
-- `dpkg-deb` for `.deb` package builds
-
-Install build dependencies on Ubuntu:
+- Rust stable
+- GTK4 and Libadwaita development packages
+- `dpkg-deb` only when producing the development `.deb`
 
 ```bash
-sudo apt install cargo libgtk-4-dev libadwaita-1-dev dpkg-dev
-```
-
-## Install from a .deb Package
-
-The preferred local install path is the generated `.deb` package.
-
-```bash
-./packaging/deb/build-deb.sh
-sudo apt install ./dist/routelane_0.1.0_amd64.deb
-```
-
-The package installs:
-
-| Source | Installed path |
-| --- | --- |
-| `routelane` | `/usr/bin/routelane` |
-| `routelane-helper` | `/usr/lib/routelane/routelane-helper` |
-| `data/io.github.routelane.desktop` | `/usr/share/applications/io.github.routelane.desktop` |
-| `data/io.github.routelane.policy` | `/usr/share/polkit-1/actions/io.github.routelane.policy` |
-
-After installation, start RouteLane from the application launcher or run:
-
-```bash
-routelane
-```
-
-## Build from Source
-
-```bash
-git clone <repo-url>
-cd routelane
 cargo build --release --bins
 ```
 
-Build outputs:
+The four binaries are:
 
-| Binary | Path |
+| Binary | Purpose |
 | --- | --- |
-| GUI application | `target/release/routelane` |
-| Privileged helper | `target/release/routelane-helper` |
+| `routelane` | GTK desktop application |
+| `routelane-daemon` | per-user routing daemon |
+| `routelanectl` | minimal Phase 1 command-line client |
+| `routelane-helper` | privileged system D-Bus helper |
 
-Manual installation from a source build:
-
-```bash
-sudo install -d -m 0755 /usr/lib/routelane
-sudo install -m 0755 target/release/routelane-helper /usr/lib/routelane/routelane-helper
-sudo install -m 0755 target/release/routelane /usr/bin/routelane
-sudo install -m 0644 data/io.github.routelane.desktop /usr/share/applications/io.github.routelane.desktop
-sudo install -m 0644 data/io.github.routelane.policy /usr/share/polkit-1/actions/io.github.routelane.policy
-```
-
-## Development Run
-
-For local development, build both binaries and point the GUI to the development helper with `ROUTELANE_HELPER`:
+## Development `.deb`
 
 ```bash
-cargo build --bins
-ROUTELANE_HELPER=./target/debug/routelane-helper cargo run --bin routelane
+./packaging/deb/build-deb.sh
 ```
 
-The Polkit policy must still be installed before `routelane-helper` can run through `pkexec`.
+The script builds in a private temporary root, creates a uniquely named
+artifact under `dist/`, and verifies required paths, modes, and root ownership.
+Its runtime dependencies include `nftables`, `iproute2`, `policykit-1`, `dbus`,
+and `systemd`, in addition to GTK/Libadwaita.
 
-## Usage
+This `.deb` is a Phase 1 development-verification artifact. Producing it does
+not by itself establish official Ubuntu, Debian, or Fedora release support, and
+it is not an RPM validation result.
 
-1. Start RouteLane.
-2. Select the network interface that should carry routed traffic, for example `tun0`, `wg0`, or `wlan0`.
-3. Add a domain, IP address, or CIDR target such as `chatgpt.com`, `8.8.8.8`, or `203.0.113.0/24`.
-4. Turn routing on. Polkit may ask for administrator authentication.
-5. Turn routing off or close the app to remove the active kernel routing rules.
+Installed integration files:
 
-Saved rules are restored when the app starts again. Routing starts disabled; the user must enable it manually.
+| Path | Purpose |
+| --- | --- |
+| `/usr/bin/routelane` | GTK client |
+| `/usr/bin/routelane-daemon` | user daemon |
+| `/usr/bin/routelanectl` | CLI client |
+| `/usr/lib/routelane/routelane-helper` | fixed, root-managed helper path |
+| `/usr/lib/systemd/user/routelane-daemon.service` | user service |
+| `/usr/lib/systemd/system/routelane-helper.service` | D-Bus-activated system service |
+| `/usr/share/dbus-1/system-services/io.github.routelane.Helper.service` | D-Bus activation |
+| `/usr/share/polkit-1/actions/io.github.routelane.policy` | Polkit policy |
 
-## Configuration
+## Phase 1 usage
 
-RouteLane stores its configuration at:
+The GUI starts the user daemon through its normal desktop integration. For
+manual testing:
 
-```text
-~/.config/routelane/config.json
+```bash
+systemctl --user start routelane-daemon.service
+routelanectl status
+routelanectl status --json
+routelanectl apply-profile ./profile.json
+routelanectl deactivate
 ```
 
-Example:
+`routelanectl` uses the same canonical daemon IPC client as the GUI. Its Phase
+1 surface is intentionally limited to the commands above.
+
+A direct `apply-profile` input is one validated profile:
 
 ```json
 {
-  "alt_interface": "tun0",
-  "rules": [
-    { "target_str": "chatgpt.com", "is_domain": true, "interface": "tun0" },
-    { "target_str": "8.8.8.8", "is_domain": false, "interface": "tun0" }
-  ]
+  "id": "work",
+  "name": "Work",
+  "enabled": true,
+  "lanes": [
+    {
+      "id": "vpn",
+      "name": "VPN",
+      "interface": "wg0",
+      "fallback_lane": null,
+      "failure_policy": "Inactive"
+    }
+  ],
+  "rules": []
 }
 ```
 
-## Security Model
+The desktop configuration is schema version 2 and is stored at
+`~/.config/routelane/config.json`. Stored profiles are inactive on load; a user
+must explicitly apply one.
 
-- The `routelane` GUI does not run as root.
-- Privileged operations are isolated in `routelane-helper`.
-- The helper is launched through `pkexec` and authorized by `/usr/share/polkit-1/actions/io.github.routelane.policy`.
-- The installed helper path is `/usr/lib/routelane/routelane-helper`.
-- Helper input is validated before any `ip rule` or `ip route` command is executed.
-- RouteLane uses routing table `100` and rule priorities in the `10000` to `10999` range.
-- Kernel routing rules are removed when routing is disabled or the app exits.
+## Official first-release support gate
 
-## CDN and Domain Routing Limitations
+The first official RouteLane release will not be published until every cell in
+this matrix is green in CI and release validation:
 
-Domain rules are resolved to IP addresses before kernel routing rules are applied. This approach works for stable DNS answers, but it has limits with CDN-backed services.
+| Distribution | Versions | Architectures |
+| --- | --- | --- |
+| Ubuntu | 22.04, 24.04, 26.04 | x86_64, aarch64 |
+| Debian | 12, 13 | x86_64, aarch64 |
+| Fedora | 43, 44 | x86_64, aarch64 |
 
-Domains such as `chatgpt.com` can return different IP addresses across DNS requests, locations, or time. When that happens, traffic may use an IP address that was not present when the route was applied. For long-running or high-accuracy domain routing, a DNS-integrated design such as `dnsmasq` plus `ipset` and packet marking is more reliable. The experimental backend for that direction lives in `src/routing/dns_router.rs`.
+All three distribution families are in official support scope from the first
+release. A package-format check on only one family is not enough to open the
+release gate. Kernel namespace integration, package installation, systemd user
+activation, system D-Bus activation, Polkit authorization, GTK launch, and
+rollback/health scenarios must pass for every listed distribution and
+architecture.
 
-## Project Layout
+## Testing
 
-```text
-src/
-  main.rs                  Application entry point
-  config.rs                JSON configuration persistence
-  models.rs                Shared data types and channel messages
-  routing/
-    mod.rs                 Routing engine loop
-    manager.rs             Routing state manager
-    executor.rs            pkexec / routelane-helper execution
-    resolver.rs            Async DNS resolution
-    dns_router.rs          Experimental dnsmasq/ipset backend
-  ui/
-    window.rs              Main window
-    rule_row.rs            Rule row widget
-    settings.rs            Settings UI
-    tray.rs                Tray integration
-    i18n.rs                UI text helpers
-  bin/
-    routelane_helper.rs    Privileged helper binary
-data/
-  io.github.routelane.desktop
-  io.github.routelane.policy
-packaging/
-  deb/
-    build-deb.sh           Local Debian package builder
+Rootless checks:
+
+```bash
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --release --bins
+./packaging/deb/build-deb.sh
 ```
+
+Root namespace integration is separate:
+
+```bash
+./scripts/run-root-integration.sh
+```
+
+Exit 77 means the environment cannot run the root namespace suite. It is a
+skip, not a pass, and must be reported as **NOT VERIFIED**.
 
 ## License
 
-MIT
+RouteLane is licensed under the GNU General Public License version 3 only
+(`GPL-3.0-only`). See `LICENSE`.

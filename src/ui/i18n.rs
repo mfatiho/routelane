@@ -35,6 +35,14 @@ pub struct Texts {
     pub rule_enabled: &'static str,
     pub rule_priority: &'static str,
     pub technical_details: &'static str,
+    pub configuration_title: &'static str,
+    pub configuration_error_summary: &'static str,
+    pub configuration_error_action: &'static str,
+    pub select_interface: &'static str,
+    pub lane_name_empty: &'static str,
+    pub lane_name_duplicate: &'static str,
+    pub lane_not_found: &'static str,
+    pub lane_interface_empty: &'static str,
 }
 
 impl Language {
@@ -74,6 +82,15 @@ impl Language {
                 rule_enabled: "Kural aktif",
                 rule_priority: "Öncelik",
                 technical_details: "Teknik ayrıntılar",
+                configuration_title: "Yapılandırma",
+                configuration_error_summary: "RouteLane yapılandırması yüklenemedi",
+                configuration_error_action:
+                    "Düzenlemeden önce dosya sahipliğini, izinleri veya JSON içeriğini düzeltin",
+                select_interface: "Bir ağ arayüzü seçin",
+                lane_name_empty: "Rota adı boş olamaz",
+                lane_name_duplicate: "Rota adı benzersiz olmalıdır",
+                lane_not_found: "Rota bulunamadı",
+                lane_interface_empty: "Rota ağ arayüzü boş olamaz",
             },
             Self::En => Texts {
                 inactive: "Routing disabled",
@@ -109,6 +126,15 @@ impl Language {
                 rule_enabled: "Rule enabled",
                 rule_priority: "Priority",
                 technical_details: "Technical details",
+                configuration_title: "Configuration",
+                configuration_error_summary: "RouteLane configuration could not be loaded",
+                configuration_error_action:
+                    "Fix file ownership, permissions, or JSON before editing",
+                select_interface: "Select a network interface",
+                lane_name_empty: "Lane name must not be empty",
+                lane_name_duplicate: "Lane name must be unique",
+                lane_not_found: "Lane was not found",
+                lane_interface_empty: "Lane interface must not be empty",
             },
         }
     }
