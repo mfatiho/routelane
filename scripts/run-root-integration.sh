@@ -8,6 +8,7 @@ PING=/usr/bin/ping
 SYSCTL=/usr/sbin/sysctl
 REGISTRY=
 TOKEN=
+REGISTRY_UID=0
 
 cleanup() {
     [ -n "$REGISTRY" ] || return 0
@@ -16,7 +17,7 @@ cleanup() {
         *) return 0 ;;
     esac
     [ -f "$REGISTRY" ] && [ ! -L "$REGISTRY" ] || return 0
-    [ "$(/usr/bin/stat -c '%u:%a' "$REGISTRY" 2>/dev/null)" = "0:600" ] || return 0
+    [ "$(/usr/bin/stat -c '%u:%a' "$REGISTRY" 2>/dev/null)" = "$REGISTRY_UID:600" ] || return 0
 
     while IFS=' ' read -r kind name extra; do
         [ -z "${extra:-}" ] || continue
@@ -39,28 +40,52 @@ skip() {
     exit 77
 }
 
-trap cleanup EXIT HUP INT TERM
+on_signal() {
+    status=$1
+    cleanup
+    exit "$status"
+}
+
+initialize_registry() {
+    REGISTRY=$(/usr/bin/mktemp /tmp/routelane-test-registry.XXXXXX) ||
+        skip "could not create an exclusive root integration registry"
+    TOKEN=${REGISTRY##*.}
+    case "$TOKEN" in
+        ??????) ;;
+        *) echo "ERROR: invalid root integration token" >&2; exit 1 ;;
+    esac
+    case "$TOKEN" in
+        *[!A-Za-z0-9]*) echo "ERROR: unsafe root integration token" >&2; exit 1 ;;
+    esac
+    chmod 0600 "$REGISTRY"
+    export ROUTELANE_TEST_REGISTRY="$REGISTRY"
+    export ROUTELANE_TEST_TOKEN="$TOKEN"
+}
+
+trap cleanup EXIT
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+
+if [ "${ROUTELANE_SHELL_SIGNAL_TEST:-}" = "1" ]; then
+    REGISTRY_UID=$(id -u)
+    initialize_registry
+    echo "READY $REGISTRY"
+    while :; do
+        /usr/bin/sleep 1
+    done
+    echo "SENTINEL"
+    exit 0
+fi
 
 [ "$(id -u)" -eq 0 ] || skip "root network integration requires UID 0"
 command -v cargo >/dev/null 2>&1 || skip "cargo is unavailable"
 
-for binary in "$IP" "$NFT" "$PING" "$SYSCTL" /usr/bin/mktemp /usr/bin/stat /usr/bin/rm; do
+for binary in "$IP" "$NFT" "$PING" "$SYSCTL" /usr/bin/mktemp /usr/bin/stat /usr/bin/rm /usr/bin/sleep; do
     [ -x "$binary" ] || skip "required executable is unavailable: $binary"
 done
 
-REGISTRY=$(/usr/bin/mktemp /tmp/routelane-test-registry.XXXXXX) ||
-    skip "could not create an exclusive root integration registry"
-TOKEN=${REGISTRY##*.}
-case "$TOKEN" in
-    ??????) ;;
-    *) echo "ERROR: invalid root integration token" >&2; exit 1 ;;
-esac
-case "$TOKEN" in
-    *[!A-Za-z0-9]*) echo "ERROR: unsafe root integration token" >&2; exit 1 ;;
-esac
-chmod 0600 "$REGISTRY"
-export ROUTELANE_TEST_REGISTRY="$REGISTRY"
-export ROUTELANE_TEST_TOKEN="$TOKEN"
+initialize_registry
 
 PREFLIGHT_NS="routelane-test-$TOKEN-preflight"
 PREFLIGHT_LEFT="rl${TOKEN}pa"
