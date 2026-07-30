@@ -340,11 +340,13 @@ where
             state.generation = plan.generation;
             state.health = health.clone();
             state.last_error = None;
+            let sequence = advance_event_sequence(&mut state);
+            let _ = self.events.send(DaemonEvent::StateChanged {
+                sequence,
+                generation: plan.generation,
+                health,
+            });
         }
-        let _ = self.events.send(DaemonEvent::StateChanged {
-            generation: plan.generation,
-            health,
-        });
         Ok(result)
     }
 
@@ -382,24 +384,26 @@ where
             self.record_failure(error.clone()).await;
             return Err(error);
         }
-        let generation = {
+        {
             let mut state = self.state.lock().await;
             state.applied = None;
             state.applied_profile = None;
             state.health = HealthReport::inactive();
             state.last_error = None;
-            state.generation
-        };
-        let _ = self.events.send(DaemonEvent::StateChanged {
-            generation,
-            health: HealthReport::inactive(),
-        });
+            let generation = state.generation;
+            let sequence = advance_event_sequence(&mut state);
+            let _ = self.events.send(DaemonEvent::StateChanged {
+                sequence,
+                generation,
+                health: HealthReport::inactive(),
+            });
+        }
         Ok(())
     }
 
     async fn record_failure(&self, error: DaemonError) {
         let ipc_error = IpcError::from(error.clone());
-        let (generation, health) = {
+        {
             let mut state = self.state.lock().await;
             let health_state = if error.code == "DAEMON_NEEDS_AUTHORIZATION" {
                 HealthState::NeedsAuthorization
@@ -411,18 +415,20 @@ where
             let health = HealthReport::from_parts(health_state, Default::default(), vec![]);
             state.health = health.clone();
             state.last_error = Some(ipc_error.clone());
-            (state.generation, health)
-        };
-        let _ = self.events.send(DaemonEvent::OperationFailed {
-            generation,
-            health,
-            error: ipc_error,
-        });
+            let generation = state.generation;
+            let sequence = advance_event_sequence(&mut state);
+            let _ = self.events.send(DaemonEvent::OperationFailed {
+                sequence,
+                generation,
+                health,
+                error: ipc_error,
+            });
+        }
     }
 
     async fn record_rolled_back_failure(&self, error: DaemonError) {
         let ipc_error = IpcError::from(error.clone());
-        let (generation, health) = {
+        {
             let mut state = self.state.lock().await;
             let health_state = if error.code == "DAEMON_NEEDS_AUTHORIZATION" {
                 HealthState::NeedsAuthorization
@@ -443,13 +449,15 @@ where
             );
             state.health = health.clone();
             state.last_error = Some(ipc_error.clone());
-            (state.generation, health)
-        };
-        let _ = self.events.send(DaemonEvent::OperationFailed {
-            generation,
-            health,
-            error: ipc_error,
-        });
+            let generation = state.generation;
+            let sequence = advance_event_sequence(&mut state);
+            let _ = self.events.send(DaemonEvent::OperationFailed {
+                sequence,
+                generation,
+                health,
+                error: ipc_error,
+            });
+        }
     }
 
     async fn restore_failed_candidate(
@@ -483,7 +491,7 @@ where
 
     async fn record_kernel_restore_failure(&self, error: DaemonError) {
         let ipc_error = IpcError::from(error);
-        let (generation, health) = {
+        {
             let mut state = self.state.lock().await;
             let health = HealthReport::failure(
                 HealthState::Failed,
@@ -497,18 +505,20 @@ where
             );
             state.health = health.clone();
             state.last_error = Some(ipc_error.clone());
-            (state.generation, health)
-        };
-        let _ = self.events.send(DaemonEvent::OperationFailed {
-            generation,
-            health,
-            error: ipc_error,
-        });
+            let generation = state.generation;
+            let sequence = advance_event_sequence(&mut state);
+            let _ = self.events.send(DaemonEvent::OperationFailed {
+                sequence,
+                generation,
+                health,
+                error: ipc_error,
+            });
+        }
     }
 
     async fn record_verification_failure(&self, error: DaemonError, mut report: HealthReport) {
         let ipc_error = IpcError::from(error);
-        let (generation, health) = {
+        {
             let mut state = self.state.lock().await;
             let health_state = if state.applied.is_some() {
                 HealthState::Degraded
@@ -533,13 +543,15 @@ where
             report = HealthReport::from_parts(report.state, report.lanes, report.diagnostics);
             state.health = report.clone();
             state.last_error = Some(ipc_error.clone());
-            (state.generation, report)
-        };
-        let _ = self.events.send(DaemonEvent::OperationFailed {
-            generation,
-            health,
-            error: ipc_error,
-        });
+            let generation = state.generation;
+            let sequence = advance_event_sequence(&mut state);
+            let _ = self.events.send(DaemonEvent::OperationFailed {
+                sequence,
+                generation,
+                health: report,
+                error: ipc_error,
+            });
+        }
     }
 
     async fn inspect_plan_health(
@@ -599,6 +611,14 @@ where
         status.health = health;
         status
     }
+}
+
+fn advance_event_sequence(state: &mut DaemonState) -> u64 {
+    state.event_sequence = state
+        .event_sequence
+        .checked_add(1)
+        .expect("daemon event sequence exhausted");
+    state.event_sequence
 }
 
 #[derive(Debug, Clone, Default)]

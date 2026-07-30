@@ -9,6 +9,7 @@ pub struct DaemonState {
     pub applied: Option<AppliedKernelState>,
     pub applied_profile: Option<Profile>,
     pub generation: u64,
+    pub event_sequence: u64,
     pub health: HealthReport,
     pub last_error: Option<IpcError>,
 }
@@ -20,6 +21,7 @@ impl DaemonState {
             applied: None,
             applied_profile: None,
             generation: 0,
+            event_sequence: 0,
             health: HealthReport::inactive(),
             last_error: None,
         }
@@ -28,6 +30,7 @@ impl DaemonState {
     pub fn status(&self) -> DaemonStatus {
         DaemonStatus {
             generation: self.generation,
+            event_sequence: self.event_sequence,
             health: self.health.clone(),
             desired_profile_id: self.desired.as_ref().map(|profile| profile.id.clone()),
             applied_profile_id: self

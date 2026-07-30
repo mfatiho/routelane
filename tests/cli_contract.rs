@@ -50,6 +50,7 @@ async fn serve_once(
 fn inactive_status() -> DaemonStatus {
     DaemonStatus {
         generation: 7,
+        event_sequence: 0,
         health: HealthReport::inactive(),
         desired_profile_id: None,
         applied_profile_id: None,
@@ -60,6 +61,7 @@ fn inactive_status() -> DaemonStatus {
 fn applied_status() -> DaemonStatus {
     DaemonStatus {
         generation: 7,
+        event_sequence: 4,
         health: HealthReport::from_parts(HealthState::Healthy, Default::default(), vec![]),
         desired_profile_id: Some("work".into()),
         applied_profile_id: Some("work".into()),
@@ -141,6 +143,7 @@ async fn status_json_is_machine_readable_and_keeps_stderr_empty() {
     assert!(output.stderr.is_empty());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["generation"], 7);
+    assert_eq!(value["event_sequence"], 0);
     assert_eq!(value["health"]["state"], "Inactive");
 }
 

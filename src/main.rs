@@ -1,7 +1,6 @@
 mod models;
 mod ui;
 
-use std::collections::VecDeque;
 use std::time::Duration;
 
 use async_channel::{bounded, Receiver, Sender};
@@ -23,15 +22,19 @@ struct ConnectionPolicy {
 #[derive(Debug)]
 struct EventSubscription {
     receiver: tokio::sync::mpsc::Receiver<routelane::ipc::DaemonEvent>,
-    buffered: VecDeque<routelane::ipc::DaemonEvent>,
+    minimum_sequence: u64,
 }
 
 impl EventSubscription {
     async fn recv(&mut self) -> Option<routelane::ipc::DaemonEvent> {
-        match self.buffered.pop_front() {
-            Some(event) => Some(event),
-            None => self.receiver.recv().await,
+        while let Some(event) = self.receiver.recv().await {
+            let sequence = daemon_event_sequence(&event);
+            if sequence > self.minimum_sequence {
+                self.minimum_sequence = sequence;
+                return Some(event);
+            }
         }
+        None
     }
 }
 
@@ -224,13 +227,14 @@ async fn refresh_daemon_state(
     client: &DaemonClient,
     sender: &Sender<DaemonToUi>,
     policy: ConnectionPolicy,
-) -> Result<u64, IpcError> {
+) -> Result<(u64, u64), IpcError> {
     let status = request_status(client, policy).await?;
     let profiles = request_profiles(client, policy).await?;
     let generation = status.generation;
+    let event_sequence = status.event_sequence;
     let _ = sender.send(DaemonToUi::Status(status)).await;
     let _ = sender.send(DaemonToUi::Profiles(profiles)).await;
-    Ok(generation)
+    Ok((generation, event_sequence))
 }
 
 async fn establish_subscription_and_refresh(
@@ -238,16 +242,12 @@ async fn establish_subscription_and_refresh(
     sender: &Sender<DaemonToUi>,
     policy: ConnectionPolicy,
 ) -> Result<EventSubscription, IpcError> {
-    let mut receiver = subscribe_with_timeout(client, policy).await?;
-    let snapshot_generation = refresh_daemon_state(client, sender, policy).await?;
-    tokio::task::yield_now().await;
-    let mut buffered = VecDeque::new();
-    while let Ok(event) = receiver.try_recv() {
-        if daemon_event_generation(&event) > snapshot_generation {
-            buffered.push_back(event);
-        }
-    }
-    Ok(EventSubscription { receiver, buffered })
+    let receiver = subscribe_with_timeout(client, policy).await?;
+    let (_, minimum_sequence) = refresh_daemon_state(client, sender, policy).await?;
+    Ok(EventSubscription {
+        receiver,
+        minimum_sequence,
+    })
 }
 
 async fn wait_for_daemon(
@@ -266,10 +266,10 @@ async fn wait_for_daemon(
     Err(last_error)
 }
 
-fn daemon_event_generation(event: &routelane::ipc::DaemonEvent) -> u64 {
+fn daemon_event_sequence(event: &routelane::ipc::DaemonEvent) -> u64 {
     match event {
-        routelane::ipc::DaemonEvent::StateChanged { generation, .. }
-        | routelane::ipc::DaemonEvent::OperationFailed { generation, .. } => *generation,
+        routelane::ipc::DaemonEvent::StateChanged { sequence, .. }
+        | routelane::ipc::DaemonEvent::OperationFailed { sequence, .. } => *sequence,
     }
 }
 
@@ -351,8 +351,8 @@ mod tests {
     use tokio::net::UnixListener;
 
     async fn run_snapshot_scenario(
-        event_generation: u64,
-    ) -> (Option<DaemonEvent>, Vec<DaemonToUi>, Vec<DaemonRequest>) {
+        event_sequences: Vec<u64>,
+    ) -> (Vec<DaemonEvent>, Vec<DaemonToUi>, Vec<DaemonRequest>) {
         let runtime = TempDir::new().unwrap();
         let path = runtime.path().join("daemon.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -367,6 +367,7 @@ mod tests {
                     DaemonRequest::Subscribe => DaemonResult::Subscribed,
                     DaemonRequest::GetStatus => DaemonResult::Status(DaemonStatus {
                         generation: 2,
+                        event_sequence: 5,
                         health: HealthReport::inactive(),
                         desired_profile_id: None,
                         applied_profile_id: None,
@@ -388,16 +389,20 @@ mod tests {
                 .await
                 .unwrap();
                 if matches!(envelope.request, DaemonRequest::Subscribe) {
-                    write_frame(
-                        &mut stream,
-                        &DaemonEvent::StateChanged {
-                            generation: event_generation,
-                            health: HealthReport::applying(),
-                        },
-                    )
-                    .await
-                    .unwrap();
                     subscription = Some(stream);
+                } else if matches!(envelope.request, DaemonRequest::ListProfiles) {
+                    for &sequence in &event_sequences {
+                        write_frame(
+                            subscription.as_mut().unwrap(),
+                            &DaemonEvent::StateChanged {
+                                generation: 2,
+                                sequence,
+                                health: HealthReport::applying(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
                 }
             }
             drop(subscription);
@@ -408,10 +413,14 @@ mod tests {
             establish_subscription_and_refresh(&client, &ui_sender, ConnectionPolicy::default())
                 .await
                 .unwrap();
-        let event = tokio::time::timeout(Duration::from_millis(100), events.recv())
-            .await
-            .ok()
-            .flatten();
+        let mut delivered = Vec::new();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while let Some(event) = events.recv().await {
+                delivered.push(event);
+            }
+        })
+        .await
+        .unwrap();
         let ui = vec![
             ui_receiver.recv().await.unwrap(),
             ui_receiver.recv().await.unwrap(),
@@ -421,7 +430,7 @@ mod tests {
             order_receiver.recv().await.unwrap(),
             order_receiver.recv().await.unwrap(),
         ];
-        (event, ui, order)
+        (delivered, ui, order)
     }
 
     #[test]
@@ -436,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_event_not_newer_than_snapshot_is_discarded() {
-        let (event, ui, order) = run_snapshot_scenario(1).await;
+        let (events, ui, order) = run_snapshot_scenario(vec![5]).await;
 
         assert_eq!(
             order,
@@ -446,7 +455,7 @@ mod tests {
                 DaemonRequest::ListProfiles,
             ]
         );
-        assert_eq!(event, None);
+        assert!(events.is_empty());
         assert!(matches!(
             &ui[0],
             DaemonToUi::Status(DaemonStatus { generation: 2, .. })
@@ -460,12 +469,16 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_event_newer_than_snapshot_is_delivered() {
-        let (event, ui, _) = run_snapshot_scenario(3).await;
+        let (events, ui, _) = run_snapshot_scenario(vec![5, 6, 6, 4, 7]).await;
 
-        assert!(matches!(
-            event,
-            Some(DaemonEvent::StateChanged { generation: 3, .. })
-        ));
+        let sequences = events
+            .iter()
+            .map(|event| match event {
+                DaemonEvent::StateChanged { sequence, .. }
+                | DaemonEvent::OperationFailed { sequence, .. } => *sequence,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![6, 7]);
         assert!(matches!(
             &ui[0],
             DaemonToUi::Status(DaemonStatus { generation: 2, .. })
@@ -490,6 +503,7 @@ mod tests {
                         envelope.request_id,
                         DaemonResult::Status(DaemonStatus {
                             generation: 2,
+                            event_sequence: 5,
                             health: HealthReport::inactive(),
                             desired_profile_id: None,
                             applied_profile_id: None,
@@ -511,6 +525,7 @@ mod tests {
                         &mut stream,
                         &DaemonEvent::StateChanged {
                             generation: 1,
+                            sequence: 5,
                             health: HealthReport::applying(),
                         },
                     )
