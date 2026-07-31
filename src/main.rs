@@ -74,6 +74,15 @@ fn main() {
     {
         let ui_sender = ui_sender.clone();
         app.connect_activate(move |app| {
+            if matches!(
+                ui::experience::activation_action(app.active_window().is_some()),
+                ui::experience::ActivationAction::PresentExisting
+            ) {
+                if let Some(window) = app.active_window() {
+                    window.present();
+                    return;
+                }
+            }
             ui::window::build_window(app, ui_sender.clone(), daemon_receiver.clone());
         });
     }

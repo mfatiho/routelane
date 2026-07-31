@@ -7,11 +7,16 @@ use async_channel::{Receiver, Sender};
 use glib::signal::Inhibit;
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
-use routelane::domain::{Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource, RuleTarget};
+use routelane::domain::{
+    HealthState, Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource, RuleTarget,
+};
 use routelane::health::HealthReport;
 use routelane::ipc::{DaemonEvent, DaemonRequest, DaemonStatus};
 
 use crate::models::{DaemonToUi, UiToDaemon};
+use crate::ui::experience::{
+    dashboard_state, AuthorizationPresentation, DashboardState, PrimaryAction, SetupStep,
+};
 use crate::ui::i18n::LanguageTexts;
 use crate::ui::rule_row::{create_rule_row, set_rule_enabled_request, RuleEdit, RuleRowContext};
 use crate::ui::settings::build_settings_dialog;
@@ -129,6 +134,38 @@ fn switch_state_after_persistence_failure(applied_profile_id: Option<&ProfileId>
 
 fn status_is_active(status: &DaemonStatus) -> bool {
     status.applied_profile_id.is_some()
+}
+
+fn dashboard_copy(
+    texts: crate::ui::i18n::Texts,
+    state: DashboardState,
+) -> (&'static str, &'static str, &'static str) {
+    match (state.authorization, state.setup_step, state.primary_action) {
+        (AuthorizationPresentation::Waiting, _, _) => (
+            texts.authorization_waiting,
+            texts.authorization_waiting,
+            texts.retry_authorization,
+        ),
+        (AuthorizationPresentation::Denied, _, _) => (
+            texts.authorization_denied,
+            texts.authorization_denied,
+            texts.retry_authorization,
+        ),
+        (_, Some(SetupStep::AddLane), _) => {
+            (texts.inactive, texts.add_first_lane, texts.open_preferences)
+        }
+        (_, Some(SetupStep::AddRule), _) => (texts.inactive, texts.add_first_rule, texts.add_rule),
+        (_, None, PrimaryAction::DisableRouting) => (
+            texts.disable_routing,
+            texts.routing_active,
+            texts.disable_routing,
+        ),
+        _ => (
+            texts.enable_routing,
+            texts.routing_inactive,
+            texts.enable_routing,
+        ),
+    }
 }
 
 fn accept_connection_epoch(
@@ -256,6 +293,20 @@ pub fn build_window(
     header.pack_end(&active);
 
     let page = adw::PreferencesPage::new();
+    let initial_dashboard = dashboard_state(&profile.borrow(), HealthState::Inactive, false);
+    let (dashboard_title, dashboard_subtitle, dashboard_action) =
+        dashboard_copy(texts, initial_dashboard);
+    let dashboard_group = adw::PreferencesGroup::builder().title("RouteLane").build();
+    let dashboard_row = adw::ActionRow::builder()
+        .title(dashboard_title)
+        .subtitle(dashboard_subtitle)
+        .build();
+    let dashboard_primary = gtk::Button::with_label(dashboard_action);
+    dashboard_primary.add_css_class("suggested-action");
+    dashboard_primary.set_sensitive(initial_dashboard.primary_action_enabled);
+    dashboard_row.add_suffix(&dashboard_primary);
+    dashboard_group.add(&dashboard_row);
+    page.add(&dashboard_group);
     let config_error_group = adw::PreferencesGroup::builder()
         .title(texts.configuration_title)
         .build();
@@ -471,6 +522,45 @@ pub fn build_window(
         });
     }
     {
+        let profile = profile.clone();
+        let settings = settings.clone();
+        let target = target.clone();
+        let active = active.clone();
+        let routing_active = routing_active.clone();
+        let save_profile = save_profile.clone();
+        let sender = sender.clone();
+        dashboard_primary.connect_clicked(move |_| {
+            let state = dashboard_state(
+                &profile.borrow(),
+                if routing_active.get() {
+                    HealthState::Healthy
+                } else {
+                    HealthState::Inactive
+                },
+                false,
+            );
+            match state.primary_action {
+                PrimaryAction::OpenPreferences => settings.emit_clicked(),
+                PrimaryAction::OpenRuleDialog => {
+                    target.grab_focus();
+                }
+                PrimaryAction::EnableRouting => {
+                    save_profile(PostSaveAction::Request(apply_request(&profile.borrow())));
+                }
+                PrimaryAction::DisableRouting => {
+                    let sender = sender.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        sender
+                            .send(UiToDaemon::Request(DaemonRequest::Deactivate))
+                            .await
+                            .ok();
+                    });
+                }
+            }
+            active.grab_focus();
+        });
+    }
+    {
         let sender = sender.clone();
         let profile = profile.clone();
         let save_profile = save_profile.clone();
@@ -501,8 +591,15 @@ pub fn build_window(
         let target_for_add = target.clone();
         let add_rule = move || {
             let text = target_for_add.text().trim().to_owned();
-            let Some(target_value) = parse_target(&text) else {
-                return;
+            let target_value = match rule_dialog_submission(&text) {
+                RuleDialogSubmission::Invalid => {
+                    target_for_add.add_css_class("error");
+                    return;
+                }
+                RuleDialogSubmission::Valid(target) => {
+                    target_for_add.remove_css_class("error");
+                    target
+                }
             };
             let rule_action = match action.selected() {
                 1 => RuleAction::Direct,
@@ -548,6 +645,8 @@ pub fn build_window(
         let title = title.clone();
         let health_content = health_content.clone();
         let profile = profile.clone();
+        let dashboard_row = dashboard_row.clone();
+        let dashboard_primary = dashboard_primary.clone();
         let rule_list = rule_list.clone();
         let document = document.clone();
         let persist_document = persist_document.clone();
@@ -581,6 +680,14 @@ pub fn build_window(
                         active.set_active(is_active);
                         updating_switch.set(false);
                         title.set_subtitle(&format!("{:?}", status.health.state));
+                        let dashboard =
+                            dashboard_state(&profile.borrow(), status.health.state, false);
+                        let (dashboard_title, dashboard_subtitle, dashboard_action) =
+                            dashboard_copy(texts, dashboard);
+                        dashboard_row.set_title(dashboard_title);
+                        dashboard_row.set_subtitle(dashboard_subtitle);
+                        dashboard_primary.set_label(dashboard_action);
+                        dashboard_primary.set_sensitive(dashboard.primary_action_enabled);
                         render_health(
                             &health_content,
                             &health_view(&status.health, Some(status.generation)),
@@ -836,6 +943,18 @@ fn parse_target(value: &str) -> Option<RuleTarget> {
         .or_else(|| Some(RuleTarget::Domain(value.to_ascii_lowercase())))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuleDialogSubmission {
+    Invalid,
+    Valid(RuleTarget),
+}
+
+fn rule_dialog_submission(value: &str) -> RuleDialogSubmission {
+    parse_target(value)
+        .map(RuleDialogSubmission::Valid)
+        .unwrap_or(RuleDialogSubmission::Invalid)
+}
+
 fn render_health(container: &gtk::Box, view: &ConnectionHealthView, texts: crate::ui::i18n::Texts) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -911,12 +1030,12 @@ mod tests {
     use super::{
         accept_connection_epoch, accept_daemon_event_revision, accept_daemon_status_revision,
         configuration_error_view, daemon_unavailable_view, health_sections, health_view,
-        reconcile_profiles, refreshed_interface_selection, status_is_active,
-        switch_state_after_persistence_failure,
+        reconcile_profiles, refreshed_interface_selection, rule_dialog_submission,
+        status_is_active, switch_state_after_persistence_failure, RuleDialogSubmission,
     };
     use crate::ui::i18n::LanguageTexts;
     use routelane::config::ConfigV2;
-    use routelane::domain::{HealthState, LaneId, ProfileId};
+    use routelane::domain::{HealthState, LaneId, ProfileId, RuleTarget};
     use routelane::health::{
         Diagnostic, DiagnosticCode, DiagnosticSubject, HealthReport, LaneHealth, Severity,
         SuggestedAction,
@@ -927,6 +1046,19 @@ mod tests {
     fn clears_selection_when_previous_interface_disappears() {
         let names = ["wlan0".to_owned(), "tun0".to_owned()];
         assert_eq!(refreshed_interface_selection(Some("old-vpn"), &names), None);
+    }
+
+    #[test]
+    fn rule_dialog_requires_a_nonempty_target() {
+        assert_eq!(rule_dialog_submission("   "), RuleDialogSubmission::Invalid);
+    }
+
+    #[test]
+    fn rule_dialog_accepts_a_domain_target() {
+        assert_eq!(
+            rule_dialog_submission("Example.COM"),
+            RuleDialogSubmission::Valid(RuleTarget::Domain("example.com".to_owned()))
+        );
     }
 
     #[test]
