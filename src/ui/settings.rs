@@ -149,17 +149,24 @@ pub fn build_settings_dialog(
     let add = adw::ActionRow::builder().title(texts.add_lane).build();
     let name = gtk::Entry::builder()
         .placeholder_text(texts.lane_name)
+        .tooltip_text(texts.lane_name)
         .width_chars(12)
         .build();
     let interface_names = interfaces.iter().map(String::as_str).collect::<Vec<_>>();
     let interface_model = gtk::StringList::new(&interface_names);
-    let interface = gtk::DropDown::builder().model(&interface_model).build();
+    let interface = gtk::DropDown::builder()
+        .model(&interface_model)
+        .tooltip_text(texts.select_interface)
+        .build();
     let policies = gtk::StringList::new(&[
         texts.failure_block,
         texts.failure_direct,
         texts.failure_inactive,
     ]);
-    let policy = gtk::DropDown::builder().model(&policies).build();
+    let policy = gtk::DropDown::builder()
+        .model(&policies)
+        .tooltip_text(texts.lane_summary_failure_policy)
+        .build();
     let button = gtk::Button::builder()
         .icon_name("list-add-symbolic")
         .tooltip_text(texts.add_lane)
@@ -169,6 +176,11 @@ pub fn build_settings_dialog(
     add.add_suffix(&policy);
     add.add_suffix(&button);
     group.add(&add);
+
+    {
+        let button = button.clone();
+        name.connect_activate(move |_| button.emit_clicked());
+    }
 
     {
         let dialog = dialog.clone();
@@ -257,7 +269,10 @@ fn add_lane_editor(
         .build();
     let interface_names = interfaces.iter().map(String::as_str).collect::<Vec<_>>();
     let interface_model = gtk::StringList::new(&interface_names);
-    let interface = gtk::DropDown::builder().model(&interface_model).build();
+    let interface = gtk::DropDown::builder()
+        .model(&interface_model)
+        .tooltip_text(texts.select_interface)
+        .build();
     if let Some(index) = interfaces
         .iter()
         .position(|candidate| candidate == lane.interface.as_str())
@@ -269,7 +284,10 @@ fn add_lane_editor(
         texts.failure_direct,
         texts.failure_inactive,
     ]);
-    let policy = gtk::DropDown::builder().model(&policies).build();
+    let policy = gtk::DropDown::builder()
+        .model(&policies)
+        .tooltip_text(texts.lane_summary_failure_policy)
+        .build();
     policy.set_selected(policy_index(&lane.failure_policy));
     let delete = gtk::Button::builder()
         .icon_name("list-remove-symbolic")
