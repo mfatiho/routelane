@@ -35,6 +35,13 @@ pub struct DashboardState {
     pub authorization: AuthorizationPresentation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizationOutcome {
+    pub authorization: AuthorizationPresentation,
+    pub primary_action_enabled: bool,
+    pub routing_active: bool,
+}
+
 pub fn activation_action(has_existing_window: bool) -> ActivationAction {
     if has_existing_window {
         ActivationAction::PresentExisting
@@ -81,4 +88,23 @@ pub fn dashboard_state(
             AuthorizationPresentation::Idle
         },
     }
+}
+
+pub fn authorization_after_error(
+    routing_active: bool,
+    authorization_denied: bool,
+) -> AuthorizationOutcome {
+    AuthorizationOutcome {
+        authorization: if authorization_denied {
+            AuthorizationPresentation::Denied
+        } else {
+            AuthorizationPresentation::Idle
+        },
+        primary_action_enabled: true,
+        routing_active,
+    }
+}
+
+pub fn authorization_after_applied() -> AuthorizationPresentation {
+    AuthorizationPresentation::Idle
 }

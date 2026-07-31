@@ -8,9 +8,11 @@ pub mod window;
 #[cfg(test)]
 mod experience_contract_tests {
     use super::experience::{
-        activation_action, dashboard_state, ActivationAction, AuthorizationPresentation,
-        PrimaryAction, SetupStep,
+        activation_action, authorization_after_applied, authorization_after_error, dashboard_state,
+        ActivationAction, AuthorizationPresentation, PrimaryAction, SetupStep,
     };
+    use crate::ui::i18n::LanguageTexts;
+    use routelane::config::Language;
     use routelane::domain::{
         HealthState, InterfaceSelector, Lane, LaneFailurePolicy, LaneId, Profile, ProfileId, Rule,
         RuleAction, RuleId, RuleSource, RuleTarget,
@@ -80,5 +82,32 @@ mod experience_contract_tests {
     fn activation_reuses_an_existing_window() {
         assert_eq!(activation_action(true), ActivationAction::PresentExisting);
         assert_eq!(activation_action(false), ActivationAction::CreateWindow);
+    }
+
+    #[test]
+    fn every_language_has_actionable_setup_and_authorization_copy() {
+        for texts in [Language::Tr.texts(), Language::En.texts()] {
+            assert!(!texts.enable_routing.is_empty());
+            assert!(!texts.add_first_lane.is_empty());
+            assert!(!texts.authorization_waiting.is_empty());
+            assert!(!texts.authorization_denied.is_empty());
+        }
+    }
+
+    #[test]
+    fn authorization_denial_reenables_control_without_changing_confirmed_state() {
+        let state = authorization_after_error(true, true);
+
+        assert_eq!(state.authorization, AuthorizationPresentation::Denied);
+        assert!(state.primary_action_enabled);
+        assert!(state.routing_active);
+    }
+
+    #[test]
+    fn accepted_apply_clears_authorization_waiting_state() {
+        assert_eq!(
+            authorization_after_applied(),
+            AuthorizationPresentation::Idle
+        );
     }
 }
