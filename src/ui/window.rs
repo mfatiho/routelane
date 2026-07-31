@@ -256,7 +256,6 @@ fn open_rule_dialog(
         .title(texts.add_address_title)
         .transient_for(parent)
         .modal(true)
-        .hide_on_close(true)
         .default_width(480)
         .build();
     let content = gtk::Box::builder()
@@ -467,7 +466,7 @@ pub fn build_window(
             dashboard_row.set_title(title);
             dashboard_row.set_subtitle(subtitle);
             dashboard_primary.set_label(action);
-            dashboard_primary.set_sensitive(state.primary_action_enabled);
+            dashboard_primary.set_sensitive(state.primary_action_enabled && config_writable.get());
             active.set_sensitive(config_writable.get() && !mutation_pending.get());
         })
     };
@@ -565,6 +564,7 @@ pub fn build_window(
         let settings = settings.clone();
         let add_rule_button = add_rule_button.clone();
         let rules_group = rules_group.clone();
+        let dashboard_primary = dashboard_primary.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(result) = results.recv().await {
                 let action = pending
@@ -588,6 +588,7 @@ pub fn build_window(
                         active.set_sensitive(false);
                         settings.set_sensitive(false);
                         add_rule_button.set_sensitive(false);
+                        dashboard_primary.set_sensitive(false);
                         rules_group.set_sensitive(false);
                         config_error_group.set_visible(true);
                         render_health(
