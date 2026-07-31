@@ -143,33 +143,62 @@ fn status_is_active(status: &DaemonStatus) -> bool {
     status.applied_profile_id.is_some()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DashboardCopy {
+    title: &'static str,
+    subtitle: &'static str,
+    action: &'static str,
+    icon_name: &'static str,
+    shows_progress: bool,
+}
+
 fn dashboard_copy(
     texts: crate::ui::i18n::Texts,
     state: DashboardState,
     health: HealthState,
-) -> (&'static str, &'static str, &'static str) {
+) -> DashboardCopy {
     match (state.authorization, state.setup_step, state.primary_action) {
-        (AuthorizationPresentation::Waiting, _, _) => (
-            texts.authorization_waiting,
-            texts.authorization_waiting,
-            texts.retry_authorization,
-        ),
-        (AuthorizationPresentation::Denied, _, _) => (
-            texts.authorization_denied,
-            texts.authorization_denied,
-            texts.retry_authorization,
-        ),
-        (_, Some(SetupStep::AddLane), _) => {
-            (texts.inactive, texts.add_first_lane, texts.open_preferences)
-        }
-        (_, Some(SetupStep::AddRule), _) => (texts.inactive, texts.add_first_rule, texts.add_rule),
+        (AuthorizationPresentation::Waiting, _, _) => DashboardCopy {
+            title: texts.authorization_waiting,
+            subtitle: texts.authorization_waiting,
+            action: texts.retry_authorization,
+            icon_name: "process-working-symbolic",
+            shows_progress: true,
+        },
+        (AuthorizationPresentation::Denied, _, _) => DashboardCopy {
+            title: texts.authorization_denied,
+            subtitle: texts.retry_authorization,
+            action: texts.retry_authorization,
+            icon_name: "dialog-password-symbolic",
+            shows_progress: false,
+        },
+        (_, Some(SetupStep::AddLane), _) => DashboardCopy {
+            title: texts.inactive,
+            subtitle: texts.add_first_lane,
+            action: texts.open_preferences,
+            icon_name: "list-add-symbolic",
+            shows_progress: false,
+        },
+        (_, Some(SetupStep::AddRule), _) => DashboardCopy {
+            title: texts.inactive,
+            subtitle: texts.add_first_rule,
+            action: texts.add_rule,
+            icon_name: "list-add-symbolic",
+            shows_progress: false,
+        },
         (_, None, action) => {
             let presentation = status_presentation(health, state.authorization, texts);
             let action = match action {
                 PrimaryAction::DisableRouting => texts.disable_routing,
                 _ => texts.enable_routing,
             };
-            (presentation.title, presentation.detail, action)
+            DashboardCopy {
+                title: presentation.title,
+                subtitle: presentation.detail,
+                action,
+                icon_name: presentation.icon_name,
+                shows_progress: matches!(health, HealthState::Applying),
+            }
         }
     }
 }
@@ -428,14 +457,21 @@ pub fn build_window(
 
     let page = adw::PreferencesPage::new();
     let initial_dashboard = dashboard_state(&profile.borrow(), HealthState::Inactive, false);
-    let (dashboard_title, dashboard_subtitle, dashboard_action) =
-        dashboard_copy(texts, initial_dashboard, HealthState::Inactive);
+    let initial_dashboard_copy = dashboard_copy(texts, initial_dashboard, HealthState::Inactive);
     let dashboard_group = adw::PreferencesGroup::builder().title("RouteLane").build();
     let dashboard_row = adw::ActionRow::builder()
-        .title(dashboard_title)
-        .subtitle(dashboard_subtitle)
+        .title(initial_dashboard_copy.title)
+        .subtitle(initial_dashboard_copy.subtitle)
         .build();
-    let dashboard_primary = gtk::Button::with_label(dashboard_action);
+    let dashboard_icon = gtk::Image::from_icon_name(initial_dashboard_copy.icon_name);
+    dashboard_row.add_prefix(&dashboard_icon);
+    let dashboard_progress = gtk::Spinner::new();
+    dashboard_progress.set_visible(initial_dashboard_copy.shows_progress);
+    if initial_dashboard_copy.shows_progress {
+        dashboard_progress.start();
+    }
+    dashboard_row.add_suffix(&dashboard_progress);
+    let dashboard_primary = gtk::Button::with_label(initial_dashboard_copy.action);
     dashboard_primary.add_css_class("suggested-action");
     dashboard_primary.set_sensitive(initial_dashboard.primary_action_enabled);
     dashboard_row.add_suffix(&dashboard_primary);
@@ -478,15 +514,24 @@ pub fn build_window(
         let profile = profile.clone();
         let mutation_pending = mutation_pending.clone();
         let dashboard_row = dashboard_row.clone();
+        let dashboard_icon = dashboard_icon.clone();
+        let dashboard_progress = dashboard_progress.clone();
         let dashboard_primary = dashboard_primary.clone();
         let active = active.clone();
         let config_writable = config_writable.clone();
         Rc::new(move |health: HealthState| {
             let state = dashboard_state(&profile.borrow(), health, mutation_pending.get());
-            let (title, subtitle, action) = dashboard_copy(texts, state, health);
-            dashboard_row.set_title(title);
-            dashboard_row.set_subtitle(subtitle);
-            dashboard_primary.set_label(action);
+            let copy = dashboard_copy(texts, state, health);
+            dashboard_row.set_title(copy.title);
+            dashboard_row.set_subtitle(copy.subtitle);
+            dashboard_icon.set_icon_name(Some(copy.icon_name));
+            dashboard_progress.set_visible(copy.shows_progress);
+            if copy.shows_progress {
+                dashboard_progress.start();
+            } else {
+                dashboard_progress.stop();
+            }
+            dashboard_primary.set_label(copy.action);
             dashboard_primary.set_sensitive(state.primary_action_enabled && config_writable.get());
             active.set_sensitive(config_writable.get() && !mutation_pending.get());
         })
@@ -1270,11 +1315,12 @@ fn refreshed_interface_selection(previous_name: Option<&str>, names: &[String]) 
 mod tests {
     use super::{
         accept_connection_epoch, accept_daemon_event_revision, accept_daemon_status_revision,
-        configuration_error_view, daemon_unavailable_view, health_after_apply_request,
-        health_sections, health_view, reconcile_profiles, refreshed_interface_selection,
-        rule_dialog_submission, status_is_active, switch_state_after_persistence_failure,
-        RuleDialogSubmission,
+        configuration_error_view, daemon_unavailable_view, dashboard_copy,
+        health_after_apply_request, health_sections, health_view, reconcile_profiles,
+        refreshed_interface_selection, rule_dialog_submission, status_is_active,
+        switch_state_after_persistence_failure, RuleDialogSubmission,
     };
+    use crate::ui::experience::{AuthorizationPresentation, DashboardState, PrimaryAction};
     use crate::ui::i18n::LanguageTexts;
     use routelane::config::ConfigV2;
     use routelane::domain::{
@@ -1339,6 +1385,24 @@ mod tests {
     #[test]
     fn apply_request_immediately_reports_applying_instead_of_stale_inactive() {
         assert_eq!(health_after_apply_request().aggregate, "Applying");
+    }
+
+    #[test]
+    fn applying_dashboard_copy_uses_progress_feedback() {
+        let copy = dashboard_copy(
+            routelane::config::Language::En.texts(),
+            DashboardState {
+                setup_step: None,
+                primary_action: PrimaryAction::DisableRouting,
+                primary_action_enabled: false,
+                authorization: AuthorizationPresentation::Waiting,
+            },
+            HealthState::Applying,
+        );
+
+        assert_eq!(copy.icon_name, "process-working-symbolic");
+        assert!(copy.shows_progress);
+        assert_eq!(copy.action, "Retry authorization");
     }
 
     #[test]
