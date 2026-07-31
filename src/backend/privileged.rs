@@ -1799,7 +1799,7 @@ fn nft_rule_object(rule: &super::CompiledRule) -> serde_json::Value {
                     "value": mark,
                 }
             }));
-            expressions.push(serde_json::json!({"counter": {}}));
+            expressions.push(serde_json::json!({"counter": null}));
             expressions.push(serde_json::json!({"return": null}));
         }
         CompiledAction::Direct => {
@@ -1809,11 +1809,11 @@ fn nft_rule_object(rule: &super::CompiledRule) -> serde_json::Value {
                     "value": 0,
                 }
             }));
-            expressions.push(serde_json::json!({"counter": {}}));
+            expressions.push(serde_json::json!({"counter": null}));
             expressions.push(serde_json::json!({"return": null}));
         }
         CompiledAction::Block => {
-            expressions.push(serde_json::json!({"counter": {}}));
+            expressions.push(serde_json::json!({"counter": null}));
             expressions.push(serde_json::json!({"reject": {}}));
         }
     }
@@ -3551,7 +3551,7 @@ mod tests {
                         "value": MARK_BASE
                     }
                 },
-                {"counter": {}},
+                {"counter": null},
                 {"return": null}
             ])
         );
