@@ -2722,12 +2722,12 @@ fn normalize_nft_document(value: &mut serde_json::Value) {
         serde_json::Value::Object(object) => {
             object.remove("metainfo");
             object.remove("handle");
-            if let Some(counter) = object
-                .get_mut("counter")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                counter.remove("packets");
-                counter.remove("bytes");
+            if object.get("counter").is_some_and(|counter| {
+                counter.as_object().is_some_and(|counter| {
+                    counter.contains_key("packets") || counter.contains_key("bytes")
+                })
+            }) {
+                object.insert("counter".to_owned(), serde_json::Value::Null);
             }
             for nested in object.values_mut() {
                 normalize_nft_document(nested);
@@ -3482,13 +3482,14 @@ mod tests {
 
     use super::{
         authorization_result, build_pending_expectations, command_invocation,
-        execute_invocation_with_timeout, nft_rule_object, render_guarded_ruleset,
-        render_owned_ruleset, render_transaction_ruleset, run_nft_batch, validate_privileged_plan,
-        validate_root_owned_file_attributes, AppliedStateStore, ApplyResponse, AuthorizationError,
-        Authorizer, CleanupResponse, CommandExecutor, CommandInvocation, CommandOutput,
-        CommandPrivilegedBackend, InspectResponse, PrivilegedBackend, PrivilegedError,
-        PrivilegedService, RestoreReceipt, RestoreResponse, ServiceError, StoredAppliedState,
-        ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES, NFT_BINARY,
+        execute_invocation_with_timeout, nft_document_fingerprint, nft_rule_object,
+        render_guarded_ruleset, render_owned_ruleset, render_transaction_ruleset, run_nft_batch,
+        validate_privileged_plan, validate_root_owned_file_attributes, AppliedStateStore,
+        ApplyResponse, AuthorizationError, Authorizer, CleanupResponse, CommandExecutor,
+        CommandInvocation, CommandOutput, CommandPrivilegedBackend, InspectResponse,
+        PrivilegedBackend, PrivilegedError, PrivilegedService, RestoreReceipt, RestoreResponse,
+        ServiceError, StoredAppliedState, ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES,
+        NFT_BINARY,
     };
     use crate::backend::{
         CommandSpec, CompiledAction, CompiledRule, CompiledTarget, IpFamily, KernelPlan,
@@ -3554,6 +3555,23 @@ mod tests {
                 {"counter": null},
                 {"return": null}
             ])
+        );
+    }
+
+    #[test]
+    fn fingerprint_ignores_live_counter_values_for_a_counter_expression() {
+        let expected = serde_json::json!({
+            "nftables": [{"rule": {"expr": [{"counter": null}]}}]
+        });
+        let live = serde_json::json!({
+            "nftables": [{"rule": {"expr": [{
+                "counter": {"packets": 12, "bytes": 34}
+            }]}}]
+        });
+
+        assert_eq!(
+            nft_document_fingerprint(&expected).unwrap(),
+            nft_document_fingerprint(&live).unwrap()
         );
     }
 
