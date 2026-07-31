@@ -299,14 +299,28 @@ fn open_rule_dialog(
         .build();
     let target = gtk::Entry::builder()
         .placeholder_text(texts.address_placeholder)
+        .tooltip_text(texts.rule_target_label)
         .hexpand(true)
         .build();
+    let target_label = gtk::Label::builder()
+        .label(texts.rule_target_label)
+        .halign(gtk::Align::Start)
+        .build();
+    target_label.set_mnemonic_widget(Some(&target));
     let feedback = gtk::Label::builder().xalign(0.0).wrap(true).build();
     feedback.add_css_class("error");
     feedback.set_visible(false);
     let actions =
         gtk::StringList::new(&[texts.action_route, texts.action_direct, texts.action_block]);
-    let action = gtk::DropDown::builder().model(&actions).build();
+    let action = gtk::DropDown::builder()
+        .model(&actions)
+        .tooltip_text(texts.rule_action_label)
+        .build();
+    let action_label = gtk::Label::builder()
+        .label(texts.rule_action_label)
+        .halign(gtk::Align::Start)
+        .build();
+    action_label.set_mnemonic_widget(Some(&action));
     let button_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -318,8 +332,10 @@ fn open_rule_dialog(
     button_row.append(&cancel);
     button_row.append(&submit);
 
+    content.append(&target_label);
     content.append(&target);
     content.append(&feedback);
+    content.append(&action_label);
     content.append(&action);
     content.append(&button_row);
     dialog.set_content(Some(&content));
@@ -337,11 +353,16 @@ fn open_rule_dialog(
         let action = action.clone();
         Rc::new(move || {
             let text = target.text().trim().to_owned();
-            let target_value = match rule_dialog_submission(&text) {
+            let submission = rule_dialog_submission(&text);
+            let restore_target_focus = rule_dialog_restores_target_focus(&submission);
+            let target_value = match submission {
                 RuleDialogSubmission::Invalid => {
                     target.add_css_class("error");
                     feedback.set_label(texts.invalid_rule_target);
                     feedback.set_visible(true);
+                    if restore_target_focus {
+                        target.grab_focus();
+                    }
                     return;
                 }
                 RuleDialogSubmission::Valid(target_value) => {
@@ -387,6 +408,7 @@ fn open_rule_dialog(
     });
     target.connect_activate(move |_| submit_rule());
     dialog.present();
+    target.grab_focus();
 }
 
 pub fn build_window(
@@ -1226,6 +1248,10 @@ fn rule_dialog_submission(value: &str) -> RuleDialogSubmission {
         .unwrap_or(RuleDialogSubmission::Invalid)
 }
 
+fn rule_dialog_restores_target_focus(submission: &RuleDialogSubmission) -> bool {
+    matches!(submission, RuleDialogSubmission::Invalid)
+}
+
 fn show_copyable_error_toast(
     toast_overlay: &adw::ToastOverlay,
     texts: crate::ui::i18n::Texts,
@@ -1317,8 +1343,8 @@ mod tests {
         accept_connection_epoch, accept_daemon_event_revision, accept_daemon_status_revision,
         configuration_error_view, daemon_unavailable_view, dashboard_copy,
         health_after_apply_request, health_sections, health_view, reconcile_profiles,
-        refreshed_interface_selection, rule_dialog_submission, status_is_active,
-        switch_state_after_persistence_failure, RuleDialogSubmission,
+        refreshed_interface_selection, rule_dialog_restores_target_focus, rule_dialog_submission,
+        status_is_active, switch_state_after_persistence_failure, RuleDialogSubmission,
     };
     use crate::ui::experience::{AuthorizationPresentation, DashboardState, PrimaryAction};
     use crate::ui::i18n::LanguageTexts;
@@ -1341,6 +1367,13 @@ mod tests {
     #[test]
     fn rule_dialog_requires_a_nonempty_target() {
         assert_eq!(rule_dialog_submission("   "), RuleDialogSubmission::Invalid);
+    }
+
+    #[test]
+    fn invalid_rule_target_restores_focus_to_the_target_field() {
+        assert!(rule_dialog_restores_target_focus(
+            &RuleDialogSubmission::Invalid
+        ));
     }
 
     #[test]
