@@ -6,6 +6,7 @@ use libadwaita::{self as adw, prelude::*};
 use routelane::domain::{LaneId, ProfileId, Rule, RuleAction, RuleId};
 use routelane::ipc::DaemonRequest;
 
+use crate::ui::confirm::confirm_destructive_action;
 use crate::ui::i18n::Texts;
 
 pub fn set_rule_enabled_request(
@@ -29,6 +30,7 @@ pub enum RuleEdit {
 pub struct RuleRowContext {
     pub lanes: Vec<(LaneId, String)>,
     pub texts: Texts,
+    pub parent: adw::ApplicationWindow,
     pub on_change: Rc<dyn Fn(Rule, RuleEdit)>,
     pub on_delete: Rc<dyn Fn(RuleId)>,
 }
@@ -37,6 +39,7 @@ pub fn create_rule_row(rule: &Rule, context: RuleRowContext) -> adw::ActionRow {
     let RuleRowContext {
         lanes,
         texts,
+        parent,
         on_change,
         on_delete,
     } = context;
@@ -146,9 +149,26 @@ pub fn create_rule_row(rule: &Rule, context: RuleRowContext) -> adw::ActionRow {
     {
         let rule_id = rule.id.clone();
         let row = row.clone();
+        let body = format!(
+            "{}{}{}",
+            texts.confirm_delete_rule_prefix,
+            target_label(rule),
+            texts.confirm_delete_rule_suffix
+        );
         delete.connect_clicked(move |_| {
-            on_delete(rule_id.clone());
-            row.set_visible(false);
+            let rule_id = rule_id.clone();
+            let row = row.clone();
+            let on_delete = on_delete.clone();
+            confirm_destructive_action(
+                &parent,
+                texts,
+                texts.confirm_delete_rule_heading,
+                &body,
+                Rc::new(move || {
+                    on_delete(rule_id.clone());
+                    row.set_visible(false);
+                }),
+            );
         });
     }
     row

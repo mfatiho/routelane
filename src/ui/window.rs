@@ -242,6 +242,7 @@ struct RuleListContext {
     routing_active: Rc<Cell<bool>>,
     texts: crate::ui::i18n::Texts,
     save_profile: Rc<dyn Fn(PostSaveAction)>,
+    window: adw::ApplicationWindow,
 }
 
 fn open_rule_dialog(
@@ -616,6 +617,7 @@ pub fn build_window(
         routing_active: routing_active.clone(),
         texts,
         save_profile: save_profile.clone(),
+        window: window.clone(),
     };
     for rule in profile.borrow().rules.clone() {
         append_rule(&rule_list, &rule);
@@ -1047,6 +1049,7 @@ fn append_rule(context: &RuleListContext, rule: &Rule) {
     let row_context = RuleRowContext {
         lanes,
         texts: context.texts,
+        parent: context.window.clone(),
         on_change,
         on_delete,
     };

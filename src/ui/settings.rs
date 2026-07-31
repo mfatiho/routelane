@@ -8,6 +8,7 @@ use routelane::domain::{
     RuleAction,
 };
 
+use crate::ui::confirm::confirm_destructive_action;
 use crate::ui::i18n::Texts;
 use routelane::config::Language;
 
@@ -97,6 +98,14 @@ fn set_lane_failure_policy(
     }
 }
 
+pub fn routed_rule_count(profile: &Profile, lane_id: &LaneId) -> usize {
+    profile
+        .rules
+        .iter()
+        .filter(|rule| matches!(&rule.action, RuleAction::Route(target) if target == lane_id))
+        .count()
+}
+
 pub fn delete_lane(profile: &mut Profile, lane_id: &LaneId) {
     profile.lanes.retain(|lane| &lane.id != lane_id);
     profile
@@ -127,6 +136,7 @@ pub fn build_settings_dialog(
 
     for lane in profile.borrow().lanes.clone() {
         add_lane_editor(
+            &dialog,
             &group,
             &lane,
             &interfaces,
@@ -161,6 +171,7 @@ pub fn build_settings_dialog(
     group.add(&add);
 
     {
+        let dialog = dialog.clone();
         let group = group.clone();
         let profile = profile.clone();
         let interfaces = interfaces.clone();
@@ -186,6 +197,7 @@ pub fn build_settings_dialog(
                     add_row.set_subtitle("");
                     name.remove_css_class("error");
                     add_lane_editor(
+                        &dialog,
                         &group,
                         &lane,
                         &interfaces,
@@ -227,6 +239,7 @@ pub fn build_settings_dialog(
 }
 
 fn add_lane_editor(
+    parent: &adw::PreferencesWindow,
     group: &adw::PreferencesGroup,
     lane: &Lane,
     interfaces: &[String],
@@ -358,13 +371,39 @@ fn add_lane_editor(
         let lane_id = lane.id.clone();
         let profile = profile.clone();
         let group = group.clone();
+        let parent = parent.clone();
         delete.connect_clicked(move |_| {
-            {
-                let mut profile = profile.borrow_mut();
-                delete_lane(&mut profile, &lane_id);
-            }
-            group.remove(&row);
-            on_change();
+            let affected = routed_rule_count(&profile.borrow(), &lane_id);
+            let body = if affected > 0 {
+                format!(
+                    "{}{}{}{}",
+                    texts.confirm_delete_lane_body,
+                    texts.confirm_delete_lane_rules_prefix,
+                    affected,
+                    texts.confirm_delete_lane_rules_suffix
+                )
+            } else {
+                texts.confirm_delete_lane_body.to_owned()
+            };
+            let lane_id = lane_id.clone();
+            let profile = profile.clone();
+            let group = group.clone();
+            let row = row.clone();
+            let on_change = on_change.clone();
+            confirm_destructive_action(
+                &parent,
+                texts,
+                texts.confirm_delete_lane_heading,
+                &body,
+                Rc::new(move || {
+                    {
+                        let mut profile = profile.borrow_mut();
+                        delete_lane(&mut profile, &lane_id);
+                    }
+                    group.remove(&row);
+                    on_change();
+                }),
+            );
         });
     }
 }
@@ -398,7 +437,9 @@ fn system_interfaces() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{add_lane, delete_lane, lane_edit_error_text, rename_lane, LaneEditError};
+    use super::{
+        add_lane, delete_lane, lane_edit_error_text, rename_lane, routed_rule_count, LaneEditError,
+    };
     use crate::ui::i18n::LanguageTexts;
     use routelane::domain::{
         InterfaceSelector, LaneFailurePolicy, Profile, ProfileId, Rule, RuleAction, RuleId,
@@ -425,6 +466,40 @@ mod tests {
         assert_eq!(profile.lanes[0].name, "Work VPN");
         assert_eq!(profile.lanes[0].interface, InterfaceSelector::from("tun0"));
         assert_eq!(profile.lanes[0].failure_policy, LaneFailurePolicy::Block);
+    }
+
+    #[test]
+    fn routed_rule_count_only_counts_rules_routed_through_the_given_lane() {
+        let mut profile = profile();
+        let vpn = add_lane(&mut profile, "VPN", "tun0", LaneFailurePolicy::Inactive).unwrap();
+        let direct = add_lane(&mut profile, "Direct", "eth0", LaneFailurePolicy::Inactive).unwrap();
+        profile.rules.push(Rule {
+            id: RuleId::from("routed-a"),
+            enabled: true,
+            priority: 1,
+            source: RuleSource::Any,
+            target: RuleTarget::Domain("a.example".to_owned()),
+            action: RuleAction::Route(vpn.clone()),
+        });
+        profile.rules.push(Rule {
+            id: RuleId::from("routed-b"),
+            enabled: true,
+            priority: 2,
+            source: RuleSource::Any,
+            target: RuleTarget::Domain("b.example".to_owned()),
+            action: RuleAction::Route(vpn.clone()),
+        });
+        profile.rules.push(Rule {
+            id: RuleId::from("blocked"),
+            enabled: true,
+            priority: 3,
+            source: RuleSource::Any,
+            target: RuleTarget::Domain("c.example".to_owned()),
+            action: RuleAction::Block,
+        });
+
+        assert_eq!(routed_rule_count(&profile, &vpn), 2);
+        assert_eq!(routed_rule_count(&profile, &direct), 0);
     }
 
     #[test]

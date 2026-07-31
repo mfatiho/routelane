@@ -1,3 +1,4 @@
+pub mod confirm;
 pub mod experience;
 pub mod i18n;
 pub mod rule_row;
