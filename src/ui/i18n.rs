@@ -57,6 +57,15 @@ pub struct Texts {
     pub lane_name_duplicate: &'static str,
     pub lane_not_found: &'static str,
     pub lane_interface_empty: &'static str,
+    pub cancel: &'static str,
+    pub delete: &'static str,
+    pub confirm_delete_rule_heading: &'static str,
+    pub confirm_delete_rule_prefix: &'static str,
+    pub confirm_delete_rule_suffix: &'static str,
+    pub confirm_delete_lane_heading: &'static str,
+    pub confirm_delete_lane_body: &'static str,
+    pub confirm_delete_lane_rules_prefix: &'static str,
+    pub confirm_delete_lane_rules_suffix: &'static str,
 }
 
 pub trait LanguageTexts {
@@ -123,6 +132,15 @@ impl LanguageTexts for Language {
                 lane_name_duplicate: "Rota adı benzersiz olmalıdır",
                 lane_not_found: "Rota bulunamadı",
                 lane_interface_empty: "Rota ağ arayüzü boş olamaz",
+                cancel: "İptal",
+                delete: "Sil",
+                confirm_delete_rule_heading: "Kuralı sil?",
+                confirm_delete_rule_prefix: "Şu kural silinecek: ",
+                confirm_delete_rule_suffix: "",
+                confirm_delete_lane_heading: "Rotayı sil?",
+                confirm_delete_lane_body: "Rota kalıcı olarak silinecek.",
+                confirm_delete_lane_rules_prefix: " Bu rotaya yönlendirilen ",
+                confirm_delete_lane_rules_suffix: " kural da silinecek.",
             },
             Self::En => Texts {
                 inactive: "Routing disabled",
@@ -181,6 +199,15 @@ impl LanguageTexts for Language {
                 lane_name_duplicate: "Lane name must be unique",
                 lane_not_found: "Lane was not found",
                 lane_interface_empty: "Lane interface must not be empty",
+                cancel: "Cancel",
+                delete: "Delete",
+                confirm_delete_rule_heading: "Delete rule?",
+                confirm_delete_rule_prefix: "The rule for ",
+                confirm_delete_rule_suffix: " will be deleted.",
+                confirm_delete_lane_heading: "Delete lane?",
+                confirm_delete_lane_body: "The lane will be permanently deleted.",
+                confirm_delete_lane_rules_prefix: " This will also delete ",
+                confirm_delete_lane_rules_suffix: " rule(s) routed through it.",
             },
         }
     }
