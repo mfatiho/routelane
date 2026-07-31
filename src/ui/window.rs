@@ -282,6 +282,7 @@ pub fn build_window(
     let updating_switch = Rc::new(Cell::new(false));
     let routing_active = Rc::new(Cell::new(false));
     let authorization = Rc::new(Cell::new(AuthorizationPresentation::Idle));
+    let mutation_pending = Rc::new(Cell::new(false));
     let last_applied_profile_id = Rc::new(RefCell::new(None::<ProfileId>));
     let last_daemon_generation = Rc::new(Cell::new(None::<u64>));
     let last_event_sequence = Rc::new(Cell::new(None::<u64>));
@@ -313,6 +314,23 @@ pub fn build_window(
     dashboard_row.add_suffix(&dashboard_primary);
     dashboard_group.add(&dashboard_row);
     page.add(&dashboard_group);
+    let sync_dashboard: Rc<dyn Fn(HealthState)> = {
+        let profile = profile.clone();
+        let mutation_pending = mutation_pending.clone();
+        let dashboard_row = dashboard_row.clone();
+        let dashboard_primary = dashboard_primary.clone();
+        let active = active.clone();
+        let config_writable = config_writable.clone();
+        Rc::new(move |health: HealthState| {
+            let state = dashboard_state(&profile.borrow(), health, mutation_pending.get());
+            let (title, subtitle, action) = dashboard_copy(texts, state);
+            dashboard_row.set_title(title);
+            dashboard_row.set_subtitle(subtitle);
+            dashboard_primary.set_label(action);
+            dashboard_primary.set_sensitive(state.primary_action_enabled);
+            active.set_sensitive(config_writable.get() && !mutation_pending.get());
+        })
+    };
     let config_error_group = adw::PreferencesGroup::builder()
         .title(texts.configuration_title)
         .build();
@@ -531,29 +549,36 @@ pub fn build_window(
         let profile = profile.clone();
         let settings = settings.clone();
         let target = target.clone();
-        let active = active.clone();
         let routing_active = routing_active.clone();
         let save_profile = save_profile.clone();
         let sender = sender.clone();
+        let mutation_pending = mutation_pending.clone();
+        let sync_dashboard = sync_dashboard.clone();
+        let health_content = health_content.clone();
         dashboard_primary.connect_clicked(move |_| {
-            let state = dashboard_state(
-                &profile.borrow(),
-                if routing_active.get() {
-                    HealthState::Healthy
-                } else {
-                    HealthState::Inactive
-                },
-                false,
-            );
+            if mutation_pending.get() {
+                return;
+            }
+            let health_guess = if routing_active.get() {
+                HealthState::Healthy
+            } else {
+                HealthState::Inactive
+            };
+            let state = dashboard_state(&profile.borrow(), health_guess, false);
             match state.primary_action {
                 PrimaryAction::OpenPreferences => settings.emit_clicked(),
                 PrimaryAction::OpenRuleDialog => {
                     target.grab_focus();
                 }
                 PrimaryAction::EnableRouting => {
+                    mutation_pending.set(true);
+                    sync_dashboard(health_guess);
+                    render_health(&health_content, &health_after_apply_request(), texts);
                     save_profile(PostSaveAction::Request(apply_request(&profile.borrow())));
                 }
                 PrimaryAction::DisableRouting => {
+                    mutation_pending.set(true);
+                    sync_dashboard(health_guess);
                     let sender = sender.clone();
                     glib::MainContext::default().spawn_local(async move {
                         sender
@@ -563,7 +588,6 @@ pub fn build_window(
                     });
                 }
             }
-            active.grab_focus();
         });
     }
     {
@@ -572,10 +596,18 @@ pub fn build_window(
         let save_profile = save_profile.clone();
         let updating_switch = updating_switch.clone();
         let health_content = health_content.clone();
+        let mutation_pending = mutation_pending.clone();
+        let sync_dashboard = sync_dashboard.clone();
         active.connect_state_set(move |_, state| {
-            if updating_switch.get() {
+            if updating_switch.get() || mutation_pending.get() {
                 return Inhibit(false);
             }
+            mutation_pending.set(true);
+            sync_dashboard(if state {
+                HealthState::Healthy
+            } else {
+                HealthState::Inactive
+            });
             if state {
                 render_health(&health_content, &health_after_apply_request(), texts);
                 save_profile(PostSaveAction::Request(apply_request(&profile.borrow())));
@@ -661,6 +693,8 @@ pub fn build_window(
         let persist_document = persist_document.clone();
         let last_applied_profile_id = last_applied_profile_id.clone();
         let config_writable = config_writable.clone();
+        let mutation_pending = mutation_pending.clone();
+        let sync_dashboard = sync_dashboard.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = receiver.recv().await {
                 match event {
@@ -684,19 +718,12 @@ pub fn build_window(
                         let is_active = status_is_active(&status);
                         *last_applied_profile_id.borrow_mut() = status.applied_profile_id.clone();
                         routing_active.set(is_active);
-                        active.set_sensitive(config_writable.get());
                         updating_switch.set(true);
                         active.set_active(is_active);
                         updating_switch.set(false);
                         title.set_subtitle(&format!("{:?}", status.health.state));
-                        let dashboard =
-                            dashboard_state(&profile.borrow(), status.health.state, false);
-                        let (dashboard_title, dashboard_subtitle, dashboard_action) =
-                            dashboard_copy(texts, dashboard);
-                        dashboard_row.set_title(dashboard_title);
-                        dashboard_row.set_subtitle(dashboard_subtitle);
-                        dashboard_primary.set_label(dashboard_action);
-                        dashboard_primary.set_sensitive(dashboard.primary_action_enabled);
+                        mutation_pending.set(false);
+                        sync_dashboard(status.health.state);
                         render_health(
                             &health_content,
                             &health_view(&status.health, Some(status.generation)),
@@ -744,7 +771,9 @@ pub fn build_window(
                         });
                     }
                     DaemonToUi::DaemonUnavailable(detail) => {
+                        mutation_pending.set(false);
                         active.set_sensitive(false);
+                        dashboard_primary.set_sensitive(false);
                         title.set_subtitle("DaemonUnavailable");
                         render_health(&health_content, &daemon_unavailable_view(detail), texts);
                     }
@@ -753,12 +782,20 @@ pub fn build_window(
                             || error.to_string().contains("authorization");
                         let outcome =
                             authorization_after_error(routing_active.get(), authorization_denied);
+                        mutation_pending.set(false);
                         authorization.set(outcome.authorization);
                         if matches!(outcome.authorization, AuthorizationPresentation::Denied) {
                             dashboard_row.set_title(texts.authorization_denied);
                             dashboard_row.set_subtitle(texts.retry_authorization);
                             dashboard_primary.set_label(texts.retry_authorization);
                             dashboard_primary.set_sensitive(outcome.primary_action_enabled);
+                            active.set_sensitive(config_writable.get());
+                        } else {
+                            sync_dashboard(if outcome.routing_active {
+                                HealthState::Healthy
+                            } else {
+                                HealthState::Inactive
+                            });
                         }
                         toast_overlay.add_toast(
                             &adw::Toast::builder()
@@ -779,9 +816,11 @@ pub fn build_window(
                         });
                     }
                     DaemonToUi::Applied(result) => {
+                        mutation_pending.set(false);
                         authorization.set(authorization_after_applied());
                         rebuild_rule_rows(&rule_list);
                         title.set_subtitle(&format!("Applying generation {}", result.generation));
+                        sync_dashboard(HealthState::Applying);
                         let sender = sender.clone();
                         glib::MainContext::default().spawn_local(async move {
                             sender
@@ -791,11 +830,12 @@ pub fn build_window(
                         });
                     }
                     DaemonToUi::Deactivated => {
+                        mutation_pending.set(false);
                         routing_active.set(false);
-                        active.set_sensitive(config_writable.get());
                         updating_switch.set(true);
                         active.set_active(false);
                         updating_switch.set(false);
+                        sync_dashboard(HealthState::Inactive);
                         render_health(
                             &health_content,
                             &health_view(&HealthReport::inactive(), None),
