@@ -376,6 +376,17 @@ pub fn build_window(
         .default_width(720)
         .default_height(720)
         .build();
+    let copy_error_action =
+        gtk::gio::SimpleAction::new("copy-error", Some(glib::VariantTy::STRING));
+    {
+        let window = window.clone();
+        copy_error_action.connect_activate(move |_, parameter| {
+            if let Some(text) = parameter.and_then(glib::Variant::str) {
+                window.clipboard().set_text(text);
+            }
+        });
+    }
+    window.add_action(&copy_error_action);
     let header = adw::HeaderBar::new();
     let title = adw::WindowTitle::builder()
         .title("RouteLane")
@@ -597,8 +608,7 @@ pub fn build_window(
                             &configuration_error_view(&error, texts),
                             texts,
                         );
-                        toast_overlay
-                            .add_toast(&adw::Toast::builder().title(&error).timeout(7).build());
+                        show_copyable_error_toast(&toast_overlay, texts, &error);
                         sender
                             .send(UiToDaemon::Request(DaemonRequest::GetStatus))
                             .await
@@ -896,12 +906,7 @@ pub fn build_window(
                                 HealthState::Inactive
                             });
                         }
-                        toast_overlay.add_toast(
-                            &adw::Toast::builder()
-                                .title(&error.to_string())
-                                .timeout(7)
-                                .build(),
-                        );
+                        show_copyable_error_toast(&toast_overlay, texts, &error.to_string());
                         let sender = sender.clone();
                         glib::MainContext::default().spawn_local(async move {
                             sender
@@ -1116,6 +1121,21 @@ fn rule_dialog_submission(value: &str) -> RuleDialogSubmission {
     parse_target(value)
         .map(RuleDialogSubmission::Valid)
         .unwrap_or(RuleDialogSubmission::Invalid)
+}
+
+fn show_copyable_error_toast(
+    toast_overlay: &adw::ToastOverlay,
+    texts: crate::ui::i18n::Texts,
+    message: &str,
+) {
+    let toast = adw::Toast::builder()
+        .title(message)
+        .button_label(texts.copy_error)
+        .action_name("win.copy-error")
+        .action_target(&message.to_variant())
+        .timeout(0)
+        .build();
+    toast_overlay.add_toast(&toast);
 }
 
 fn render_health(container: &gtk::Box, view: &ConnectionHealthView, texts: crate::ui::i18n::Texts) {

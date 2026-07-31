@@ -66,6 +66,7 @@ pub struct Texts {
     pub confirm_delete_lane_body: &'static str,
     pub confirm_delete_lane_rules_prefix: &'static str,
     pub confirm_delete_lane_rules_suffix: &'static str,
+    pub copy_error: &'static str,
 }
 
 pub trait LanguageTexts {
@@ -141,6 +142,7 @@ impl LanguageTexts for Language {
                 confirm_delete_lane_body: "Rota kalıcı olarak silinecek.",
                 confirm_delete_lane_rules_prefix: " Bu rotaya yönlendirilen ",
                 confirm_delete_lane_rules_suffix: " kural da silinecek.",
+                copy_error: "Kopyala",
             },
             Self::En => Texts {
                 inactive: "Routing disabled",
@@ -208,6 +210,7 @@ impl LanguageTexts for Language {
                 confirm_delete_lane_body: "The lane will be permanently deleted.",
                 confirm_delete_lane_rules_prefix: " This will also delete ",
                 confirm_delete_lane_rules_suffix: " rule(s) routed through it.",
+                copy_error: "Copy",
             },
         }
     }
