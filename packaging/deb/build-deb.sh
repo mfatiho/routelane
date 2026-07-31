@@ -64,6 +64,7 @@ install -d -m 0755 \
     "${PACKAGE_ROOT}/usr/lib/systemd/user" \
     "${PACKAGE_ROOT}/usr/lib/systemd/system" \
     "${PACKAGE_ROOT}/usr/share/applications" \
+    "${PACKAGE_ROOT}/usr/share/dbus-1/system.d" \
     "${PACKAGE_ROOT}/usr/share/dbus-1/system-services" \
     "${PACKAGE_ROOT}/usr/share/polkit-1/actions"
 
@@ -81,6 +82,8 @@ install -m 0644 "${REPO_ROOT}/data/routelane-helper.service" \
     "${PACKAGE_ROOT}/usr/lib/systemd/system/routelane-helper.service"
 install -m 0644 "${REPO_ROOT}/data/io.github.routelane.Helper.service" \
     "${PACKAGE_ROOT}/usr/share/dbus-1/system-services/io.github.routelane.Helper.service"
+install -m 0644 "${REPO_ROOT}/data/io.github.routelane.Helper.conf" \
+    "${PACKAGE_ROOT}/usr/share/dbus-1/system.d/io.github.routelane.Helper.conf"
 install -m 0644 "${REPO_ROOT}/data/io.github.routelane.desktop" \
     "${PACKAGE_ROOT}/usr/share/applications/io.github.routelane.desktop"
 install -m 0644 "${REPO_ROOT}/data/io.github.routelane.policy" \
@@ -109,6 +112,7 @@ REQUIRED_PATHS=(
     "./usr/lib/systemd/user/routelane-daemon.service"
     "./usr/lib/systemd/system/routelane-helper.service"
     "./usr/share/dbus-1/system-services/io.github.routelane.Helper.service"
+    "./usr/share/dbus-1/system.d/io.github.routelane.Helper.conf"
     "./usr/share/polkit-1/actions/io.github.routelane.policy"
 )
 
@@ -142,6 +146,7 @@ require_mode '-rwxr-xr-x' './usr/lib/routelane/routelane-helper'
 require_mode '-rw-r--r--' './usr/lib/systemd/user/routelane-daemon.service'
 require_mode '-rw-r--r--' './usr/lib/systemd/system/routelane-helper.service'
 require_mode '-rw-r--r--' './usr/share/dbus-1/system-services/io.github.routelane.Helper.service'
+require_mode '-rw-r--r--' './usr/share/dbus-1/system.d/io.github.routelane.Helper.conf'
 require_mode '-rw-r--r--' './usr/share/polkit-1/actions/io.github.routelane.policy'
 
 echo "Created ${OUTPUT_DEB}"
