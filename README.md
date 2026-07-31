@@ -48,6 +48,17 @@ RouteLane does not use an external “what is my IP” service for health checks
 Connection Health compares the desired plan with lossless local interface,
 route, rule, nftables, ownership, and conflict evidence.
 
+## Guided desktop journey
+
+1. Open RouteLane; if it is already running, its existing window is focused.
+2. Choose a lane/interface in Preferences when the setup card asks for one.
+3. Add a domain, IP, or CIDR rule, then select Enable routing.
+4. Complete the desktop Polkit prompt when RouteLane needs to modify routing.
+
+RouteLane never asks for or stores a sudo password. Polkit controls the
+authorization lifetime, and a missing desktop Polkit agent yields
+`NeedsAuthorization` rather than silent escalation.
+
 ## Build
 
 Build requirements:
