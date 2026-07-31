@@ -1,4 +1,56 @@
+use crate::ui::i18n::Texts;
 use routelane::domain::{HealthState, Profile};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusPresentation {
+    pub title: &'static str,
+    pub detail: &'static str,
+    pub icon_name: &'static str,
+}
+
+pub fn status_presentation(
+    health: HealthState,
+    authorization: AuthorizationPresentation,
+    texts: Texts,
+) -> StatusPresentation {
+    if matches!(authorization, AuthorizationPresentation::Denied)
+        || matches!(health, HealthState::NeedsAuthorization)
+    {
+        return StatusPresentation {
+            title: texts.authorization_denied,
+            detail: texts.retry_authorization,
+            icon_name: "dialog-password-symbolic",
+        };
+    }
+    match health {
+        HealthState::Inactive => StatusPresentation {
+            title: texts.inactive,
+            detail: texts.routing_inactive,
+            icon_name: "media-playback-stop-symbolic",
+        },
+        HealthState::Applying => StatusPresentation {
+            title: texts.status_applying,
+            detail: texts.authorization_waiting,
+            icon_name: "process-working-symbolic",
+        },
+        HealthState::Healthy => StatusPresentation {
+            title: texts.status_healthy,
+            detail: texts.routing_active,
+            icon_name: "emblem-ok-symbolic",
+        },
+        HealthState::Degraded => StatusPresentation {
+            title: texts.status_degraded,
+            detail: texts.technical_details,
+            icon_name: "dialog-warning-symbolic",
+        },
+        HealthState::Failed => StatusPresentation {
+            title: texts.status_failed,
+            detail: texts.technical_details,
+            icon_name: "dialog-error-symbolic",
+        },
+        HealthState::NeedsAuthorization => unreachable!(),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupStep {

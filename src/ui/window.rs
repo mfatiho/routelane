@@ -15,7 +15,7 @@ use routelane::ipc::{DaemonEvent, DaemonRequest, DaemonStatus};
 
 use crate::models::{DaemonToUi, UiToDaemon};
 use crate::ui::experience::{
-    authorization_after_applied, authorization_after_error, dashboard_state,
+    authorization_after_applied, authorization_after_error, dashboard_state, status_presentation,
     AuthorizationPresentation, DashboardState, PrimaryAction, SetupStep,
 };
 use crate::ui::i18n::LanguageTexts;
@@ -146,6 +146,7 @@ fn status_is_active(status: &DaemonStatus) -> bool {
 fn dashboard_copy(
     texts: crate::ui::i18n::Texts,
     state: DashboardState,
+    health: HealthState,
 ) -> (&'static str, &'static str, &'static str) {
     match (state.authorization, state.setup_step, state.primary_action) {
         (AuthorizationPresentation::Waiting, _, _) => (
@@ -162,16 +163,14 @@ fn dashboard_copy(
             (texts.inactive, texts.add_first_lane, texts.open_preferences)
         }
         (_, Some(SetupStep::AddRule), _) => (texts.inactive, texts.add_first_rule, texts.add_rule),
-        (_, None, PrimaryAction::DisableRouting) => (
-            texts.disable_routing,
-            texts.routing_active,
-            texts.disable_routing,
-        ),
-        _ => (
-            texts.enable_routing,
-            texts.routing_inactive,
-            texts.enable_routing,
-        ),
+        (_, None, action) => {
+            let presentation = status_presentation(health, state.authorization, texts);
+            let action = match action {
+                PrimaryAction::DisableRouting => texts.disable_routing,
+                _ => texts.enable_routing,
+            };
+            (presentation.title, presentation.detail, action)
+        }
     }
 }
 
@@ -430,7 +429,7 @@ pub fn build_window(
     let page = adw::PreferencesPage::new();
     let initial_dashboard = dashboard_state(&profile.borrow(), HealthState::Inactive, false);
     let (dashboard_title, dashboard_subtitle, dashboard_action) =
-        dashboard_copy(texts, initial_dashboard);
+        dashboard_copy(texts, initial_dashboard, HealthState::Inactive);
     let dashboard_group = adw::PreferencesGroup::builder().title("RouteLane").build();
     let dashboard_row = adw::ActionRow::builder()
         .title(dashboard_title)
@@ -484,7 +483,7 @@ pub fn build_window(
         let config_writable = config_writable.clone();
         Rc::new(move |health: HealthState| {
             let state = dashboard_state(&profile.borrow(), health, mutation_pending.get());
-            let (title, subtitle, action) = dashboard_copy(texts, state);
+            let (title, subtitle, action) = dashboard_copy(texts, state, health);
             dashboard_row.set_title(title);
             dashboard_row.set_subtitle(subtitle);
             dashboard_primary.set_label(action);

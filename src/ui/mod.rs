@@ -10,7 +10,7 @@ pub mod window;
 mod experience_contract_tests {
     use super::experience::{
         activation_action, authorization_after_applied, authorization_after_error, dashboard_state,
-        ActivationAction, AuthorizationPresentation, PrimaryAction, SetupStep,
+        status_presentation, ActivationAction, AuthorizationPresentation, PrimaryAction, SetupStep,
     };
     use crate::ui::i18n::LanguageTexts;
     use routelane::config::Language;
@@ -110,5 +110,26 @@ mod experience_contract_tests {
             authorization_after_applied(),
             AuthorizationPresentation::Idle
         );
+    }
+
+    #[test]
+    fn status_presentation_replaces_raw_health_states_with_actionable_copy() {
+        for health in [
+            HealthState::Inactive,
+            HealthState::Applying,
+            HealthState::NeedsAuthorization,
+            HealthState::Healthy,
+            HealthState::Degraded,
+            HealthState::Failed,
+        ] {
+            let presentation = status_presentation(
+                health,
+                AuthorizationPresentation::Idle,
+                Language::Tr.texts(),
+            );
+            assert!(!presentation.title.is_empty());
+            assert!(!presentation.detail.is_empty());
+            assert!(!presentation.icon_name.is_empty());
+        }
     }
 }
