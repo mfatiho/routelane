@@ -244,7 +244,7 @@ pub fn build_window(
     app: &adw::Application,
     sender: Sender<UiToDaemon>,
     receiver: Receiver<DaemonToUi>,
-) {
+) -> adw::ApplicationWindow {
     gtk::Window::set_default_icon_name(APP_ICON_NAME);
     let repository = ConfigRepository::user_default();
     let (mut document, load_error) = match repository.load() {
@@ -837,6 +837,7 @@ pub fn build_window(
         }
     });
     window.present();
+    window
 }
 
 fn append_rule(context: &RuleListContext, rule: &Rule) {

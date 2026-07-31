@@ -1,7 +1,7 @@
 mod models;
 mod ui;
 
-use std::time::Duration;
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use async_channel::{bounded, Receiver, Sender};
 use libadwaita::{self as adw, prelude::*};
@@ -73,17 +73,20 @@ fn main() {
         .build();
     {
         let ui_sender = ui_sender.clone();
+        let main_window = Rc::new(RefCell::new(None::<adw::ApplicationWindow>));
         app.connect_activate(move |app| {
-            if matches!(
-                ui::experience::activation_action(app.active_window().is_some()),
-                ui::experience::ActivationAction::PresentExisting
-            ) {
-                if let Some(window) = app.active_window() {
-                    window.present();
-                    return;
+            match ui::experience::activation_action(main_window.borrow().is_some()) {
+                ui::experience::ActivationAction::PresentExisting => {
+                    if let Some(window) = main_window.borrow().as_ref() {
+                        window.present();
+                    }
+                }
+                ui::experience::ActivationAction::CreateWindow => {
+                    let window =
+                        ui::window::build_window(app, ui_sender.clone(), daemon_receiver.clone());
+                    *main_window.borrow_mut() = Some(window);
                 }
             }
-            ui::window::build_window(app, ui_sender.clone(), daemon_receiver.clone());
         });
     }
     app.connect_shutdown(move |_| {
