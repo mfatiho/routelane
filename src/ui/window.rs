@@ -65,6 +65,10 @@ pub fn health_view(report: &HealthReport, generation: Option<u64>) -> Connection
     }
 }
 
+fn health_after_apply_request() -> ConnectionHealthView {
+    health_view(&HealthReport::applying(), None)
+}
+
 pub fn daemon_unavailable_view(detail: impl Into<String>) -> ConnectionHealthView {
     ConnectionHealthView {
         aggregate: "DaemonUnavailable".to_owned(),
@@ -567,11 +571,13 @@ pub fn build_window(
         let profile = profile.clone();
         let save_profile = save_profile.clone();
         let updating_switch = updating_switch.clone();
+        let health_content = health_content.clone();
         active.connect_state_set(move |_, state| {
             if updating_switch.get() {
                 return Inhibit(false);
             }
             if state {
+                render_health(&health_content, &health_after_apply_request(), texts);
                 save_profile(PostSaveAction::Request(apply_request(&profile.borrow())));
             } else {
                 let sender = sender.clone();
@@ -1045,9 +1051,10 @@ fn refreshed_interface_selection(previous_name: Option<&str>, names: &[String]) 
 mod tests {
     use super::{
         accept_connection_epoch, accept_daemon_event_revision, accept_daemon_status_revision,
-        configuration_error_view, daemon_unavailable_view, health_sections, health_view,
-        reconcile_profiles, refreshed_interface_selection, rule_dialog_submission,
-        status_is_active, switch_state_after_persistence_failure, RuleDialogSubmission,
+        configuration_error_view, daemon_unavailable_view, health_after_apply_request,
+        health_sections, health_view, reconcile_profiles, refreshed_interface_selection,
+        rule_dialog_submission, status_is_active, switch_state_after_persistence_failure,
+        RuleDialogSubmission,
     };
     use crate::ui::i18n::LanguageTexts;
     use routelane::config::ConfigV2;
@@ -1075,6 +1082,11 @@ mod tests {
             rule_dialog_submission("Example.COM"),
             RuleDialogSubmission::Valid(RuleTarget::Domain("example.com".to_owned()))
         );
+    }
+
+    #[test]
+    fn apply_request_immediately_reports_applying_instead_of_stale_inactive() {
+        assert_eq!(health_after_apply_request().aggregate, "Applying");
     }
 
     #[test]
