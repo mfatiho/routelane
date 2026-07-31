@@ -19,7 +19,9 @@ use crate::ui::experience::{
     AuthorizationPresentation, DashboardState, PrimaryAction, SetupStep,
 };
 use crate::ui::i18n::LanguageTexts;
-use crate::ui::rule_row::{create_rule_row, set_rule_enabled_request, RuleEdit, RuleRowContext};
+use crate::ui::rule_row::{
+    create_rule_row, set_rule_enabled_request, ReorderDirection, RuleEdit, RuleRowContext,
+};
 use crate::ui::settings::build_settings_dialog;
 use crate::ui::tray::{spawn_tray, TrayCommand, APP_ICON_NAME};
 use routelane::config::{
@@ -277,8 +279,6 @@ fn open_rule_dialog(
     let actions =
         gtk::StringList::new(&[texts.action_route, texts.action_direct, texts.action_block]);
     let action = gtk::DropDown::builder().model(&actions).build();
-    let priority = gtk::SpinButton::with_range(1.0, 4_294_967_295.0, 1.0);
-    priority.set_value(100.0);
     let button_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -293,7 +293,6 @@ fn open_rule_dialog(
     content.append(&target);
     content.append(&feedback);
     content.append(&action);
-    content.append(&priority);
     content.append(&button_row);
     dialog.set_content(Some(&content));
     dialog.set_default_widget(Some(&submit));
@@ -308,7 +307,6 @@ fn open_rule_dialog(
         let target = target.clone();
         let feedback = feedback.clone();
         let action = action.clone();
-        let priority = priority.clone();
         Rc::new(move || {
             let text = target.text().trim().to_owned();
             let target_value = match rule_dialog_submission(&text) {
@@ -337,7 +335,7 @@ fn open_rule_dialog(
             let rule = Rule {
                 id: RuleId::from(format!("rule-{}", uuid::Uuid::new_v4()).as_str()),
                 enabled: true,
-                priority: priority.value_as_int().max(1) as u32,
+                priority: next_rule_priority(&profile.borrow()),
                 source: RuleSource::Any,
                 target: target_value,
                 action: rule_action,
@@ -352,7 +350,6 @@ fn open_rule_dialog(
             append_rule(&rule_list, &rule);
             target.set_text("");
             action.set_selected(0);
-            priority.set_value(100.0);
             dialog.close();
         })
     };
@@ -642,9 +639,7 @@ pub fn build_window(
         save_profile: save_profile.clone(),
         window: window.clone(),
     };
-    for rule in profile.borrow().rules.clone() {
-        append_rule(&rule_list, &rule);
-    }
+    rebuild_rule_rows(&rule_list);
 
     {
         let window = window.clone();
@@ -1064,12 +1059,53 @@ fn append_rule(context: &RuleListContext, rule: &Rule) {
             save(action);
         })
     };
+    let on_reorder: Rc<dyn Fn(RuleId, ReorderDirection)> = {
+        let profile = context.profile.clone();
+        let save = context.save_profile.clone();
+        let routing_active = context.routing_active.clone();
+        let context = context.clone();
+        Rc::new(move |id, direction| {
+            let mut ordered: Vec<Rule> = profile.borrow().rules.clone();
+            ordered.sort_by(Rule::execution_cmp);
+            let Some(index) = ordered.iter().position(|rule| rule.id == id) else {
+                return;
+            };
+            let neighbor_index = match direction {
+                ReorderDirection::Up => index.checked_sub(1),
+                ReorderDirection::Down => index.checked_add(1).filter(|i| *i < ordered.len()),
+            };
+            let Some(neighbor_index) = neighbor_index else {
+                return;
+            };
+            let this_priority = ordered[index].priority;
+            let neighbor_id = ordered[neighbor_index].id.clone();
+            let neighbor_priority = ordered[neighbor_index].priority;
+            {
+                let mut profile = profile.borrow_mut();
+                for rule in profile.rules.iter_mut() {
+                    if rule.id == id {
+                        rule.priority = neighbor_priority;
+                    } else if rule.id == neighbor_id {
+                        rule.priority = this_priority;
+                    }
+                }
+            }
+            let action = if routing_active.get() {
+                PostSaveAction::Request(apply_request(&profile.borrow()))
+            } else {
+                PostSaveAction::None
+            };
+            save(action);
+            rebuild_rule_rows(&context);
+        })
+    };
     let row_context = RuleRowContext {
         lanes,
         texts: context.texts,
         parent: context.window.clone(),
         on_change,
         on_delete,
+        on_reorder,
     };
     let row = create_rule_row(rule, row_context);
     context.group.add(&row);
@@ -1080,10 +1116,20 @@ fn rebuild_rule_rows(context: &RuleListContext) {
     for row in context.rows.borrow_mut().drain(..) {
         context.group.remove(&row);
     }
-    let rules = context.profile.borrow().rules.clone();
+    let mut rules = context.profile.borrow().rules.clone();
+    rules.sort_by(Rule::execution_cmp);
     for rule in rules {
         append_rule(context, &rule);
     }
+}
+
+fn next_rule_priority(profile: &Profile) -> u32 {
+    profile
+        .rules
+        .iter()
+        .map(|rule| rule.priority)
+        .max()
+        .map_or(100, |highest| highest.saturating_add(10))
 }
 
 fn apply_request(profile: &Profile) -> DaemonRequest {
@@ -1232,7 +1278,9 @@ mod tests {
     };
     use crate::ui::i18n::LanguageTexts;
     use routelane::config::ConfigV2;
-    use routelane::domain::{HealthState, LaneId, ProfileId, RuleTarget};
+    use routelane::domain::{
+        HealthState, LaneId, ProfileId, Rule, RuleAction, RuleId, RuleSource, RuleTarget,
+    };
     use routelane::health::{
         Diagnostic, DiagnosticCode, DiagnosticSubject, HealthReport, LaneHealth, Severity,
         SuggestedAction,
@@ -1256,6 +1304,37 @@ mod tests {
             rule_dialog_submission("Example.COM"),
             RuleDialogSubmission::Valid(RuleTarget::Domain("example.com".to_owned()))
         );
+    }
+
+    #[test]
+    fn next_rule_priority_defaults_to_one_hundred_for_an_empty_profile() {
+        assert_eq!(
+            super::next_rule_priority(&super::empty_default_profile()),
+            100
+        );
+    }
+
+    #[test]
+    fn next_rule_priority_is_ten_above_the_current_highest() {
+        let mut profile = super::empty_default_profile();
+        profile.rules.push(Rule {
+            id: RuleId::from("a"),
+            enabled: true,
+            priority: 40,
+            source: RuleSource::Any,
+            target: RuleTarget::Domain("a.example".to_owned()),
+            action: RuleAction::Direct,
+        });
+        profile.rules.push(Rule {
+            id: RuleId::from("b"),
+            enabled: true,
+            priority: 15,
+            source: RuleSource::Any,
+            target: RuleTarget::Domain("b.example".to_owned()),
+            action: RuleAction::Direct,
+        });
+
+        assert_eq!(super::next_rule_priority(&profile), 50);
     }
 
     #[test]

@@ -27,12 +27,19 @@ pub enum RuleEdit {
     Enabled(bool),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReorderDirection {
+    Up,
+    Down,
+}
+
 pub struct RuleRowContext {
     pub lanes: Vec<(LaneId, String)>,
     pub texts: Texts,
     pub parent: adw::ApplicationWindow,
     pub on_change: Rc<dyn Fn(Rule, RuleEdit)>,
     pub on_delete: Rc<dyn Fn(RuleId)>,
+    pub on_reorder: Rc<dyn Fn(RuleId, ReorderDirection)>,
 }
 
 pub fn create_rule_row(rule: &Rule, context: RuleRowContext) -> adw::ActionRow {
@@ -42,6 +49,7 @@ pub fn create_rule_row(rule: &Rule, context: RuleRowContext) -> adw::ActionRow {
         parent,
         on_change,
         on_delete,
+        on_reorder,
     } = context;
     let row = adw::ActionRow::new();
     row.set_title(&target_label(rule));
@@ -51,10 +59,18 @@ pub fn create_rule_row(rule: &Rule, context: RuleRowContext) -> adw::ActionRow {
         .valign(gtk::Align::Center)
         .tooltip_text(texts.rule_enabled)
         .build();
-    let priority = gtk::SpinButton::with_range(1.0, 4_294_967_295.0, 1.0);
-    priority.set_value(f64::from(rule.priority));
-    priority.set_width_chars(6);
-    priority.set_tooltip_text(Some(texts.rule_priority));
+    let move_up = gtk::Button::builder()
+        .icon_name("go-up-symbolic")
+        .tooltip_text(texts.move_rule_up)
+        .valign(gtk::Align::Center)
+        .build();
+    move_up.add_css_class("flat");
+    let move_down = gtk::Button::builder()
+        .icon_name("go-down-symbolic")
+        .tooltip_text(texts.move_rule_down)
+        .valign(gtk::Align::Center)
+        .build();
+    move_down.add_css_class("flat");
 
     let actions =
         gtk::StringList::new(&[texts.action_route, texts.action_direct, texts.action_block]);
@@ -92,11 +108,12 @@ pub fn create_rule_row(rule: &Rule, context: RuleRowContext) -> adw::ActionRow {
     delete.add_css_class("flat");
 
     row.add_suffix(&enabled);
-    row.add_suffix(&priority);
+    row.add_suffix(&move_up);
+    row.add_suffix(&move_down);
     row.add_suffix(&action);
     row.add_suffix(&lane_select);
     row.add_suffix(&delete);
-    row.set_subtitle(&action_label(&rule.action, &lanes, rule.priority));
+    row.set_subtitle(&action_label(&rule.action, &lanes));
     let rule_state = Rc::new(RefCell::new(rule.clone()));
 
     {
@@ -109,11 +126,17 @@ pub fn create_rule_row(rule: &Rule, context: RuleRowContext) -> adw::ActionRow {
         });
     }
     {
-        let changed = rule_state.clone();
-        let on_change = on_change.clone();
-        priority.connect_value_changed(move |spin| {
-            changed.borrow_mut().priority = spin.value_as_int().max(1) as u32;
-            on_change(changed.borrow().clone(), RuleEdit::Definition);
+        let rule_id = rule.id.clone();
+        let on_reorder = on_reorder.clone();
+        move_up.connect_clicked(move |_| {
+            on_reorder(rule_id.clone(), ReorderDirection::Up);
+        });
+    }
+    {
+        let rule_id = rule.id.clone();
+        let on_reorder = on_reorder.clone();
+        move_down.connect_clicked(move |_| {
+            on_reorder(rule_id.clone(), ReorderDirection::Down);
         });
     }
     {
@@ -185,8 +208,8 @@ fn target_label(rule: &Rule) -> String {
     }
 }
 
-fn action_label(action: &RuleAction, lanes: &[(LaneId, String)], priority: u32) -> String {
-    let action = match action {
+fn action_label(action: &RuleAction, lanes: &[(LaneId, String)]) -> String {
+    match action {
         RuleAction::Route(lane_id) => lanes
             .iter()
             .find(|(id, _)| id == lane_id)
@@ -194,8 +217,7 @@ fn action_label(action: &RuleAction, lanes: &[(LaneId, String)], priority: u32) 
             .unwrap_or_else(|| "Route".to_owned()),
         RuleAction::Direct => "Direct".to_owned(),
         RuleAction::Block => "Block".to_owned(),
-    };
-    format!("{action} · priority {priority}")
+    }
 }
 
 #[cfg(test)]
