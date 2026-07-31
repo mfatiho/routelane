@@ -244,6 +244,113 @@ struct RuleListContext {
     save_profile: Rc<dyn Fn(PostSaveAction)>,
 }
 
+fn open_rule_dialog(
+    parent: &adw::ApplicationWindow,
+    texts: crate::ui::i18n::Texts,
+    profile: Rc<RefCell<Profile>>,
+    routing_active: Rc<Cell<bool>>,
+    save_profile: Rc<dyn Fn(PostSaveAction)>,
+    rule_list: RuleListContext,
+) {
+    let dialog = adw::Window::builder()
+        .title(texts.add_address_title)
+        .transient_for(parent)
+        .modal(true)
+        .hide_on_close(true)
+        .default_width(480)
+        .build();
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .build();
+    let target = gtk::Entry::builder()
+        .placeholder_text(texts.address_placeholder)
+        .hexpand(true)
+        .build();
+    let feedback = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    feedback.add_css_class("error");
+    feedback.set_visible(false);
+    let actions =
+        gtk::StringList::new(&[texts.action_route, texts.action_direct, texts.action_block]);
+    let action = gtk::DropDown::builder().model(&actions).build();
+    let priority = gtk::SpinButton::with_range(1.0, 4_294_967_295.0, 1.0);
+    priority.set_value(100.0);
+    let submit = gtk::Button::with_label(texts.add_rule);
+    submit.add_css_class("suggested-action");
+
+    content.append(&target);
+    content.append(&feedback);
+    content.append(&action);
+    content.append(&priority);
+    content.append(&submit);
+    dialog.set_content(Some(&content));
+    dialog.set_default_widget(Some(&submit));
+
+    let submit_rule: Rc<dyn Fn()> = {
+        let dialog = dialog.clone();
+        let target = target.clone();
+        let feedback = feedback.clone();
+        let action = action.clone();
+        let priority = priority.clone();
+        Rc::new(move || {
+            let text = target.text().trim().to_owned();
+            let target_value = match rule_dialog_submission(&text) {
+                RuleDialogSubmission::Invalid => {
+                    target.add_css_class("error");
+                    feedback.set_label(texts.invalid_rule_target);
+                    feedback.set_visible(true);
+                    return;
+                }
+                RuleDialogSubmission::Valid(target_value) => {
+                    target.remove_css_class("error");
+                    feedback.set_visible(false);
+                    target_value
+                }
+            };
+            let rule_action = match action.selected() {
+                1 => RuleAction::Direct,
+                2 => RuleAction::Block,
+                _ => profile
+                    .borrow()
+                    .lanes
+                    .first()
+                    .map(|lane| RuleAction::Route(lane.id.clone()))
+                    .unwrap_or(RuleAction::Direct),
+            };
+            let rule = Rule {
+                id: RuleId::from(format!("rule-{}", uuid::Uuid::new_v4()).as_str()),
+                enabled: true,
+                priority: priority.value_as_int().max(1) as u32,
+                source: RuleSource::Any,
+                target: target_value,
+                action: rule_action,
+            };
+            profile.borrow_mut().rules.push(rule.clone());
+            let post_save_action = if routing_active.get() {
+                PostSaveAction::Request(apply_request(&profile.borrow()))
+            } else {
+                PostSaveAction::None
+            };
+            save_profile(post_save_action);
+            append_rule(&rule_list, &rule);
+            target.set_text("");
+            action.set_selected(0);
+            priority.set_value(100.0);
+            dialog.close();
+        })
+    };
+    submit.connect_clicked({
+        let submit_rule = submit_rule.clone();
+        move |_| submit_rule()
+    });
+    target.connect_activate(move |_| submit_rule());
+    dialog.present();
+}
+
 pub fn build_window(
     app: &adw::Application,
     sender: Sender<UiToDaemon>,
@@ -314,6 +421,39 @@ pub fn build_window(
     dashboard_row.add_suffix(&dashboard_primary);
     dashboard_group.add(&dashboard_row);
     page.add(&dashboard_group);
+    let active_lane_group = adw::PreferencesGroup::builder()
+        .title(texts.active_lane_title)
+        .build();
+    let active_lane_row = adw::ActionRow::new();
+    active_lane_group.add(&active_lane_row);
+    let sync_lane_summary: Rc<dyn Fn()> = {
+        let profile = profile.clone();
+        let active_lane_group = active_lane_group.clone();
+        let active_lane_row = active_lane_row.clone();
+        Rc::new(move || {
+            let profile = profile.borrow();
+            let Some(lane) = profile.lanes.first() else {
+                active_lane_group.set_visible(false);
+                return;
+            };
+            let failure_policy = match lane.failure_policy {
+                routelane::domain::LaneFailurePolicy::Block => texts.failure_block,
+                routelane::domain::LaneFailurePolicy::Direct => texts.failure_direct,
+                routelane::domain::LaneFailurePolicy::Inactive => texts.failure_inactive,
+            };
+            active_lane_row.set_title(&lane.name);
+            active_lane_row.set_subtitle(&format!(
+                "{}: {} • {}: {}",
+                texts.lane_summary_interface,
+                lane.interface.as_str(),
+                texts.lane_summary_failure_policy,
+                failure_policy
+            ));
+            active_lane_group.set_visible(true);
+        })
+    };
+    sync_lane_summary();
+    page.add(&active_lane_group);
     let sync_dashboard: Rc<dyn Fn(HealthState)> = {
         let profile = profile.clone();
         let mutation_pending = mutation_pending.clone();
@@ -348,6 +488,16 @@ pub fn build_window(
         render_health(&config_error_content, &error, texts);
     }
     page.add(&config_error_group);
+    let rules_group = adw::PreferencesGroup::builder()
+        .title(texts.rules_title)
+        .description(texts.rules_description)
+        .build();
+    rules_group.set_sensitive(editable);
+    let add_rule_button = gtk::Button::with_label(texts.add_rule);
+    add_rule_button.set_halign(gtk::Align::Start);
+    add_rule_button.set_sensitive(editable);
+    rules_group.add(&add_rule_button);
+    page.add(&rules_group);
     let health_group = adw::PreferencesGroup::builder()
         .title(texts.health_title)
         .build();
@@ -357,35 +507,6 @@ pub fn build_window(
     health_group.add(&health_row);
     render_health(&health_content, &initial_daemon_health, texts);
     page.add(&health_group);
-
-    let rules_group = adw::PreferencesGroup::builder()
-        .title(texts.rules_title)
-        .description(texts.rules_description)
-        .build();
-    rules_group.set_sensitive(editable);
-    let add_row = adw::ActionRow::builder()
-        .title(texts.add_address_title)
-        .build();
-    let target = gtk::Entry::builder()
-        .placeholder_text(texts.address_placeholder)
-        .hexpand(true)
-        .build();
-    let actions =
-        gtk::StringList::new(&[texts.action_route, texts.action_direct, texts.action_block]);
-    let action = gtk::DropDown::builder().model(&actions).build();
-    let priority = gtk::SpinButton::with_range(1.0, 4_294_967_295.0, 1.0);
-    priority.set_value(100.0);
-    let add = gtk::Button::builder()
-        .icon_name("list-add-symbolic")
-        .tooltip_text(texts.add_rule_tooltip)
-        .build();
-    add.set_sensitive(editable);
-    add_row.add_suffix(&target);
-    add_row.add_suffix(&action);
-    add_row.add_suffix(&priority);
-    add_row.add_suffix(&add);
-    rules_group.add(&add_row);
-    page.add(&rules_group);
 
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&page));
@@ -442,7 +563,7 @@ pub fn build_window(
         let last_applied_profile_id = last_applied_profile_id.clone();
         let config_writable = config_writable.clone();
         let settings = settings.clone();
-        let add = add.clone();
+        let add_rule_button = add_rule_button.clone();
         let rules_group = rules_group.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(result) = results.recv().await {
@@ -466,7 +587,7 @@ pub fn build_window(
                         updating_switch.set(false);
                         active.set_sensitive(false);
                         settings.set_sensitive(false);
-                        add.set_sensitive(false);
+                        add_rule_button.set_sensitive(false);
                         rules_group.set_sensitive(false);
                         config_error_group.set_visible(true);
                         render_health(
@@ -507,6 +628,7 @@ pub fn build_window(
         let persist_document = persist_document.clone();
         let rule_list = rule_list.clone();
         let routing_active = routing_active.clone();
+        let sync_lane_summary = sync_lane_summary.clone();
         settings.connect_clicked(move |_| {
             let initial_language = document.borrow().language;
             let on_language: Rc<dyn Fn(Language)> = {
@@ -523,6 +645,7 @@ pub fn build_window(
                 let save_profile = save_profile.clone();
                 let rule_list = rule_list.clone();
                 let routing_active = routing_active.clone();
+                let sync_lane_summary = sync_lane_summary.clone();
                 let profile = profile.clone();
                 Rc::new(move || {
                     let action = if routing_active.get() {
@@ -532,6 +655,7 @@ pub fn build_window(
                     };
                     save_profile(action);
                     rebuild_rule_rows(&rule_list);
+                    sync_lane_summary();
                 })
             };
             let dialog = build_settings_dialog(
@@ -548,13 +672,14 @@ pub fn build_window(
     {
         let profile = profile.clone();
         let settings = settings.clone();
-        let target = target.clone();
         let routing_active = routing_active.clone();
         let save_profile = save_profile.clone();
         let sender = sender.clone();
         let mutation_pending = mutation_pending.clone();
         let sync_dashboard = sync_dashboard.clone();
         let health_content = health_content.clone();
+        let window = window.clone();
+        let rule_list = rule_list.clone();
         dashboard_primary.connect_clicked(move |_| {
             if mutation_pending.get() {
                 return;
@@ -568,7 +693,14 @@ pub fn build_window(
             match state.primary_action {
                 PrimaryAction::OpenPreferences => settings.emit_clicked(),
                 PrimaryAction::OpenRuleDialog => {
-                    target.grab_focus();
+                    open_rule_dialog(
+                        &window,
+                        texts,
+                        profile.clone(),
+                        routing_active.clone(),
+                        save_profile.clone(),
+                        rule_list.clone(),
+                    );
                 }
                 PrimaryAction::EnableRouting => {
                     mutation_pending.set(true);
@@ -624,58 +756,21 @@ pub fn build_window(
         });
     }
     {
+        let window = window.clone();
         let profile = profile.clone();
-        let save_profile = save_profile.clone();
         let routing_active = routing_active.clone();
+        let save_profile = save_profile.clone();
         let rule_list = rule_list.clone();
-        let target_for_add = target.clone();
-        let add_rule = move || {
-            let text = target_for_add.text().trim().to_owned();
-            let target_value = match rule_dialog_submission(&text) {
-                RuleDialogSubmission::Invalid => {
-                    target_for_add.add_css_class("error");
-                    return;
-                }
-                RuleDialogSubmission::Valid(target) => {
-                    target_for_add.remove_css_class("error");
-                    target
-                }
-            };
-            let rule_action = match action.selected() {
-                1 => RuleAction::Direct,
-                2 => RuleAction::Block,
-                _ => profile
-                    .borrow()
-                    .lanes
-                    .first()
-                    .map(|lane| RuleAction::Route(lane.id.clone()))
-                    .unwrap_or(RuleAction::Direct),
-            };
-            let rule = Rule {
-                id: RuleId::from(format!("rule-{}", uuid::Uuid::new_v4()).as_str()),
-                enabled: true,
-                priority: priority.value_as_int().max(1) as u32,
-                source: RuleSource::Any,
-                target: target_value,
-                action: rule_action,
-            };
-            {
-                profile.borrow_mut().rules.push(rule.clone());
-            }
-            let action = if routing_active.get() {
-                PostSaveAction::Request(apply_request(&profile.borrow()))
-            } else {
-                PostSaveAction::None
-            };
-            save_profile(action);
-            append_rule(&rule_list, &rule);
-            target_for_add.set_text("");
-        };
-        add.connect_clicked({
-            let add_rule = add_rule.clone();
-            move |_| add_rule()
+        add_rule_button.connect_clicked(move |_| {
+            open_rule_dialog(
+                &window,
+                texts,
+                profile.clone(),
+                routing_active.clone(),
+                save_profile.clone(),
+                rule_list.clone(),
+            );
         });
-        target.connect_activate(move |_| add_rule());
     }
 
     {
@@ -695,6 +790,7 @@ pub fn build_window(
         let config_writable = config_writable.clone();
         let mutation_pending = mutation_pending.clone();
         let sync_dashboard = sync_dashboard.clone();
+        let sync_lane_summary = sync_lane_summary.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = receiver.recv().await {
                 match event {
@@ -852,6 +948,7 @@ pub fn build_window(
                             }
                             persist_document(PostSaveAction::None);
                             rebuild_rule_rows(&rule_list);
+                            sync_lane_summary();
                         }
                     }
                 }
