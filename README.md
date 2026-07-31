@@ -161,6 +161,27 @@ The desktop configuration is schema version 2 and is stored at
 `~/.config/routelane/config.json`. Stored profiles are inactive on load; a user
 must explicitly apply one.
 
+## Uninstalling
+
+```bash
+sudo apt remove routelane
+```
+
+`apt remove` deletes every file the package owns (there are no conffiles), stops
+and disables `routelane-helper.service`, and best-effort stops
+`routelane-daemon.service` for any active user session. `~/.config/routelane/config.json`
+is not owned by the package and is left in place for each user.
+
+Disable routing (GUI toggle or `routelanectl deactivate`) **before** removing the
+package if routing is currently active. Tearing down the live kernel routing
+state (the `inet routelane` nftables table, rule priorities 10000-10099, and
+routing tables 20000-20099) requires RouteLane's privileged Polkit action,
+which needs an interactive prompt — a package removal script cannot satisfy
+that non-interactively, so it cannot be done automatically during `apt remove`.
+If you remove the package while routing was still active, `postrm` detects and
+warns about any leftover kernel state and prints the exact commands to clear it
+manually.
+
 ## Troubleshooting a GUI crash
 
 The desktop launcher runs `RUST_BACKTRACE=1 routelane`, and its stderr,
