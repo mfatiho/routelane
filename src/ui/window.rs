@@ -279,16 +279,29 @@ fn open_rule_dialog(
     let action = gtk::DropDown::builder().model(&actions).build();
     let priority = gtk::SpinButton::with_range(1.0, 4_294_967_295.0, 1.0);
     priority.set_value(100.0);
+    let button_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    let cancel = gtk::Button::with_label(texts.cancel);
     let submit = gtk::Button::with_label(texts.add_rule);
     submit.add_css_class("suggested-action");
+    button_row.append(&cancel);
+    button_row.append(&submit);
 
     content.append(&target);
     content.append(&feedback);
     content.append(&action);
     content.append(&priority);
-    content.append(&submit);
+    content.append(&button_row);
     dialog.set_content(Some(&content));
     dialog.set_default_widget(Some(&submit));
+
+    cancel.connect_clicked({
+        let dialog = dialog.clone();
+        move |_| dialog.close()
+    });
 
     let submit_rule: Rc<dyn Fn()> = {
         let dialog = dialog.clone();
