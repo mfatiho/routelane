@@ -101,6 +101,78 @@ Description: Policy-based routing desktop application
  RouteLane routes selected domains or IP/CIDR targets through a chosen network interface.
 CONTROL
 
+cat > "${PACKAGE_ROOT}/DEBIAN/prerm" <<'PRERM'
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove)
+        systemctl stop routelane-helper.service >/dev/null 2>&1 || true
+        systemctl disable routelane-helper.service >/dev/null 2>&1 || true
+
+        if [ -d /run/user ]; then
+            for run_dir in /run/user/*; do
+                [ -d "$run_dir" ] || continue
+                uid="$(basename "$run_dir")"
+                user="$(getent passwd "$uid" | cut -d: -f1)" || continue
+                [ -n "$user" ] || continue
+                runuser -u "$user" -- env XDG_RUNTIME_DIR="$run_dir" \
+                    systemctl --user stop routelane-daemon.service >/dev/null 2>&1 || true
+            done
+        fi
+        ;;
+esac
+
+exit 0
+PRERM
+chmod 0755 "${PACKAGE_ROOT}/DEBIAN/prerm"
+
+cat > "${PACKAGE_ROOT}/DEBIAN/postrm" <<'POSTRM'
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|purge)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl reset-failed routelane-helper.service >/dev/null 2>&1 || true
+        fi
+
+        LEFTOVER=""
+        if command -v ip >/dev/null 2>&1 \
+            && ip rule show 2>/dev/null | grep -Eq '^100[0-9][0-9]:'; then
+            LEFTOVER="1"
+        fi
+        if command -v nft >/dev/null 2>&1 \
+            && nft list table inet routelane >/dev/null 2>&1; then
+            LEFTOVER="1"
+        fi
+
+        echo "RouteLane has been removed. Each user's ~/.config/routelane/config.json was left in place." >&2
+
+        if [ -n "$LEFTOVER" ]; then
+            cat >&2 <<'EOF'
+RouteLane was removed while its routing state was still active in the
+kernel. This cannot be cleaned up automatically from a package removal
+script -- RouteLane's privileged action requires an interactive Polkit
+prompt that a non-interactive removal script cannot satisfy. Check for
+and remove any leftover state manually:
+
+    ip rule show | grep -E '^100[0-9][0-9]:'
+    ip route show table 20000
+    nft list table inet routelane
+
+Remove what you find with 'sudo ip rule del ...', 'sudo ip route flush
+table <n>', and 'sudo nft delete table inet routelane'.
+EOF
+        fi
+        ;;
+esac
+
+exit 0
+POSTRM
+chmod 0755 "${PACKAGE_ROOT}/DEBIAN/postrm"
+
 echo "Building package: ${OUTPUT_DEB}"
 dpkg-deb --build --root-owner-group "${PACKAGE_ROOT}" "${OUTPUT_DEB}"
 
@@ -148,5 +220,22 @@ require_mode '-rw-r--r--' './usr/lib/systemd/system/routelane-helper.service'
 require_mode '-rw-r--r--' './usr/share/dbus-1/system-services/io.github.routelane.Helper.service'
 require_mode '-rw-r--r--' './usr/share/dbus-1/system.d/io.github.routelane.Helper.conf'
 require_mode '-rw-r--r--' './usr/share/polkit-1/actions/io.github.routelane.policy'
+
+CONTROL_EXTRACT_DIR="${BUILD_ROOT}/control"
+dpkg-deb -e "${OUTPUT_DEB}" "${CONTROL_EXTRACT_DIR}"
+
+require_control_mode() {
+    local expected_mode="$1"
+    local name="$2"
+    local actual_mode
+    actual_mode="$(stat -c '%a' "${CONTROL_EXTRACT_DIR}/${name}" 2>/dev/null || true)"
+    if [[ "${actual_mode}" != "${expected_mode}" ]]; then
+        echo "error: control script ${name} has mode '${actual_mode:-missing}', expected ${expected_mode}" >&2
+        exit 1
+    fi
+}
+
+require_control_mode '755' 'prerm'
+require_control_mode '755' 'postrm'
 
 echo "Created ${OUTPUT_DEB}"
