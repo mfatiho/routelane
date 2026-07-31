@@ -2,7 +2,7 @@
 Type=Application
 Name=RouteLane
 Comment=Policy-based routing desktop application
-Exec=routelane
+Exec=env RUST_BACKTRACE=1 routelane
 Icon=network-vpn-symbolic
 Terminal=false
 Categories=Network;System;

@@ -161,6 +161,22 @@ The desktop configuration is schema version 2 and is stored at
 `~/.config/routelane/config.json`. Stored profiles are inactive on load; a user
 must explicitly apply one.
 
+## Troubleshooting a GUI crash
+
+The desktop launcher runs `RUST_BACKTRACE=1 routelane`, and its stderr,
+including any panic message and backtrace, is captured by the user journal
+under the app-launch scope. If the window closes unexpectedly right after
+opening, check:
+
+```bash
+journalctl --user -g routelane --since "-10 min"
+```
+
+`cargo fmt`/`cargo test`/`cargo clippy` cannot catch a crash that only
+happens once the compiled binary actually runs (for example, a `RefCell`
+double-borrow reachable only from a live GTK callback) — a GUI crash always
+needs an actual launch to reproduce and the journal to diagnose.
+
 ## Official first-release support gate
 
 The first official RouteLane release will not be published until every cell in
