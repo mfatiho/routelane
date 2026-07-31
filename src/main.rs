@@ -60,6 +60,11 @@ impl ConnectionPolicy {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("{info}");
+        default_panic_hook(info);
+    }));
 
     let (ui_sender, ui_receiver) = bounded::<UiToDaemon>(64);
     let (daemon_sender, daemon_receiver) = bounded::<DaemonToUi>(64);
@@ -75,9 +80,11 @@ fn main() {
         let ui_sender = ui_sender.clone();
         let main_window = Rc::new(RefCell::new(None::<adw::ApplicationWindow>));
         app.connect_activate(move |app| {
-            match ui::experience::activation_action(main_window.borrow().is_some()) {
+            let has_existing_window = main_window.borrow().is_some();
+            match ui::experience::activation_action(has_existing_window) {
                 ui::experience::ActivationAction::PresentExisting => {
-                    if let Some(window) = main_window.borrow().as_ref() {
+                    let existing = main_window.borrow().clone();
+                    if let Some(window) = existing {
                         window.present();
                     }
                 }
