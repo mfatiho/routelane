@@ -15,7 +15,8 @@ use routelane::ipc::{DaemonEvent, DaemonRequest, DaemonStatus};
 
 use crate::models::{DaemonToUi, UiToDaemon};
 use crate::ui::experience::{
-    dashboard_state, AuthorizationPresentation, DashboardState, PrimaryAction, SetupStep,
+    authorization_after_applied, authorization_after_error, dashboard_state,
+    AuthorizationPresentation, DashboardState, PrimaryAction, SetupStep,
 };
 use crate::ui::i18n::LanguageTexts;
 use crate::ui::rule_row::{create_rule_row, set_rule_enabled_request, RuleEdit, RuleRowContext};
@@ -276,6 +277,7 @@ pub fn build_window(
         .build();
     let updating_switch = Rc::new(Cell::new(false));
     let routing_active = Rc::new(Cell::new(false));
+    let authorization = Rc::new(Cell::new(AuthorizationPresentation::Idle));
     let last_applied_profile_id = Rc::new(RefCell::new(None::<ProfileId>));
     let last_daemon_generation = Rc::new(Cell::new(None::<u64>));
     let last_event_sequence = Rc::new(Cell::new(None::<u64>));
@@ -647,6 +649,7 @@ pub fn build_window(
         let profile = profile.clone();
         let dashboard_row = dashboard_row.clone();
         let dashboard_primary = dashboard_primary.clone();
+        let authorization = authorization.clone();
         let rule_list = rule_list.clone();
         let document = document.clone();
         let persist_document = persist_document.clone();
@@ -740,6 +743,17 @@ pub fn build_window(
                         render_health(&health_content, &daemon_unavailable_view(detail), texts);
                     }
                     DaemonToUi::Error(error) => {
+                        let authorization_denied = error.to_string().contains("AccessDenied")
+                            || error.to_string().contains("authorization");
+                        let outcome =
+                            authorization_after_error(routing_active.get(), authorization_denied);
+                        authorization.set(outcome.authorization);
+                        if matches!(outcome.authorization, AuthorizationPresentation::Denied) {
+                            dashboard_row.set_title(texts.authorization_denied);
+                            dashboard_row.set_subtitle(texts.retry_authorization);
+                            dashboard_primary.set_label(texts.retry_authorization);
+                            dashboard_primary.set_sensitive(outcome.primary_action_enabled);
+                        }
                         toast_overlay.add_toast(
                             &adw::Toast::builder()
                                 .title(&error.to_string())
@@ -759,6 +773,7 @@ pub fn build_window(
                         });
                     }
                     DaemonToUi::Applied(result) => {
+                        authorization.set(authorization_after_applied());
                         rebuild_rule_rows(&rule_list);
                         title.set_subtitle(&format!("Applying generation {}", result.generation));
                         let sender = sender.clone();
