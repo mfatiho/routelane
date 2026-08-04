@@ -262,6 +262,7 @@ fn accept_daemon_event_revision(
 enum PostSaveAction {
     None,
     Request(DaemonRequest),
+    QuitApplication,
 }
 
 #[derive(Clone)]
@@ -653,6 +654,7 @@ pub fn build_window(
         let add_rule_button = add_rule_button.clone();
         let rules_group = rules_group.clone();
         let dashboard_primary = dashboard_primary.clone();
+        let app = app.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(result) = results.recv().await {
                 let action = pending
@@ -660,11 +662,13 @@ pub fn build_window(
                     .remove(&result.generation)
                     .unwrap_or(PostSaveAction::None);
                 match result.result {
-                    Ok(()) => {
-                        if let PostSaveAction::Request(request) = action {
+                    Ok(()) => match action {
+                        PostSaveAction::Request(request) => {
                             sender.send(UiToDaemon::Request(request)).await.ok();
                         }
-                    }
+                        PostSaveAction::QuitApplication => app.quit(),
+                        PostSaveAction::None => {}
+                    },
                     Err(error) => {
                         config_writable.set(false);
                         let restored_active = switch_state_after_persistence_failure(
@@ -725,7 +729,7 @@ pub fn build_window(
                     {
                         document.borrow_mut().language = language;
                     }
-                    persist_document(PostSaveAction::None);
+                    persist_document(PostSaveAction::QuitApplication);
                 })
             };
             let on_lane_change: Rc<dyn Fn()> = {

@@ -80,6 +80,69 @@ fn language_change_requires_restart(current: Language, selected: Language) -> bo
     current != selected
 }
 
+fn confirmed_language_change(
+    current: Language,
+    selected: Language,
+    confirmed: bool,
+) -> Option<Language> {
+    (confirmed && language_change_requires_restart(current, selected)).then_some(selected)
+}
+
+fn confirm_language_restart(
+    parent: &adw::PreferencesWindow,
+    texts: Texts,
+    on_confirm: Rc<dyn Fn()>,
+) {
+    let confirmation = adw::Window::builder()
+        .title(texts.language_restart_title)
+        .transient_for(parent)
+        .modal(true)
+        .default_width(420)
+        .build();
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .build();
+    let body = gtk::Label::builder()
+        .label(texts.language_restart_body)
+        .wrap(true)
+        .xalign(0.0)
+        .build();
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    let cancel = gtk::Button::with_label(texts.cancel);
+    let confirm = gtk::Button::with_label(texts.confirm);
+    confirm.add_css_class("suggested-action");
+    buttons.append(&cancel);
+    buttons.append(&confirm);
+    content.append(&body);
+    content.append(&buttons);
+    confirmation.set_content(Some(&content));
+    confirmation.set_default_widget(Some(&cancel));
+
+    cancel.connect_clicked({
+        let confirmation = confirmation.clone();
+        move |_| confirmation.close()
+    });
+    confirm.connect_clicked({
+        let confirmation = confirmation.clone();
+        move |_| {
+            on_confirm();
+            confirmation.close();
+        }
+    });
+
+    confirmation.present();
+    cancel.grab_focus();
+}
+
 fn set_lane_interface(profile: &mut Profile, lane_id: &LaneId, interface: &str) -> bool {
     if let Some(lane) = profile.lanes.iter_mut().find(|lane| &lane.id == lane_id) {
         lane.interface = InterfaceSelector::from(interface);
@@ -245,8 +308,38 @@ pub fn build_settings_dialog(
         .build();
     language.set_model(Some(&gtk::StringList::new(&["Türkçe", "English"])));
     language.set_selected(initial_language.index());
-    language.connect_selected_notify(move |combo| {
-        on_language(Language::from_index(combo.selected()));
+    let confirmed_language = Rc::new(std::cell::Cell::new(initial_language));
+    let reverting_language = Rc::new(std::cell::Cell::new(false));
+    language.connect_selected_notify({
+        let dialog = dialog.clone();
+        let confirmed_language = confirmed_language.clone();
+        let reverting_language = reverting_language.clone();
+        move |combo| {
+            if reverting_language.get() {
+                return;
+            }
+            let current = confirmed_language.get();
+            let selected = Language::from_index(combo.selected());
+            if !language_change_requires_restart(current, selected) {
+                return;
+            }
+            reverting_language.set(true);
+            combo.set_selected(current.index());
+            reverting_language.set(false);
+
+            let confirmed_language = confirmed_language.clone();
+            let on_language = on_language.clone();
+            confirm_language_restart(
+                &dialog,
+                texts,
+                Rc::new(move || {
+                    if let Some(language) = confirmed_language_change(current, selected, true) {
+                        confirmed_language.set(language);
+                        on_language(language);
+                    }
+                }),
+            );
+        }
     });
     language_group.add(&language);
     page.add(&language_group);
@@ -460,8 +553,8 @@ fn system_interfaces() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_lane, delete_lane, lane_edit_error_text, language_change_requires_restart, rename_lane,
-        routed_rule_count, LaneEditError,
+        add_lane, confirmed_language_change, delete_lane, lane_edit_error_text,
+        language_change_requires_restart, rename_lane, routed_rule_count, LaneEditError,
     };
     use crate::ui::i18n::LanguageTexts;
     use routelane::config::Language;
@@ -581,5 +674,17 @@ mod tests {
             Language::Tr
         ));
         assert!(language_change_requires_restart(Language::Tr, Language::En));
+    }
+
+    #[test]
+    fn cancelling_language_confirmation_preserves_the_previous_language() {
+        assert_eq!(
+            confirmed_language_change(Language::Tr, Language::En, false),
+            None
+        );
+        assert_eq!(
+            confirmed_language_change(Language::Tr, Language::En, true),
+            Some(Language::En)
+        );
     }
 }
