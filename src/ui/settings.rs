@@ -76,6 +76,10 @@ fn lane_edit_error_text(error: LaneEditError, texts: Texts) -> &'static str {
     }
 }
 
+fn language_change_requires_restart(current: Language, selected: Language) -> bool {
+    current != selected
+}
+
 fn set_lane_interface(profile: &mut Profile, lane_id: &LaneId, interface: &str) -> bool {
     if let Some(lane) = profile.lanes.iter_mut().find(|lane| &lane.id == lane_id) {
         lane.interface = InterfaceSelector::from(interface);
@@ -456,9 +460,11 @@ fn system_interfaces() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_lane, delete_lane, lane_edit_error_text, rename_lane, routed_rule_count, LaneEditError,
+        add_lane, delete_lane, lane_edit_error_text, language_change_requires_restart, rename_lane,
+        routed_rule_count, LaneEditError,
     };
     use crate::ui::i18n::LanguageTexts;
+    use routelane::config::Language;
     use routelane::domain::{
         InterfaceSelector, LaneFailurePolicy, Profile, ProfileId, Rule, RuleAction, RuleId,
         RuleSource, RuleTarget,
@@ -566,5 +572,14 @@ mod tests {
             ),
             "Lane interface must not be empty"
         );
+    }
+
+    #[test]
+    fn language_change_requires_confirmation_only_for_a_different_language() {
+        assert!(!language_change_requires_restart(
+            Language::Tr,
+            Language::Tr
+        ));
+        assert!(language_change_requires_restart(Language::Tr, Language::En));
     }
 }
