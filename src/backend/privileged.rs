@@ -1766,30 +1766,40 @@ fn chain_object(name: &str) -> serde_json::Value {
 
 fn nft_rule_object(rule: &super::CompiledRule) -> serde_json::Value {
     let mut expressions = Vec::new();
-    if let CompiledTarget::Network(network) = &rule.target {
-        let protocol = if network.addr().is_ipv4() {
-            "ip"
-        } else {
-            "ip6"
-        };
-        let destination = if network.prefix_len() == if network.addr().is_ipv4() { 32 } else { 128 }
-        {
-            serde_json::Value::String(network.addr().to_string())
-        } else {
-            serde_json::json!({
-                "prefix": {
-                    "addr": network.addr().to_string(),
-                    "len": network.prefix_len(),
-                }
-            })
-        };
-        expressions.push(serde_json::json!({
+    match &rule.target {
+        CompiledTarget::Any => {}
+        CompiledTarget::Cgroup(path) => expressions.push(serde_json::json!({
             "match": {
                 "op": "==",
-                "left": {"payload": {"protocol": protocol, "field": "daddr"}},
-                "right": destination,
+                "left": {"socket": {"key": "cgroupv2", "level": 2}},
+                "right": path,
             }
-        }));
+        })),
+        CompiledTarget::Network(network) => {
+            let protocol = if network.addr().is_ipv4() {
+                "ip"
+            } else {
+                "ip6"
+            };
+            let destination =
+                if network.prefix_len() == if network.addr().is_ipv4() { 32 } else { 128 } {
+                    serde_json::Value::String(network.addr().to_string())
+                } else {
+                    serde_json::json!({
+                        "prefix": {
+                            "addr": network.addr().to_string(),
+                            "len": network.prefix_len(),
+                        }
+                    })
+                };
+            expressions.push(serde_json::json!({
+                "match": {
+                    "op": "==",
+                    "left": {"payload": {"protocol": protocol, "field": "daddr"}},
+                    "right": destination,
+                }
+            }));
+        }
     }
     match rule.action {
         CompiledAction::Mark(mark) => {
@@ -3043,6 +3053,7 @@ pub enum ValidationError {
     DuplicateMark(u32),
     DuplicatePriority(u32),
     InvalidInterface(String),
+    InvalidApplicationCgroup(String),
     UnknownMark(u32),
 }
 
@@ -3077,6 +3088,9 @@ impl fmt::Display for ValidationError {
             }
             Self::InvalidInterface(interface) => {
                 write!(formatter, "invalid kernel interface name {interface:?}")
+            }
+            Self::InvalidApplicationCgroup(path) => {
+                write!(formatter, "invalid RouteLane application cgroup {path:?}")
             }
             Self::UnknownMark(mark) => {
                 write!(
@@ -3140,6 +3154,11 @@ pub fn validate_privileged_plan(plan: &KernelPlan) -> Result<(), ValidationError
     }
 
     for rule in &plan.rules {
+        if let CompiledTarget::Cgroup(path) = &rule.target {
+            if !is_routelane_application_cgroup(path) {
+                return Err(ValidationError::InvalidApplicationCgroup(path.clone()));
+            }
+        }
         if let CompiledAction::Mark(mark) = rule.action {
             if !marks.contains(&mark) {
                 return Err(ValidationError::UnknownMark(mark));
@@ -3148,6 +3167,16 @@ pub fn validate_privileged_plan(plan: &KernelPlan) -> Result<(), ValidationError
     }
 
     Ok(())
+}
+
+fn is_routelane_application_cgroup(path: &str) -> bool {
+    let Some(rule_id) = path.strip_prefix("routelane.apps/") else {
+        return false;
+    };
+    !rule_id.is_empty()
+        && rule_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn is_kernel_interface_name(interface: &str) -> bool {
@@ -3554,6 +3583,40 @@ mod tests {
                 {"counter": null},
                 {"return": null}
             ])
+        );
+    }
+
+    #[test]
+    fn privileged_nft_renderer_matches_application_cgroup_before_marking() {
+        let rule = CompiledRule {
+            id: RuleId::from("browser"),
+            priority: 1,
+            target: CompiledTarget::Cgroup("routelane.apps/browser".to_owned()),
+            action: CompiledAction::Mark(MARK_BASE),
+        };
+
+        assert_eq!(
+            nft_rule_object(&rule)["rule"]["expr"][0],
+            serde_json::json!({
+                "match": {
+                    "op": "==",
+                    "left": {"socket": {"key": "cgroupv2", "level": 2}},
+                    "right": "routelane.apps/browser"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn privileged_plan_rejects_an_application_cgroup_outside_routelane() {
+        let mut plan = fixture_valid_plan();
+        plan.rules[0].target = CompiledTarget::Cgroup("../user.slice".to_owned());
+
+        assert_eq!(
+            validate_privileged_plan(&plan),
+            Err(ValidationError::InvalidApplicationCgroup(
+                "../user.slice".to_owned()
+            ))
         );
     }
 
