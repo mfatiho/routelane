@@ -50,31 +50,29 @@ satırında da gösterilir.
 
 ## Veri modeli
 
-`Profile` içine sıralı `application_policies` eklenir. Her kayıt şunları
-taşır:
+Mevcut `RuleSource::Application(ApplicationSelector)` modeli kullanılır; ayrı
+bir uygulama politikası listesi eklenmez. Bir uygulama kuralı,
+`RuleTarget::Any` ve `RuleAction::Route(LaneId)` ile birlikte çalışır.
+`ApplicationSelector`, isteğe bağlı `.desktop` kimliğini, kanonik
+yürütülebilir dosya yolunu ve alt süreçlerin dahil edilmesini taşır. Kuralın
+mevcut değişmez kimliği, etkinlik durumu ve önceliği aynen kullanılır.
 
-- Değişmez politika kimliği
-- Görünen uygulama adı ve isteğe bağlı `.desktop` kimliği
-- Başlatılacak komutun mutlak yürütülebilir yolu ile argümanları
-- Süreç eşleştirmesi için yürütülebilir dosya kanonik yolu
-- Hedef `LaneId`
-- Etkinlik durumu
-
-Doğrulama kuralları: kimlikler benzersizdir; hedef lane mevcut olmalıdır;
-yürütülebilir yol boş olmamalıdır; `.desktop` kimliği varsa benzersiz olmalıdır.
-Konfigürasyon sürümü, eski profil dosyalarını boş uygulama politikası listesiyle
-geriye uyumlu okur.
+Doğrulama kuralları: uygulama kaynaklı kuralın hedefi yalnızca `Any` olabilir;
+eylemi yalnızca mevcut bir lane'e `Route` olabilir; yürütülebilir yol boş
+olamaz; `.desktop` kimliği boş değilse profil içinde benzersiz olmalıdır.
+Eski profil dosyaları, alanlar zaten isteğe bağlı olmayan mevcut kural modeli
+ile geriye uyumlu okunur.
 
 ## Cgroup ve ayrıcalık sınırı
 
 Helper, yalnızca `/sys/fs/cgroup/routelane.apps` altındaki RouteLane'e ait
-cgroup hiyerarşisini yönetir. Politika kimliği için sabit, güvenli biçimde
+cgroup hiyerarşisini yönetir. Uygulama kuralı kimliği için sabit, güvenli biçimde
 kodlanmış bir alt cgroup oluşturulur.
 
 Helper API'si ham cgroup yolu veya komut kabul etmez. Şu dar operasyonları
 sağlar:
 
-- Etkin profil planında yer alan politika için cgroup hazırlama
+- Etkin profil planında yer alan uygulama kuralı için cgroup hazırlama
 - Doğrulanmış bir PID'yi, kanonik yürütülebilir yolu politika ile eşleşiyorsa
   ilgili cgroup'a taşıma
 - Devre dışı bırakılan politikaların boş cgroup'larını temizleme
@@ -91,7 +89,7 @@ yalnızca boş cgroup üzerinde yapılır.
 
 ## nftables ve politika yönlendirme
 
-Her etkin uygulama politikası için nftables `output` zincirine, mevcut domain
+Her etkin uygulama kuralı için nftables `output` zincirine, mevcut domain
 ve IP/CIDR işaretleme kurallarından önce bir `socket cgroupv2` eşleşmesi
 eklenir. Eşleşme pakete hedef lane'in ayrılmış markını yazar; mevcut `ip rule`
 ve lane tablo rotaları paketi seçili arayüze ulaştırır.
@@ -107,7 +105,7 @@ uygun aile rotası yoksa mevcut lane hata politikası (`Direct`, `Fallback`,
 
 ## Daemon akışı
 
-1. Profil kaydedilir ve planlayıcı etkin uygulama politikalarını lane markları
+1. Profil kaydedilir ve planlayıcı etkin uygulama kurallarını lane markları
    ile kernel planına dönüştürür.
 2. Helper atomik nftables/policy-route etkinleştirme işleminde cgroup
    hazırlığını da yapar.
@@ -131,8 +129,8 @@ hazırlama hatası, yarım etkinleşmiş bir uygulama yönlendirme durumu bırak
   politikayı güncellemeye yönlendirilir.
 - Yetki reddi, uygulama adı ve tekrar deneme eylemi ile gösterilir.
 - Çalışan süreç bulunamazsa başlatma eylemi sunulur; bu hata değildir.
-- Sağlık raporu, her etkin uygulama politikasının cgroup ve nft eşleşmesini
-  doğrular; başarısızlık ilgili lane'i değil uygulama politikasını `Degraded`
+- Sağlık raporu, her etkin uygulama kuralının cgroup ve nft eşleşmesini
+  doğrular; başarısızlık ilgili lane'i değil uygulama kuralını `Degraded`
   olarak belirtir.
 
 ## Test stratejisi
