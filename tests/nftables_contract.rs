@@ -121,6 +121,36 @@ fn routed_rule_returns_after_marking_so_first_matching_rule_wins() {
 }
 
 #[test]
+fn renders_application_cgroup_before_destination_rules() {
+    let mut plan = fixture_kernel_plan_with_all_actions();
+    plan.rules.insert(
+        0,
+        CompiledRule {
+            id: RuleId::from("browser"),
+            priority: 1,
+            target: CompiledTarget::Cgroup("routelane.apps/browser".to_owned()),
+            action: CompiledAction::Mark(0x524c0002),
+        },
+    );
+
+    let rendered = render_ruleset(&plan, TableMode::Create).unwrap();
+    let application = rendered
+        .lines()
+        .find(|line| line.contains("socket cgroupv2"))
+        .expect("application cgroup rule");
+    let destination = rendered
+        .lines()
+        .find(|line| line.contains("203.0.113.0/24"))
+        .expect("destination rule");
+
+    assert_eq!(
+        application,
+        "add rule inet routelane output socket cgroupv2 level 2 \"routelane.apps/browser\" meta mark set 0x524c0002 counter return"
+    );
+    assert!(rendered.find(application).unwrap() < rendered.find(destination).unwrap());
+}
+
+#[test]
 fn rejects_interface_value_that_cannot_be_a_kernel_interface() {
     let mut plan = fixture_kernel_plan_with_all_actions();
     plan.lanes[0].interface = "wg0\nflush ruleset".into();

@@ -18,6 +18,12 @@ macro_rules! string_id {
                 Self(value.to_owned())
             }
         }
+
+        impl $name {
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
     };
 }
 
@@ -97,6 +103,11 @@ mod tests {
             rules.into_iter().map(|rule| rule.id).collect::<Vec<_>>(),
             vec![RuleId::from("a"), RuleId::from("b"), RuleId::from("z")]
         );
+    }
+
+    #[test]
+    fn rule_id_exposes_its_stable_value() {
+        assert_eq!(RuleId::from("browser").as_str(), "browser");
     }
 
     #[test]
