@@ -3412,8 +3412,7 @@ where
         self.run_backend(move |backend| backend.apply(&plan)).await
     }
 
-    pub async fn inspect(&self, sender: Option<&str>) -> Result<InspectResponse, ServiceError> {
-        self.authorize(sender).await?;
+    pub async fn inspect(&self, _sender: Option<&str>) -> Result<InspectResponse, ServiceError> {
         self.run_backend(PrivilegedBackend::inspect).await
     }
 
@@ -6069,7 +6068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inspect_and_cleanup_are_authorized_before_backend_access() {
+    async fn inspect_is_read_only_while_cleanup_and_restore_require_authorization() {
         let (denied, denied_events) = fixture_service(Err(AuthorizationError::Challenge));
         let failed_candidate = {
             let mut plan = fixture_valid_plan();
@@ -6077,10 +6076,7 @@ mod tests {
             serde_json::to_string(&plan).unwrap()
         };
         let previous = serde_json::to_string(&fixture_valid_plan()).unwrap();
-        assert_eq!(
-            denied.inspect(Some(":1.42")).await,
-            Err(ServiceError::Authorization(AuthorizationError::Challenge))
-        );
+        denied.inspect(None).await.unwrap();
         assert_eq!(
             denied.cleanup(Some(":1.42")).await,
             Err(ServiceError::Authorization(AuthorizationError::Challenge))
@@ -6093,11 +6089,11 @@ mod tests {
         );
         assert_eq!(
             *denied_events.lock().unwrap(),
-            vec!["authorize", "authorize", "authorize"]
+            vec!["inspect", "authorize", "authorize"]
         );
 
         let (allowed, allowed_events) = fixture_service(Ok(()));
-        allowed.inspect(Some(":1.42")).await.unwrap();
+        allowed.inspect(None).await.unwrap();
         allowed.cleanup(Some(":1.42")).await.unwrap();
         assert_eq!(
             allowed
@@ -6108,14 +6104,7 @@ mod tests {
         );
         assert_eq!(
             *allowed_events.lock().unwrap(),
-            vec![
-                "authorize",
-                "inspect",
-                "authorize",
-                "cleanup",
-                "authorize",
-                "restore"
-            ]
+            vec!["inspect", "authorize", "cleanup", "authorize", "restore"]
         );
     }
 }
