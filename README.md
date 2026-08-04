@@ -9,6 +9,7 @@ Phase 1 includes:
 - GTK4/Libadwaita multi-lane profile management
 - `Route`, `Direct`, and independently enabled/disabled `Block` rules
 - IPv4 and IPv6 policy routing with nftables marking
+- per-application lane selection with cgroup v2 process affinity
 - a per-user daemon and versioned Unix-socket IPC
 - a small system D-Bus helper authorized by Polkit
 - kernel-derived Connection Health reports
@@ -35,6 +36,7 @@ routelane-helper (root, D-Bus activated)
         +-- routing tables 20000..20099
         +-- rule priorities 10000..10099
         +-- marks 0x524c0001..0x524c0064
+        +-- cgroups /sys/fs/cgroup/routelane.apps/*
 ```
 
 The helper accepts typed plans rather than arbitrary commands. Before every
@@ -54,6 +56,18 @@ route, rule, nftables, ownership, and conflict evidence.
 2. Choose a lane/interface in Preferences when the setup card asks for one.
 3. Add a domain, IP, or CIDR rule, then select Enable routing.
 4. Complete the desktop Polkit prompt when RouteLane needs to modify routing.
+5. In Applications, select an installed program and lane. RouteLane can launch
+   it inside that lane or move matching processes that are already running.
+
+Application routing applies to every new connection from the selected process
+tree, including CDN, authentication, and browser verification endpoints. For a
+browser this also means other tabs in the same browser process use that lane.
+RouteLane does not decrypt HTTPS or infer third-party domains.
+
+Host `.desktop` applications with a resolvable executable are supported.
+Flatpak and Snap applications are detected as sandboxed integration cases and
+are not part of the first application-routing release; they require separate
+host/sandbox mediation rather than silently bypassing the selected lane.
 
 RouteLane never asks for or stores a sudo password. Polkit controls the
 authorization lifetime, and a missing desktop Polkit agent yields
