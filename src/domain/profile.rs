@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Rule, RuleAction, RuleId};
+use super::{Rule, RuleAction, RuleId, RuleSource, RuleTarget};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -74,6 +74,9 @@ pub enum DomainError {
     EmptyLaneName(LaneId),
     DuplicateLaneName(String),
     DuplicateRuleId(RuleId),
+    InvalidApplicationRule(RuleId),
+    EmptyApplicationExecutable(RuleId),
+    DuplicateApplicationDesktopId(String),
     UnknownLane(LaneId),
     SelfReferentialFallback(LaneId),
     FallbackCycle(LaneId),
@@ -108,9 +111,27 @@ pub fn validate_profile(profile: &Profile) -> Result<(), DomainError> {
     }
 
     let mut rule_ids = BTreeSet::new();
+    let mut application_desktop_ids = BTreeSet::new();
     for rule in &profile.rules {
         if !rule_ids.insert(rule.id.clone()) {
             return Err(DomainError::DuplicateRuleId(rule.id.clone()));
+        }
+        if let RuleSource::Application(selector) = &rule.source {
+            if selector.executable_path.as_os_str().is_empty() {
+                return Err(DomainError::EmptyApplicationExecutable(rule.id.clone()));
+            }
+            if !matches!(rule.target, RuleTarget::Any)
+                || !matches!(rule.action, RuleAction::Route(_))
+            {
+                return Err(DomainError::InvalidApplicationRule(rule.id.clone()));
+            }
+            if let Some(desktop_id) = selector.desktop_id.as_deref().filter(|id| !id.is_empty()) {
+                if !application_desktop_ids.insert(desktop_id.to_owned()) {
+                    return Err(DomainError::DuplicateApplicationDesktopId(
+                        desktop_id.to_owned(),
+                    ));
+                }
+            }
         }
     }
 
@@ -195,7 +216,8 @@ mod tests {
         canonical_lane_name, validate_profile, DomainError, InterfaceSelector, Lane,
         LaneFailurePolicy, LaneId, Profile, ProfileId,
     };
-    use crate::domain::{Rule, RuleAction, RuleId, RuleSource, RuleTarget};
+    use crate::domain::{ApplicationSelector, Rule, RuleAction, RuleId, RuleSource, RuleTarget};
+    use std::path::PathBuf;
 
     fn fixture_lane(id: &str, interface: &str) -> Lane {
         Lane {
@@ -225,6 +247,21 @@ mod tests {
             enabled: true,
             lanes,
             rules,
+        }
+    }
+
+    fn fixture_application_rule(target: RuleTarget, action: RuleAction) -> Rule {
+        Rule {
+            id: RuleId::from("browser"),
+            enabled: true,
+            priority: 10,
+            source: RuleSource::Application(ApplicationSelector {
+                desktop_id: Some("org.example.Browser".to_owned()),
+                executable_path: PathBuf::from("/usr/bin/browser"),
+                include_children: true,
+            }),
+            target,
+            action,
         }
     }
 
@@ -347,6 +384,74 @@ mod tests {
         assert_eq!(
             validate_profile(&profile),
             Err(DomainError::DuplicateRuleId(RuleId::from("duplicate")))
+        );
+    }
+
+    #[test]
+    fn rejects_application_rule_with_a_destination_target() {
+        let profile = fixture_profile(
+            vec![fixture_lane("vinn", "tun0")],
+            vec![fixture_application_rule(
+                RuleTarget::Domain("example.com".to_owned()),
+                RuleAction::Route(LaneId::from("vinn")),
+            )],
+        );
+
+        assert_eq!(
+            validate_profile(&profile),
+            Err(DomainError::InvalidApplicationRule(RuleId::from("browser")))
+        );
+    }
+
+    #[test]
+    fn rejects_application_rule_without_a_route_lane() {
+        let profile = fixture_profile(
+            vec![fixture_lane("vinn", "tun0")],
+            vec![fixture_application_rule(
+                RuleTarget::Any,
+                RuleAction::Direct,
+            )],
+        );
+
+        assert_eq!(
+            validate_profile(&profile),
+            Err(DomainError::InvalidApplicationRule(RuleId::from("browser")))
+        );
+    }
+
+    #[test]
+    fn rejects_application_rule_without_an_executable_path() {
+        let mut rule =
+            fixture_application_rule(RuleTarget::Any, RuleAction::Route(LaneId::from("vinn")));
+        let RuleSource::Application(selector) = &mut rule.source else {
+            unreachable!();
+        };
+        selector.executable_path = PathBuf::new();
+        let profile = fixture_profile(vec![fixture_lane("vinn", "tun0")], vec![rule]);
+
+        assert_eq!(
+            validate_profile(&profile),
+            Err(DomainError::EmptyApplicationExecutable(RuleId::from(
+                "browser"
+            )))
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_application_desktop_ids() {
+        let action = RuleAction::Route(LaneId::from("vinn"));
+        let mut duplicate = fixture_application_rule(RuleTarget::Any, action.clone());
+        duplicate.id = RuleId::from("browser-two");
+        let profile = fixture_profile(
+            vec![fixture_lane("vinn", "tun0")],
+            vec![fixture_application_rule(RuleTarget::Any, action), duplicate],
+        );
+
+        assert_eq!(
+            validate_profile(&profile),
+            Err(DomainError::DuplicateApplicationDesktopId(
+                "org.example.Browser".to_owned()
+            ))
         );
     }
 
