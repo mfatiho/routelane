@@ -1,6 +1,7 @@
 use routelane::backend::{
-    ApplicationCgroupManager, PrivilegedService, ProcessIdentity, ServiceError,
-    SystemPolkitAuthorizer, SystemPrivilegedBackend,
+    application_cgroup_rule_ids, validate_privileged_plan, ApplicationCgroupManager, KernelPlan,
+    PrivilegedService, ProcessIdentity, ServiceError, SystemPolkitAuthorizer,
+    SystemPrivilegedBackend, MAX_PLAN_JSON_BYTES,
 };
 use serde::Serialize;
 
@@ -35,9 +36,37 @@ impl DbusHelper {
         plan_json: &str,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<String> {
+        let sender = header.sender().map(|sender| sender.as_str());
+        self.core
+            .authorize_mutation(sender)
+            .await
+            .map_err(to_fdo_error)?;
+        if plan_json.len() > MAX_PLAN_JSON_BYTES {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "kernel plan exceeds the maximum size".to_owned(),
+            ));
+        }
+        let plan: KernelPlan = serde_json::from_str(plan_json)
+            .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
+        validate_privileged_plan(&plan)
+            .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
+        let sender =
+            sender.ok_or_else(|| zbus::fdo::Error::AccessDenied("missing sender".to_owned()))?;
+        let uid = self
+            .authorizer
+            .caller_uid(sender)
+            .await
+            .map_err(|error| zbus::fdo::Error::AccessDenied(error.to_string()))?;
+        for rule_id in application_cgroup_rule_ids(&plan.rules)
+            .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?
+        {
+            self.cgroups
+                .prepare(&rule_id, uid)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        }
         let response = self
             .core
-            .apply_plan(header.sender().map(|sender| sender.as_str()), plan_json)
+            .apply_plan(Some(sender), plan_json)
             .await
             .map_err(to_fdo_error)?;
         serialize_response(&response)

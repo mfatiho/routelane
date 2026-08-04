@@ -3,9 +3,27 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::backend::{CompiledRule, CompiledTarget};
 use crate::domain::RuleId;
 
 const APPLICATION_CGROUP_ROOT: &str = "/sys/fs/cgroup/routelane.apps";
+
+pub fn application_cgroup_rule_ids(rules: &[CompiledRule]) -> Result<Vec<RuleId>, CgroupError> {
+    let mut ids = Vec::new();
+    for rule in rules {
+        let CompiledTarget::Cgroup(path) = &rule.target else {
+            continue;
+        };
+        let Some(id) = path.strip_prefix("routelane.apps/") else {
+            return Err(CgroupError::InvalidRuleId);
+        };
+        if id != rule.id.as_str() {
+            return Err(CgroupError::InvalidRuleId);
+        }
+        ids.push(rule.id.clone());
+    }
+    Ok(ids)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessIdentity {
@@ -223,6 +241,21 @@ mod tests {
         assert_eq!(
             super::delegation_targets(&path),
             [path.clone(), path.join("cgroup.procs")]
+        );
+    }
+
+    #[test]
+    fn application_rule_ids_are_extracted_from_a_validated_kernel_plan() {
+        let rules = vec![crate::backend::CompiledRule {
+            id: RuleId::from("browser"),
+            priority: 1,
+            target: crate::backend::CompiledTarget::Cgroup("routelane.apps/browser".to_owned()),
+            action: crate::backend::CompiledAction::Mark(crate::backend::MARK_BASE),
+        }];
+
+        assert_eq!(
+            super::application_cgroup_rule_ids(&rules).unwrap(),
+            vec![RuleId::from("browser")]
         );
     }
 
