@@ -1,0 +1,249 @@
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use crate::domain::RuleId;
+
+const APPLICATION_CGROUP_ROOT: &str = "/sys/fs/cgroup/routelane.apps";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_time: u64,
+    pub executable_path: PathBuf,
+}
+
+impl ProcessIdentity {
+    pub fn new(pid: u32, start_time: u64, executable_path: PathBuf) -> Self {
+        Self {
+            pid,
+            start_time,
+            executable_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CgroupError {
+    InvalidRuleId,
+    ProcessIdentityMismatch { pid: u32 },
+    CgroupNotEmpty { rule_id: RuleId },
+    Io(String),
+}
+
+impl fmt::Display for CgroupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRuleId => {
+                formatter.write_str("application rule ID is unsafe for cgroup use")
+            }
+            Self::ProcessIdentityMismatch { pid } => {
+                write!(
+                    formatter,
+                    "process {pid} no longer matches the requested application"
+                )
+            }
+            Self::CgroupNotEmpty { rule_id } => {
+                write!(
+                    formatter,
+                    "application cgroup for {} is not empty",
+                    rule_id.as_str()
+                )
+            }
+            Self::Io(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CgroupError {}
+
+#[derive(Debug, Clone)]
+pub struct ApplicationCgroupManager {
+    root: PathBuf,
+    proc_root: PathBuf,
+    create_control_files: bool,
+    delegate_to_owner: bool,
+}
+
+impl ApplicationCgroupManager {
+    pub fn system() -> Self {
+        Self {
+            root: PathBuf::from(APPLICATION_CGROUP_ROOT),
+            proc_root: PathBuf::from("/proc"),
+            create_control_files: false,
+            delegate_to_owner: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(root: PathBuf, proc_root: PathBuf) -> Self {
+        Self {
+            root,
+            proc_root,
+            create_control_files: true,
+            delegate_to_owner: false,
+        }
+    }
+
+    pub fn prepare(&self, rule_id: &RuleId, owner_uid: u32) -> Result<PathBuf, CgroupError> {
+        let path = self.rule_path(rule_id)?;
+        fs::create_dir_all(&path).map_err(io_error)?;
+        if self.create_control_files {
+            fs::write(path.join("cgroup.procs"), "").map_err(io_error)?;
+        }
+        if self.delegate_to_owner {
+            chown(&path, owner_uid)?;
+        }
+        Ok(path)
+    }
+
+    pub fn adopt(&self, rule_id: &RuleId, identity: &ProcessIdentity) -> Result<(), CgroupError> {
+        let path = self.rule_path(rule_id)?;
+        if !self.matches_process(identity) {
+            return Err(CgroupError::ProcessIdentityMismatch { pid: identity.pid });
+        }
+        let mut control = OpenOptions::new()
+            .write(true)
+            .open(path.join("cgroup.procs"))
+            .map_err(io_error)?;
+        writeln!(control, "{}", identity.pid).map_err(io_error)
+    }
+
+    pub fn cleanup(&self, rule_id: &RuleId) -> Result<(), CgroupError> {
+        let path = self.rule_path(rule_id)?;
+        if !path.exists() {
+            return Ok(());
+        }
+        let members = fs::read_to_string(path.join("cgroup.procs")).map_err(io_error)?;
+        if !members.trim().is_empty() {
+            return Err(CgroupError::CgroupNotEmpty {
+                rule_id: rule_id.clone(),
+            });
+        }
+        fs::remove_dir(&path).map_err(io_error)
+    }
+
+    fn rule_path(&self, rule_id: &RuleId) -> Result<PathBuf, CgroupError> {
+        let name = rule_id.as_str();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(CgroupError::InvalidRuleId);
+        }
+        Ok(self.root.join(name))
+    }
+
+    fn matches_process(&self, identity: &ProcessIdentity) -> bool {
+        let path = self.proc_root.join(identity.pid.to_string());
+        let Ok(executable_path) = fs::read_link(path.join("exe")) else {
+            return false;
+        };
+        if executable_path != identity.executable_path {
+            return false;
+        }
+        let Ok(stat) = fs::read_to_string(path.join("stat")) else {
+            return false;
+        };
+        stat.rsplit_once(") ")
+            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(identity.start_time)
+    }
+}
+
+fn chown(path: &Path, owner_uid: u32) -> Result<(), CgroupError> {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| CgroupError::Io("cgroup path contains an interior NUL byte".to_owned()))?;
+    let result = unsafe { libc::chown(path.as_ptr(), owner_uid, owner_uid) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_error(std::io::Error::last_os_error()))
+    }
+}
+
+fn io_error(error: std::io::Error) -> CgroupError {
+    CgroupError::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use crate::domain::RuleId;
+
+    use super::{ApplicationCgroupManager, CgroupError, ProcessIdentity};
+
+    #[test]
+    fn adoption_rejects_pid_when_executable_or_start_time_differs() {
+        let fixture = Fixture::new();
+        fixture.process(42, 100, "/usr/bin/browser");
+        let manager = fixture.manager();
+        manager.prepare(&RuleId::from("browser"), 1000).unwrap();
+
+        let error = manager
+            .adopt(
+                &RuleId::from("browser"),
+                &ProcessIdentity::new(42, 101, PathBuf::from("/usr/bin/browser")),
+            )
+            .unwrap_err();
+
+        assert_eq!(error, CgroupError::ProcessIdentityMismatch { pid: 42 });
+    }
+
+    #[test]
+    fn cleanup_rejects_rule_ids_that_could_escape_the_routelane_subtree() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+
+        assert_eq!(
+            manager
+                .cleanup(&RuleId::from("../../user.slice"))
+                .unwrap_err(),
+            CgroupError::InvalidRuleId
+        );
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        proc_root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("routelane-cgroup-test-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            let proc_root = root.join("proc");
+            fs::create_dir_all(&proc_root).unwrap();
+            Self { root, proc_root }
+        }
+
+        fn manager(&self) -> ApplicationCgroupManager {
+            ApplicationCgroupManager::for_test(self.root.join("cgroup"), self.proc_root.clone())
+        }
+
+        fn process(&self, pid: u32, start_time: u64, executable: &str) {
+            let path = self.proc_root.join(pid.to_string());
+            fs::create_dir_all(&path).unwrap();
+            std::os::unix::fs::symlink(executable, path.join("exe")).unwrap();
+            fs::write(
+                path.join("stat"),
+                format!("{pid} (browser) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {start_time}"),
+            )
+            .unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+}
