@@ -1,5 +1,6 @@
 use routelane::backend::{
-    PrivilegedService, ServiceError, SystemPolkitAuthorizer, SystemPrivilegedBackend,
+    ApplicationCgroupManager, PrivilegedService, ProcessIdentity, ServiceError,
+    SystemPolkitAuthorizer, SystemPrivilegedBackend,
 };
 use serde::Serialize;
 
@@ -23,6 +24,8 @@ type HelperCore = PrivilegedService<SystemPolkitAuthorizer, SystemPrivilegedBack
 
 struct DbusHelper {
     core: HelperCore,
+    authorizer: SystemPolkitAuthorizer,
+    cgroups: ApplicationCgroupManager,
 }
 
 #[zbus::interface(name = "io.github.routelane.Helper1")]
@@ -81,6 +84,51 @@ impl DbusHelper {
             .map_err(to_fdo_error)?;
         serialize_response(&response)
     }
+
+    async fn prepare_application_cgroup(
+        &self,
+        rule_id: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let sender = header.sender().map(|sender| sender.as_str());
+        self.core
+            .authorize_mutation(sender)
+            .await
+            .map_err(to_fdo_error)?;
+        let sender =
+            sender.ok_or_else(|| zbus::fdo::Error::AccessDenied("missing sender".into()))?;
+        let uid = self
+            .authorizer
+            .caller_uid(sender)
+            .await
+            .map_err(|error| zbus::fdo::Error::AccessDenied(error.to_string()))?;
+        let path = self
+            .cgroups
+            .prepare(&routelane::domain::RuleId::from(rule_id), uid)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        serialize_response(&path)
+    }
+
+    async fn adopt_application_process(
+        &self,
+        rule_id: &str,
+        pid: u32,
+        start_time: u64,
+        executable_path: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        self.core
+            .authorize_mutation(header.sender().map(|sender| sender.as_str()))
+            .await
+            .map_err(to_fdo_error)?;
+        self.cgroups
+            .adopt(
+                &routelane::domain::RuleId::from(rule_id),
+                &ProcessIdentity::new(pid, start_time, executable_path.into()),
+            )
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        serialize_response(&serde_json::json!({"adopted": true}))
+    }
 }
 
 fn serialize_response(response: &impl Serialize) -> zbus::fdo::Result<String> {
@@ -130,11 +178,11 @@ async fn main() {
 
 async fn run_dbus_service() -> zbus::Result<()> {
     let connection = zbus::Connection::system().await?;
+    let authorizer = SystemPolkitAuthorizer::new(connection.clone());
     let helper = DbusHelper {
-        core: PrivilegedService::new(
-            SystemPolkitAuthorizer::new(connection.clone()),
-            SystemPrivilegedBackend::default(),
-        ),
+        core: PrivilegedService::new(authorizer.clone(), SystemPrivilegedBackend::default()),
+        authorizer,
+        cgroups: ApplicationCgroupManager::system(),
     };
     connection.object_server().at(OBJECT_PATH, helper).await?;
     connection.request_name(BUS_NAME).await?;

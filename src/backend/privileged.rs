@@ -3227,6 +3227,17 @@ impl SystemPolkitAuthorizer {
     pub fn new(connection: zbus::Connection) -> Self {
         Self { connection }
     }
+
+    pub async fn caller_uid(&self, sender: &str) -> Result<u32, AuthorizationError> {
+        let sender_name = zbus::names::BusName::try_from(sender)
+            .map_err(|error| AuthorizationError::UidLookup(error.to_string()))?;
+        let dbus = zbus::fdo::DBusProxy::new(&self.connection)
+            .await
+            .map_err(|error| AuthorizationError::UidLookup(error.to_string()))?;
+        dbus.get_connection_unix_user(sender_name)
+            .await
+            .map_err(|error| AuthorizationError::UidLookup(error.to_string()))
+    }
 }
 
 impl Authorizer for SystemPolkitAuthorizer {
@@ -3234,15 +3245,7 @@ impl Authorizer for SystemPolkitAuthorizer {
 
     fn authorize<'a>(&'a self, sender: &'a str) -> Self::Future<'a> {
         Box::pin(async move {
-            let sender_name = zbus::names::BusName::try_from(sender)
-                .map_err(|error| AuthorizationError::UidLookup(error.to_string()))?;
-            let dbus = zbus::fdo::DBusProxy::new(&self.connection)
-                .await
-                .map_err(|error| AuthorizationError::UidLookup(error.to_string()))?;
-            let _caller_uid = dbus
-                .get_connection_unix_user(sender_name)
-                .await
-                .map_err(|error| AuthorizationError::UidLookup(error.to_string()))?;
+            let _caller_uid = self.caller_uid(sender).await?;
 
             let policykit = zbus::Proxy::new(
                 &self.connection,
@@ -3461,6 +3464,10 @@ where
     pub async fn cleanup(&self, sender: Option<&str>) -> Result<CleanupResponse, ServiceError> {
         self.authorize(sender).await?;
         self.run_backend(PrivilegedBackend::cleanup).await
+    }
+
+    pub async fn authorize_mutation(&self, sender: Option<&str>) -> Result<(), ServiceError> {
+        self.authorize(sender).await.map(|_| ())
     }
 
     async fn authorize<'a>(&self, sender: Option<&'a str>) -> Result<&'a str, ServiceError> {
