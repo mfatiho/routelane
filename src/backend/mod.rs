@@ -7,7 +7,9 @@ mod policy_route;
 mod privileged;
 mod transaction;
 
-pub use cgroup::{ApplicationCgroupManager, CgroupError, ProcessIdentity};
+pub use cgroup::{
+    application_cgroup_rule_ids, ApplicationCgroupManager, CgroupError, ProcessIdentity,
+};
 pub use inspect::{
     build_snapshot_commands, detect_resource_conflicts, detect_resource_conflicts_for_update,
     KernelSnapshot, ResourceConflict, ResourceState, SnapshotCommands, SnapshotInput,
