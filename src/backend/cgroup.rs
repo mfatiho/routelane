@@ -93,7 +93,9 @@ impl ApplicationCgroupManager {
             fs::write(path.join("cgroup.procs"), "").map_err(io_error)?;
         }
         if self.delegate_to_owner {
-            chown(&path, owner_uid)?;
+            for target in delegation_targets(&path) {
+                chown(&target, owner_uid)?;
+            }
         }
         Ok(path)
     }
@@ -156,6 +158,10 @@ impl ApplicationCgroupManager {
     }
 }
 
+fn delegation_targets(path: &Path) -> [PathBuf; 2] {
+    [path.to_owned(), path.join("cgroup.procs")]
+}
+
 fn chown(path: &Path, owner_uid: u32) -> Result<(), CgroupError> {
     let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| CgroupError::Io("cgroup path contains an interior NUL byte".to_owned()))?;
@@ -207,6 +213,16 @@ mod tests {
                 .cleanup(&RuleId::from("../../user.slice"))
                 .unwrap_err(),
             CgroupError::InvalidRuleId
+        );
+    }
+
+    #[test]
+    fn delegation_includes_the_directory_and_its_process_control_file() {
+        let path = PathBuf::from("/sys/fs/cgroup/routelane.apps/browser");
+
+        assert_eq!(
+            super::delegation_targets(&path),
+            [path.clone(), path.join("cgroup.procs")]
         );
     }
 
