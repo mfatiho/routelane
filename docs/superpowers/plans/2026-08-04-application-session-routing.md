@@ -146,7 +146,7 @@ git commit -m "feat: discover desktop applications and processes"
 
 **Consumes:** A validated application rule and resolved lane mark.
 
-**Produces:** `CompiledSource::Cgroup { relative_path: String }` and an nft rule rendered before all destination rules.
+**Produces:** `CompiledTarget::Cgroup(String)` and an nft rule rendered before all destination rules.
 
 - [ ] **Step 1: Write failing planner and renderer tests**
 
@@ -154,7 +154,7 @@ git commit -m "feat: discover desktop applications and processes"
 #[test]
 fn application_rule_compiles_to_its_lane_mark() {
     let plan = compile_profile(&application_profile(), &topology(), &ResolutionSnapshot::empty(), 7).unwrap();
-    assert!(matches!(plan.rules[0].source, CompiledSource::Cgroup { .. }));
+    assert!(matches!(plan.rules[0].target, CompiledTarget::Cgroup(_)));
     assert_eq!(plan.rules[0].action, CompiledAction::Mark(MARK_BASE));
 }
 
@@ -173,7 +173,7 @@ Expected: FAIL because compiled sources do not yet exist.
 
 - [ ] **Step 3: Implement source-aware compilation and rendering**
 
-Add `CompiledSource::{Any,Cgroup { relative_path }}` to `CompiledRule`. Derive the relative path only from a validated rule ID, render the nftables `socket cgroupv2` expression using an escaped fixed RouteLane subtree path, then append `meta mark set ... counter return`. Keep `CompiledSource::Any` output byte-for-byte equivalent to existing destination rules.
+Add `CompiledTarget::Cgroup(String)` to `CompiledRule`. Derive the relative path only from a validated rule ID, render the nftables `socket cgroupv2` expression using an escaped fixed RouteLane subtree path, then append `meta mark set ... counter return`. Keep the existing destination target output byte-for-byte equivalent.
 
 - [ ] **Step 4: Run focused tests and confirm GREEN**
 
