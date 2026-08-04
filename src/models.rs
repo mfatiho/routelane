@@ -1,5 +1,8 @@
 use routelane::domain::Profile;
-use routelane::ipc::{ApplyProfileResult, DaemonEvent, DaemonRequest, DaemonStatus, IpcError};
+use routelane::ipc::{
+    ApplicationAdoptionResult, ApplicationLaunchResult, ApplyProfileResult, DaemonEvent,
+    DaemonRequest, DaemonStatus, IpcError,
+};
 
 #[derive(Debug)]
 pub enum UiToDaemon {
@@ -13,6 +16,8 @@ pub enum DaemonToUi {
     Status(DaemonStatus),
     Profiles(Vec<Profile>),
     Applied(ApplyProfileResult),
+    ApplicationLaunched(ApplicationLaunchResult),
+    ApplicationProcessesAdopted(ApplicationAdoptionResult),
     Deactivated,
     Event(DaemonEvent),
     DaemonUnavailable(String),

@@ -74,6 +74,16 @@ pub fn discover_desktop_apps() -> Result<Vec<DesktopApp>, DesktopError> {
 }
 
 pub fn discover_from_paths(paths: &[PathBuf]) -> Result<Vec<DesktopApp>, DesktopError> {
+    let search_path = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    discover_from_paths_with_search_path(paths, &search_path)
+}
+
+fn discover_from_paths_with_search_path(
+    paths: &[PathBuf],
+    search_path: &[PathBuf],
+) -> Result<Vec<DesktopApp>, DesktopError> {
     let mut applications = BTreeMap::new();
     for path in paths {
         if !path.exists() {
@@ -97,7 +107,7 @@ pub fn discover_from_paths(paths: &[PathBuf]) -> Result<Vec<DesktopApp>, Desktop
                     path: entry_path.clone(),
                     source,
                 })?;
-            if let Some(application) = parse_desktop_entry(&entry_path, &content) {
+            if let Some(application) = parse_desktop_entry(&entry_path, &content, search_path) {
                 applications
                     .entry(application.desktop_id.clone())
                     .or_insert(application);
@@ -114,7 +124,7 @@ pub fn discover_from_paths(paths: &[PathBuf]) -> Result<Vec<DesktopApp>, Desktop
     Ok(applications)
 }
 
-fn parse_desktop_entry(path: &Path, content: &str) -> Option<DesktopApp> {
+fn parse_desktop_entry(path: &Path, content: &str, search_path: &[PathBuf]) -> Option<DesktopApp> {
     let values = desktop_entry_values(content);
     if *values.get("Type")? != "Application"
         || values.get("Hidden").is_some_and(|value| *value == "true")
@@ -125,7 +135,8 @@ fn parse_desktop_entry(path: &Path, content: &str) -> Option<DesktopApp> {
         return None;
     }
     let display_name = values.get("Name")?.trim();
-    let executable_path = fs::canonicalize(executable_from_exec(values.get("Exec")?)?).ok()?;
+    let executable_path =
+        resolve_executable(executable_from_exec(values.get("Exec")?)?, search_path)?;
     let desktop_id = path.file_stem()?.to_str()?.to_owned();
     (!display_name.is_empty()).then(|| DesktopApp::new(desktop_id, display_name, executable_path))
 }
@@ -152,18 +163,34 @@ fn desktop_entry_values(content: &str) -> BTreeMap<&str, &str> {
 fn executable_from_exec(exec: &str) -> Option<&str> {
     let executable = exec.split_whitespace().next()?;
     (!executable.is_empty()
-        && executable.starts_with('/')
         && !executable
             .bytes()
             .any(|byte| matches!(byte, b'\'' | b'"' | b'`' | b'$' | b';' | b'|' | b'&')))
     .then_some(executable)
 }
 
+fn resolve_executable(executable: &str, search_path: &[PathBuf]) -> Option<PathBuf> {
+    let path = Path::new(executable);
+    if path.is_absolute() {
+        return fs::canonicalize(path).ok();
+    }
+    if path.components().count() != 1 {
+        return None;
+    }
+    search_path
+        .iter()
+        .map(|directory| directory.join(path))
+        .find_map(|candidate| fs::canonicalize(candidate).ok())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{discover_from_paths, DesktopApp};
+    use super::{discover_from_paths, discover_from_paths_with_search_path, DesktopApp};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn discovery_ignores_hidden_entries_and_extracts_exec_path() {
@@ -195,9 +222,38 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn discovery_resolves_a_bare_exec_name_from_the_search_path() {
+        let directory = temporary_desktop_directory();
+        let bin = directory.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join("browser");
+        fs::write(&executable, "").unwrap();
+        fs::write(
+            directory.join("browser.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Browser\nExec=browser %U\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_from_paths_with_search_path(
+                std::slice::from_ref(&directory),
+                std::slice::from_ref(&bin),
+            )
+            .unwrap()[0]
+                .executable_path,
+            fs::canonicalize(executable).unwrap()
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn temporary_desktop_directory() -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("routelane-desktop-test-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "routelane-desktop-test-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
+        ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
