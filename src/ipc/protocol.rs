@@ -36,6 +36,14 @@ pub enum DaemonRequest {
         rule_id: RuleId,
         enabled: bool,
     },
+    LaunchApplication {
+        profile_id: ProfileId,
+        rule_id: RuleId,
+    },
+    AdoptApplicationProcesses {
+        profile_id: ProfileId,
+        rule_id: RuleId,
+    },
     Deactivate,
     Subscribe,
 }
@@ -75,6 +83,8 @@ pub enum DaemonResult {
     /// Partial profile snapshot for merge/upsert, not an authoritative catalog.
     Profiles(Vec<Profile>),
     Applied(ApplyProfileResult),
+    ApplicationLaunched(ApplicationLaunchResult),
+    ApplicationProcessesAdopted(ApplicationAdoptionResult),
     Deactivated,
     Subscribed,
 }
@@ -93,6 +103,17 @@ pub struct DaemonStatus {
 pub struct ApplyProfileResult {
     pub generation: u64,
     pub plan_hash: PlanHash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationLaunchResult {
+    pub pid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationAdoptionResult {
+    pub adopted_count: u32,
+    pub skipped_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
