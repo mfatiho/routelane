@@ -1,3 +1,4 @@
+pub mod application;
 pub mod backend;
 pub mod config;
 pub mod daemon;
