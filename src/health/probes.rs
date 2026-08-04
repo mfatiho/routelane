@@ -58,6 +58,15 @@ pub fn evaluate_health(plan: Option<&KernelPlan>, snapshot: &KernelSnapshot) -> 
     HealthReport::from_parts(state, lanes, diagnostics)
 }
 
+pub fn kernel_resources_match_plan(report: &HealthReport) -> bool {
+    !report.diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.code,
+            DiagnosticCode::NftablesFeatureMissing | DiagnosticCode::RoutingResourceConflict
+        )
+    })
+}
+
 fn inspect_lane(
     lane: &LanePlan,
     snapshot: &KernelSnapshot,

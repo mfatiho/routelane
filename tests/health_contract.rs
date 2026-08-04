@@ -7,7 +7,8 @@ use routelane::backend::{
 };
 use routelane::domain::{HealthState, LaneFailurePolicy, LaneId, ProfileId};
 use routelane::health::{
-    aggregate_health, evaluate_health, DiagnosticCode, DiagnosticSubject, Severity,
+    aggregate_health, evaluate_health, kernel_resources_match_plan, DiagnosticCode,
+    DiagnosticSubject, Severity,
 };
 
 fn read(path: impl AsRef<Path>) -> Vec<u8> {
@@ -255,6 +256,7 @@ fn unavailable_lane_stays_degraded_when_its_interface_later_appears() {
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == DiagnosticCode::LaneGatewayUnreachable));
+    assert!(kernel_resources_match_plan(&report));
 }
 
 #[test]
@@ -309,4 +311,5 @@ fn missing_ipv6_rule_is_reported_even_when_both_routes_and_ipv4_rules_are_exact(
                 .technical_detail
                 .contains("IPv6 policy rule is missing")
     }));
+    assert!(!kernel_resources_match_plan(&report));
 }

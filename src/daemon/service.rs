@@ -22,8 +22,8 @@ use crate::domain::{
     normalize_lane_names, validate_profile, HealthState, Profile, ProfileId, RuleId, RuleTarget,
 };
 use crate::health::{
-    evaluate_health, Diagnostic, DiagnosticCode, DiagnosticSubject, HealthReport, Severity,
-    SuggestedAction,
+    evaluate_health, kernel_resources_match_plan, Diagnostic, DiagnosticCode, DiagnosticSubject,
+    HealthReport, Severity, SuggestedAction,
 };
 use crate::ipc::{
     ApplyProfileResult, DaemonEnvelope, DaemonEvent, DaemonRequest, DaemonResponse, DaemonResult,
@@ -308,7 +308,7 @@ where
         }
 
         let health = match self.inspect_plan_health(Some(&profile), &plan).await {
-            Ok(report) if report.state == HealthState::Healthy => report,
+            Ok(report) if kernel_resources_match_plan(&report) => report,
             Ok(report) => {
                 let error = DaemonError::new(
                     "DAEMON_HEALTH_VERIFICATION_FAILED",
@@ -742,7 +742,7 @@ where
             state.health = health.clone();
             state.last_error = None;
         }
-        if health.state == HealthState::Healthy {
+        if kernel_resources_match_plan(&health) {
             Ok(())
         } else {
             self.record_reconciliation_drift(
