@@ -369,6 +369,8 @@ async fn forward_response(response: routelane::ipc::DaemonResponse, sender: &Sen
         Some(DaemonResult::Profiles(profiles)) => Some(DaemonToUi::Profiles(profiles)),
         Some(DaemonResult::Applied(result)) => Some(DaemonToUi::Applied(result)),
         Some(DaemonResult::Deactivated) => Some(DaemonToUi::Deactivated),
+        Some(DaemonResult::ApplicationLaunched(_))
+        | Some(DaemonResult::ApplicationProcessesAdopted(_)) => None,
         Some(DaemonResult::Subscribed) | None => None,
     };
     if let Some(event) = event {

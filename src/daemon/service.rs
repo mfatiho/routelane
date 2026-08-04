@@ -13,21 +13,23 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::{broadcast, Mutex};
 
+use crate::application::{matching_processes, RunningProcess};
 use crate::backend::{
     compile_profile, AppliedKernelState, ApplyResponse, CleanupResponse, InspectResponse,
     KernelPlan, ResolutionSnapshot, RestoreResponse, RouteMode, TopologySnapshot,
 };
 use crate::dns::periodic::resolve_domain;
 use crate::domain::{
-    normalize_lane_names, validate_profile, HealthState, Profile, ProfileId, RuleId, RuleTarget,
+    normalize_lane_names, validate_profile, HealthState, Profile, ProfileId, RuleId, RuleSource,
+    RuleTarget,
 };
 use crate::health::{
     evaluate_health, kernel_resources_match_plan, Diagnostic, DiagnosticCode, DiagnosticSubject,
     HealthReport, Severity, SuggestedAction,
 };
 use crate::ipc::{
-    ApplyProfileResult, DaemonEnvelope, DaemonEvent, DaemonRequest, DaemonResponse, DaemonResult,
-    IpcError, IPC_PROTOCOL_VERSION,
+    ApplicationAdoptionResult, ApplicationLaunchResult, ApplyProfileResult, DaemonEnvelope,
+    DaemonEvent, DaemonRequest, DaemonResponse, DaemonResult, IpcError, IPC_PROTOCOL_VERSION,
 };
 
 use super::DaemonState;
@@ -124,6 +126,20 @@ pub trait PrivilegedHelperClient: Send + Sync {
     ) -> Result<RestoreResponse, DaemonError>;
     async fn inspect(&self) -> Result<InspectResponse, DaemonError>;
     async fn cleanup(&self) -> Result<CleanupResponse, DaemonError>;
+    async fn prepare_application_cgroup(&self, _rule_id: &RuleId) -> Result<PathBuf, DaemonError> {
+        Err(DaemonError::helper(
+            "application cgroup operations are unavailable",
+        ))
+    }
+    async fn adopt_application_process(
+        &self,
+        _rule_id: &RuleId,
+        _process: &RunningProcess,
+    ) -> Result<(), DaemonError> {
+        Err(DaemonError::helper(
+            "application cgroup operations are unavailable",
+        ))
+    }
 }
 
 pub trait ConfigRepository: Send + Sync {
@@ -226,6 +242,20 @@ where
                 .set_rule_enabled(profile_id, rule_id, enabled)
                 .await
                 .map(DaemonResult::Applied),
+            DaemonRequest::LaunchApplication {
+                profile_id,
+                rule_id,
+            } => self
+                .launch_application(profile_id, rule_id)
+                .await
+                .map(DaemonResult::ApplicationLaunched),
+            DaemonRequest::AdoptApplicationProcesses {
+                profile_id,
+                rule_id,
+            } => self
+                .adopt_application_processes(profile_id, rule_id)
+                .await
+                .map(DaemonResult::ApplicationProcessesAdopted),
             DaemonRequest::Deactivate => {
                 self.deactivate().await.map(|()| DaemonResult::Deactivated)
             }
@@ -235,6 +265,78 @@ where
         match result {
             Ok(result) => DaemonResponse::success(request_id, result),
             Err(error) => DaemonResponse::failure(request_id, error.into()),
+        }
+    }
+
+    pub async fn launch_application(
+        &self,
+        profile_id: ProfileId,
+        rule_id: RuleId,
+    ) -> Result<ApplicationLaunchResult, DaemonError> {
+        let selector = self.application_selector(&profile_id, &rule_id).await?;
+        let cgroup = self.helper.prepare_application_cgroup(&rule_id).await?;
+        let control = cgroup.join("cgroup.procs");
+        let mut command = Command::new(&selector.executable_path);
+        unsafe {
+            command.pre_exec(move || {
+                let mut file = OpenOptions::new().write(true).open(&control)?;
+                writeln!(file, "{}", libc::getpid())?;
+                Ok(())
+            });
+        }
+        let child = command
+            .spawn()
+            .map_err(|error| DaemonError::helper(format!("start application: {error}")))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| DaemonError::helper("started application has no PID"))?;
+        Ok(ApplicationLaunchResult { pid })
+    }
+
+    pub async fn adopt_application_processes(
+        &self,
+        profile_id: ProfileId,
+        rule_id: RuleId,
+    ) -> Result<ApplicationAdoptionResult, DaemonError> {
+        let selector = self.application_selector(&profile_id, &rule_id).await?;
+        let processes = matching_processes(&selector);
+        let mut adopted_count = 0;
+        let mut skipped_count = 0;
+        for process in processes {
+            match self
+                .helper
+                .adopt_application_process(&rule_id, &process)
+                .await
+            {
+                Ok(()) => adopted_count += 1,
+                Err(_) => skipped_count += 1,
+            }
+        }
+        Ok(ApplicationAdoptionResult {
+            adopted_count,
+            skipped_count,
+        })
+    }
+
+    async fn application_selector(
+        &self,
+        profile_id: &ProfileId,
+        rule_id: &RuleId,
+    ) -> Result<crate::domain::ApplicationSelector, DaemonError> {
+        let state = self.state.lock().await;
+        let profile = state
+            .desired
+            .as_ref()
+            .filter(|profile| &profile.id == profile_id)
+            .ok_or_else(|| DaemonError::validation("application profile is unavailable"))?;
+        let rule = profile
+            .rules
+            .iter()
+            .find(|rule| &rule.id == rule_id && rule.enabled)
+            .ok_or_else(|| DaemonError::validation("application rule is unavailable"))?;
+        match &rule.source {
+            RuleSource::Application(selector) => Ok(selector.clone()),
+            RuleSource::Any => Err(DaemonError::validation("rule is not an application rule")),
         }
     }
 
@@ -993,6 +1095,38 @@ impl PrivilegedHelperClient for SystemPrivilegedHelperClient {
             .map_err(|error| helper_call_error("Cleanup", error))?;
         serde_json::from_str(&response_json)
             .map_err(|error| DaemonError::helper(format!("decode Cleanup response: {error}")))
+    }
+
+    async fn prepare_application_cgroup(&self, rule_id: &RuleId) -> Result<PathBuf, DaemonError> {
+        let proxy = self.proxy().await?;
+        let response_json: String = proxy
+            .call("PrepareApplicationCgroup", &(rule_id.as_str(),))
+            .await
+            .map_err(|error| helper_call_error("PrepareApplicationCgroup", error))?;
+        serde_json::from_str(&response_json).map_err(|error| {
+            DaemonError::helper(format!("decode PrepareApplicationCgroup response: {error}"))
+        })
+    }
+
+    async fn adopt_application_process(
+        &self,
+        rule_id: &RuleId,
+        process: &RunningProcess,
+    ) -> Result<(), DaemonError> {
+        let proxy = self.proxy().await?;
+        let _: String = proxy
+            .call(
+                "AdoptApplicationProcess",
+                &(
+                    rule_id.as_str(),
+                    process.pid,
+                    process.start_time,
+                    process.executable_path.to_string_lossy().as_ref(),
+                ),
+            )
+            .await
+            .map_err(|error| helper_call_error("AdoptApplicationProcess", error))?;
+        Ok(())
     }
 }
 

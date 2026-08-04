@@ -25,6 +25,19 @@ use tempfile::TempDir;
 use tokio::io::{duplex, AsyncWriteExt};
 use tokio::sync::Notify;
 
+#[test]
+fn application_requests_serialize_only_profile_and_rule_identifiers() {
+    let request = DaemonRequest::LaunchApplication {
+        profile_id: ProfileId::from("default"),
+        rule_id: RuleId::from("browser"),
+    };
+
+    let json = serde_json::to_value(request).unwrap();
+    assert_eq!(json["method"], "LaunchApplication");
+    assert_eq!(json["parameters"]["profile_id"], "default");
+    assert_eq!(json["parameters"]["rule_id"], "browser");
+}
+
 #[derive(Clone, Default)]
 struct FakeTopology;
 
