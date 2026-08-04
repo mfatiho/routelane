@@ -69,13 +69,19 @@ pub fn render_ruleset(plan: &KernelPlan, mode: TableMode) -> Result<String, NftR
 }
 
 fn render_target(batch: &mut String, target: &CompiledTarget) {
-    let CompiledTarget::Network(network) = target else {
-        return;
-    };
-
-    match network {
-        IpNet::V4(network) => write!(batch, " ip daddr {}", render_v4_network(*network)).unwrap(),
-        IpNet::V6(network) => write!(batch, " ip6 daddr {}", render_v6_network(*network)).unwrap(),
+    match target {
+        CompiledTarget::Any => {}
+        CompiledTarget::Cgroup(path) => {
+            write!(batch, " socket cgroupv2 level 2 \"{path}\"").unwrap();
+        }
+        CompiledTarget::Network(network) => match network {
+            IpNet::V4(network) => {
+                write!(batch, " ip daddr {}", render_v4_network(*network)).unwrap()
+            }
+            IpNet::V6(network) => {
+                write!(batch, " ip6 daddr {}", render_v6_network(*network)).unwrap()
+            }
+        },
     }
 }
 

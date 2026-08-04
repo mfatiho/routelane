@@ -87,6 +87,7 @@ pub struct CompiledRule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompiledTarget {
     Any,
+    Cgroup(String),
     Network(IpNet),
 }
 

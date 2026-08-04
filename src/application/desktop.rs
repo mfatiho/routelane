@@ -188,7 +188,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            discover_from_paths(&[directory.clone()]).unwrap(),
+            discover_from_paths(std::slice::from_ref(&directory)).unwrap(),
             vec![DesktopApp::new("browser", "Browser", executable,)]
         );
 

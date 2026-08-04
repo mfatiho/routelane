@@ -491,36 +491,36 @@ fn empty_exact_domain_resolution_temporarily_emits_no_rules() {
 }
 
 #[test]
-fn enabled_application_source_is_an_explicit_unsupported_capability() {
+fn application_source_compiles_to_a_lane_cgroup_mark() {
     let application = ApplicationSelector {
         desktop_id: Some("org.example.App".to_owned()),
         executable_path: "/usr/bin/example".into(),
         include_children: true,
     };
     let profile = profile(
-        vec![],
+        vec![lane("vinn", "tun0")],
         vec![rule_with(
             "application-rule",
             10,
             RuleSource::Application(application),
             RuleTarget::Any,
-            RuleAction::Direct,
+            RuleAction::Route(LaneId::from("vinn")),
         )],
     );
 
+    let plan = compile_profile(
+        &profile,
+        &topology_for(&[("tun0", "10.0.0.1")]),
+        &ResolutionSnapshot::empty(),
+        1,
+    )
+    .unwrap();
+
     assert_eq!(
-        compile_profile(
-            &profile,
-            &TopologySnapshot::empty(),
-            &ResolutionSnapshot::empty(),
-            1,
-        )
-        .unwrap_err(),
-        PlanError::UnsupportedCapability {
-            rule_id: RuleId::from("application-rule"),
-            capability: Capability::Application,
-        }
+        plan.rules[0].target,
+        CompiledTarget::Cgroup("routelane.apps/application-rule".to_owned())
     );
+    assert_eq!(plan.rules[0].action, CompiledAction::Mark(0x524c0001));
 }
 
 #[test]

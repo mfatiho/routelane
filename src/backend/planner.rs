@@ -122,41 +122,37 @@ fn compile_rule(
     lane_plans: &BTreeMap<LaneId, &LanePlan>,
     compiled_rules: &mut Vec<CompiledRule>,
 ) -> Result<(), PlanError> {
-    match &rule.source {
-        RuleSource::Any => {}
-        RuleSource::Application(_) => {
-            return Err(PlanError::UnsupportedCapability {
-                rule_id: rule.id.clone(),
-                capability: Capability::Application,
-            });
-        }
-    }
-
-    let targets = match &rule.target {
-        RuleTarget::Any => vec![CompiledTarget::Any],
-        RuleTarget::Ip(address) => vec![CompiledTarget::Network(host_network(*address))],
-        RuleTarget::Cidr(network) => vec![CompiledTarget::Network(*network)],
-        RuleTarget::Domain(_) => {
-            let mut addresses = resolutions
-                .addresses(&rule.id)
-                .ok_or_else(|| PlanError::DomainResolutionUnavailable(rule.id.clone()))?
-                .to_vec();
-            addresses.sort();
-            addresses.dedup();
-            addresses.into_iter().map(CompiledTarget::Network).collect()
-        }
-        RuleTarget::WildcardDomain(_) => {
-            return Err(PlanError::UnsupportedCapability {
-                rule_id: rule.id.clone(),
-                capability: Capability::WildcardDomain,
-            });
-        }
-        RuleTarget::ServicePack(_) => {
-            return Err(PlanError::UnsupportedCapability {
-                rule_id: rule.id.clone(),
-                capability: Capability::ServicePack,
-            });
-        }
+    let targets = match &rule.source {
+        RuleSource::Application(_) => vec![CompiledTarget::Cgroup(format!(
+            "routelane.apps/{}",
+            rule.id.as_str()
+        ))],
+        RuleSource::Any => match &rule.target {
+            RuleTarget::Any => vec![CompiledTarget::Any],
+            RuleTarget::Ip(address) => vec![CompiledTarget::Network(host_network(*address))],
+            RuleTarget::Cidr(network) => vec![CompiledTarget::Network(*network)],
+            RuleTarget::Domain(_) => {
+                let mut addresses = resolutions
+                    .addresses(&rule.id)
+                    .ok_or_else(|| PlanError::DomainResolutionUnavailable(rule.id.clone()))?
+                    .to_vec();
+                addresses.sort();
+                addresses.dedup();
+                addresses.into_iter().map(CompiledTarget::Network).collect()
+            }
+            RuleTarget::WildcardDomain(_) => {
+                return Err(PlanError::UnsupportedCapability {
+                    rule_id: rule.id.clone(),
+                    capability: Capability::WildcardDomain,
+                });
+            }
+            RuleTarget::ServicePack(_) => {
+                return Err(PlanError::UnsupportedCapability {
+                    rule_id: rule.id.clone(),
+                    capability: Capability::ServicePack,
+                });
+            }
+        },
     };
     let action = match compile_action(&rule.action, profile_lanes, lane_plans) {
         Some(action) => action,
