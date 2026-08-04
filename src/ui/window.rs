@@ -8,12 +8,14 @@ use glib::signal::Inhibit;
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
 use routelane::domain::{
-    HealthState, Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource, RuleTarget,
+    ApplicationSelector, HealthState, Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource,
+    RuleTarget,
 };
 use routelane::health::HealthReport;
 use routelane::ipc::{DaemonEvent, DaemonRequest, DaemonStatus};
 
 use crate::models::{DaemonToUi, UiToDaemon};
+use crate::ui::application_row::{create_application_row, ApplicationRowContext};
 use crate::ui::experience::{
     authorization_after_applied, authorization_after_error, dashboard_state, status_presentation,
     AuthorizationPresentation, DashboardState, PrimaryAction, SetupStep,
@@ -274,6 +276,122 @@ struct RuleListContext {
     texts: crate::ui::i18n::Texts,
     save_profile: Rc<dyn Fn(PostSaveAction)>,
     window: adw::ApplicationWindow,
+}
+
+#[derive(Clone)]
+struct ApplicationListContext {
+    group: adw::PreferencesGroup,
+    rows: Rc<RefCell<Vec<adw::ActionRow>>>,
+    profile: Rc<RefCell<Profile>>,
+    routing_active: Rc<Cell<bool>>,
+    texts: crate::ui::i18n::Texts,
+    save_profile: Rc<dyn Fn(PostSaveAction)>,
+    sender: Sender<UiToDaemon>,
+    window: adw::ApplicationWindow,
+}
+
+fn open_application_dialog(parent: &adw::ApplicationWindow, context: ApplicationListContext) {
+    let applications = routelane::application::discover_desktop_apps().unwrap_or_default();
+    let dialog = adw::Window::builder()
+        .title(context.texts.add_application)
+        .transient_for(parent)
+        .modal(true)
+        .default_width(480)
+        .build();
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .build();
+    let names = applications
+        .iter()
+        .map(|application| application.display_name.as_str())
+        .collect::<Vec<_>>();
+    let application = gtk::DropDown::builder()
+        .model(&gtk::StringList::new(&names))
+        .hexpand(true)
+        .build();
+    let lane_names = context
+        .profile
+        .borrow()
+        .lanes
+        .iter()
+        .map(|lane| lane.name.clone())
+        .collect::<Vec<_>>();
+    let lanes = lane_names.iter().map(String::as_str).collect::<Vec<_>>();
+    let lane = gtk::DropDown::builder()
+        .model(&gtk::StringList::new(&lanes))
+        .hexpand(true)
+        .build();
+    let feedback = gtk::Label::builder()
+        .label(context.texts.applications_description)
+        .xalign(0.0)
+        .wrap(true)
+        .visible(applications.is_empty())
+        .build();
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    let cancel = gtk::Button::with_label(context.texts.cancel);
+    let submit = gtk::Button::with_label(context.texts.add_application);
+    submit.add_css_class("suggested-action");
+    submit.set_sensitive(!applications.is_empty() && !lanes.is_empty());
+    buttons.append(&cancel);
+    buttons.append(&submit);
+    content.append(&application);
+    content.append(&lane);
+    content.append(&feedback);
+    content.append(&buttons);
+    dialog.set_content(Some(&content));
+    cancel.connect_clicked({
+        let dialog = dialog.clone();
+        move |_| dialog.close()
+    });
+    submit.connect_clicked({
+        let dialog = dialog.clone();
+        move |_| {
+            let Some(selected_application) = applications.get(application.selected() as usize)
+            else {
+                return;
+            };
+            let Some(selected_lane) = context
+                .profile
+                .borrow()
+                .lanes
+                .get(lane.selected() as usize)
+                .map(|lane| lane.id.clone())
+            else {
+                return;
+            };
+            let rule = Rule {
+                id: RuleId::from(format!("app-{}", uuid::Uuid::new_v4()).as_str()),
+                enabled: true,
+                priority: next_rule_priority(&context.profile.borrow()),
+                source: RuleSource::Application(ApplicationSelector {
+                    desktop_id: Some(selected_application.desktop_id.clone()),
+                    executable_path: selected_application.executable_path.clone(),
+                    include_children: true,
+                }),
+                target: RuleTarget::Any,
+                action: RuleAction::Route(selected_lane),
+            };
+            context.profile.borrow_mut().rules.push(rule);
+            let action = if context.routing_active.get() {
+                PostSaveAction::Request(apply_request(&context.profile.borrow()))
+            } else {
+                PostSaveAction::None
+            };
+            (context.save_profile)(action);
+            rebuild_application_rows(&context);
+            dialog.close();
+        }
+    });
+    dialog.present();
 }
 
 fn open_rule_dialog(
@@ -586,6 +704,16 @@ pub fn build_window(
     add_rule_button.set_sensitive(editable);
     rules_group.add(&add_rule_button);
     page.add(&rules_group);
+    let applications_group = adw::PreferencesGroup::builder()
+        .title(texts.applications_title)
+        .description(texts.applications_description)
+        .build();
+    applications_group.set_sensitive(editable);
+    let add_application_button = gtk::Button::with_label(texts.add_application);
+    add_application_button.set_halign(gtk::Align::Start);
+    add_application_button.set_sensitive(editable);
+    applications_group.add(&add_application_button);
+    page.add(&applications_group);
     let health_group = adw::PreferencesGroup::builder()
         .title(texts.health_title)
         .build();
@@ -652,6 +780,7 @@ pub fn build_window(
         let config_writable = config_writable.clone();
         let settings = settings.clone();
         let add_rule_button = add_rule_button.clone();
+        let add_application_button = add_application_button.clone();
         let rules_group = rules_group.clone();
         let dashboard_primary = dashboard_primary.clone();
         let app = app.clone();
@@ -680,6 +809,7 @@ pub fn build_window(
                         active.set_sensitive(false);
                         settings.set_sensitive(false);
                         add_rule_button.set_sensitive(false);
+                        add_application_button.set_sensitive(false);
                         dashboard_primary.set_sensitive(false);
                         rules_group.set_sensitive(false);
                         config_error_group.set_visible(true);
@@ -710,6 +840,18 @@ pub fn build_window(
         window: window.clone(),
     };
     rebuild_rule_rows(&rule_list);
+    let application_rows = Rc::new(RefCell::new(Vec::<adw::ActionRow>::new()));
+    let application_list = ApplicationListContext {
+        group: applications_group.clone(),
+        rows: application_rows,
+        profile: profile.clone(),
+        routing_active: routing_active.clone(),
+        texts,
+        save_profile: save_profile.clone(),
+        sender: sender.clone(),
+        window: window.clone(),
+    };
+    rebuild_application_rows(&application_list);
 
     {
         let window = window.clone();
@@ -718,6 +860,7 @@ pub fn build_window(
         let document = document.clone();
         let persist_document = persist_document.clone();
         let rule_list = rule_list.clone();
+        let application_list = application_list.clone();
         let routing_active = routing_active.clone();
         let sync_lane_summary = sync_lane_summary.clone();
         settings.connect_clicked(move |_| {
@@ -738,6 +881,7 @@ pub fn build_window(
                 let routing_active = routing_active.clone();
                 let sync_lane_summary = sync_lane_summary.clone();
                 let profile = profile.clone();
+                let application_list = application_list.clone();
                 Rc::new(move || {
                     let action = if routing_active.get() {
                         PostSaveAction::Request(apply_request(&profile.borrow()))
@@ -746,6 +890,7 @@ pub fn build_window(
                     };
                     save_profile(action);
                     rebuild_rule_rows(&rule_list);
+                    rebuild_application_rows(&application_list);
                     sync_lane_summary();
                 })
             };
@@ -863,6 +1008,13 @@ pub fn build_window(
             );
         });
     }
+    {
+        let window = window.clone();
+        let application_list = application_list.clone();
+        add_application_button.connect_clicked(move |_| {
+            open_application_dialog(&window, application_list.clone());
+        });
+    }
 
     {
         let active = active.clone();
@@ -875,6 +1027,7 @@ pub fn build_window(
         let dashboard_primary = dashboard_primary.clone();
         let authorization = authorization.clone();
         let rule_list = rule_list.clone();
+        let application_list = application_list.clone();
         let document = document.clone();
         let persist_document = persist_document.clone();
         let last_applied_profile_id = last_applied_profile_id.clone();
@@ -907,6 +1060,7 @@ pub fn build_window(
                         routing_active.set(is_active);
                         updating_switch.set(true);
                         active.set_active(is_active);
+                        rebuild_application_rows(&application_list);
                         updating_switch.set(false);
                         title.set_subtitle(&format!("{:?}", status.health.state));
                         mutation_pending.set(false);
@@ -1001,6 +1155,7 @@ pub fn build_window(
                         mutation_pending.set(false);
                         authorization.set(authorization_after_applied());
                         rebuild_rule_rows(&rule_list);
+                        rebuild_application_rows(&application_list);
                         title.set_subtitle(&format!("Applying generation {}", result.generation));
                         sync_dashboard(HealthState::Applying);
                         let sender = sender.clone();
@@ -1011,11 +1166,25 @@ pub fn build_window(
                                 .ok();
                         });
                     }
+                    DaemonToUi::ApplicationLaunched(result) => {
+                        let message = format!("{} PID {}", texts.application_launched, result.pid);
+                        toast_overlay.add_toast(&adw::Toast::new(&message));
+                    }
+                    DaemonToUi::ApplicationProcessesAdopted(result) => {
+                        let message = format!(
+                            "{}{}{}",
+                            texts.application_adopted_prefix,
+                            result.adopted_count,
+                            texts.application_adopted_suffix
+                        );
+                        toast_overlay.add_toast(&adw::Toast::new(&message));
+                    }
                     DaemonToUi::Deactivated => {
                         mutation_pending.set(false);
                         routing_active.set(false);
                         updating_switch.set(true);
                         active.set_active(false);
+                        rebuild_application_rows(&application_list);
                         updating_switch.set(false);
                         sync_dashboard(HealthState::Inactive);
                         render_health(
@@ -1034,6 +1203,7 @@ pub fn build_window(
                             }
                             persist_document(PostSaveAction::None);
                             rebuild_rule_rows(&rule_list);
+                            rebuild_application_rows(&application_list);
                             sync_lane_summary();
                         }
                     }
@@ -1187,9 +1357,106 @@ fn rebuild_rule_rows(context: &RuleListContext) {
         context.group.remove(&row);
     }
     let mut rules = context.profile.borrow().rules.clone();
+    rules.retain(|rule| matches!(rule.source, RuleSource::Any));
     rules.sort_by(Rule::execution_cmp);
     for rule in rules {
         append_rule(context, &rule);
+    }
+}
+
+fn append_application(context: &ApplicationListContext, rule: &Rule) {
+    let lanes = context
+        .profile
+        .borrow()
+        .lanes
+        .iter()
+        .map(|lane| (lane.id.clone(), lane.name.clone()))
+        .collect::<Vec<_>>();
+    let on_change: Rc<dyn Fn(Rule, RuleEdit)> = {
+        let profile = context.profile.clone();
+        let save = context.save_profile.clone();
+        let routing_active = context.routing_active.clone();
+        Rc::new(move |updated, edit| {
+            let updated_id = updated.id.clone();
+            let changed = {
+                let mut profile = profile.borrow_mut();
+                if let Some(rule) = profile.rules.iter_mut().find(|rule| rule.id == updated.id) {
+                    *rule = updated;
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
+                let action = if routing_active.get() {
+                    match edit {
+                        RuleEdit::Enabled(enabled) => {
+                            PostSaveAction::Request(set_rule_enabled_request(
+                                profile.borrow().id.clone(),
+                                updated_id,
+                                enabled,
+                            ))
+                        }
+                        RuleEdit::Definition => {
+                            PostSaveAction::Request(apply_request(&profile.borrow()))
+                        }
+                    }
+                } else {
+                    PostSaveAction::None
+                };
+                save(action);
+            }
+        })
+    };
+    let on_delete: Rc<dyn Fn(RuleId)> = {
+        let profile = context.profile.clone();
+        let save = context.save_profile.clone();
+        let routing_active = context.routing_active.clone();
+        Rc::new(move |id| {
+            profile.borrow_mut().rules.retain(|rule| rule.id != id);
+            let action = if routing_active.get() {
+                PostSaveAction::Request(apply_request(&profile.borrow()))
+            } else {
+                PostSaveAction::None
+            };
+            save(action);
+        })
+    };
+    let on_request: Rc<dyn Fn(DaemonRequest)> = {
+        let sender = context.sender.clone();
+        Rc::new(move |request| {
+            let sender = sender.clone();
+            glib::MainContext::default().spawn_local(async move {
+                sender.send(UiToDaemon::Request(request)).await.ok();
+            });
+        })
+    };
+    let row = create_application_row(
+        rule,
+        ApplicationRowContext {
+            profile_id: context.profile.borrow().id.clone(),
+            lanes,
+            texts: context.texts,
+            parent: context.window.clone(),
+            on_change,
+            on_delete,
+            on_request,
+            routing_active: context.routing_active.get(),
+        },
+    );
+    context.group.add(&row);
+    context.rows.borrow_mut().push(row);
+}
+
+fn rebuild_application_rows(context: &ApplicationListContext) {
+    for row in context.rows.borrow_mut().drain(..) {
+        context.group.remove(&row);
+    }
+    let mut rules = context.profile.borrow().rules.clone();
+    rules.retain(|rule| matches!(rule.source, RuleSource::Application(_)));
+    rules.sort_by(Rule::execution_cmp);
+    for rule in rules {
+        append_application(context, &rule);
     }
 }
 

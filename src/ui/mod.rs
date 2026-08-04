@@ -1,3 +1,4 @@
+pub mod application_row;
 pub mod confirm;
 pub mod experience;
 pub mod i18n;
