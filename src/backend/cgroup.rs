@@ -144,6 +144,62 @@ impl ApplicationCgroupManager {
         fs::remove_dir(&path).map_err(io_error)
     }
 
+    pub fn verified_orphan_directories(&self) -> Result<Vec<PathBuf>, CgroupError> {
+        if !self.root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            let file_type = entry.file_type().map_err(io_error)?;
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return Err(CgroupError::Io(
+                    "RouteLane application cgroup root contains a non-directory entry".to_owned(),
+                ));
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| CgroupError::InvalidRuleId)?;
+            let rule_id = RuleId::from(name.as_str());
+            let path = self.rule_path(&rule_id)?;
+            if path != entry.path() {
+                return Err(CgroupError::InvalidRuleId);
+            }
+            let members = fs::read_to_string(path.join("cgroup.procs")).map_err(io_error)?;
+            if !members.trim().is_empty() {
+                return Err(CgroupError::CgroupNotEmpty { rule_id });
+            }
+            for child in fs::read_dir(&path).map_err(io_error)? {
+                let child = child.map_err(io_error)?;
+                if child.file_type().map_err(io_error)?.is_dir() {
+                    return Err(CgroupError::Io(
+                        "RouteLane application cgroup contains a nested directory".to_owned(),
+                    ));
+                }
+            }
+            paths.push(path);
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    pub fn remove_verified_orphan_directories(&self, paths: &[PathBuf]) -> Result<(), CgroupError> {
+        let verified = self.verified_orphan_directories()?;
+        if paths.iter().any(|path| !verified.contains(path)) {
+            return Err(CgroupError::Io(
+                "application cgroup cleanup target was not verified".to_owned(),
+            ));
+        }
+        for path in paths {
+            if self.create_control_files {
+                fs::remove_file(path.join("cgroup.procs")).map_err(io_error)?;
+            }
+            fs::remove_dir(path).map_err(io_error)?;
+        }
+        Ok(())
+    }
+
     fn rule_path(&self, rule_id: &RuleId) -> Result<PathBuf, CgroupError> {
         let name = rule_id.as_str();
         if name.is_empty()
@@ -199,10 +255,13 @@ fn io_error(error: std::io::Error) -> CgroupError {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::domain::RuleId;
 
     use super::{ApplicationCgroupManager, CgroupError, ProcessIdentity};
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn adoption_rejects_pid_when_executable_or_start_time_differs() {
@@ -259,6 +318,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn orphan_preflight_returns_only_empty_direct_route_lane_cgroups() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let browser = manager.prepare(&RuleId::from("browser"), 1000).unwrap();
+
+        assert_eq!(
+            manager.verified_orphan_directories().unwrap(),
+            vec![browser]
+        );
+    }
+
+    #[test]
+    fn orphan_preflight_rejects_a_symlink_before_cleanup() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        fs::create_dir_all(&manager.root).unwrap();
+        std::os::unix::fs::symlink(&fixture.proc_root, manager.root.join("browser")).unwrap();
+
+        assert!(matches!(
+            manager.verified_orphan_directories(),
+            Err(CgroupError::Io(_))
+        ));
+        assert!(manager.root.join("browser").exists());
+    }
+
     struct Fixture {
         root: PathBuf,
         proc_root: PathBuf,
@@ -266,8 +351,11 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root =
-                std::env::temp_dir().join(format!("routelane-cgroup-test-{}", std::process::id()));
+            let root = std::env::temp_dir().join(format!(
+                "routelane-cgroup-test-{}-{}",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ));
             let _ = fs::remove_dir_all(&root);
             let proc_root = root.join("proc");
             fs::create_dir_all(&proc_root).unwrap();
