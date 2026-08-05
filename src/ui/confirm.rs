@@ -12,6 +12,17 @@ pub fn confirm_destructive_action(
     body: &str,
     on_confirm: Rc<dyn Fn()>,
 ) {
+    confirm_destructive_action_with_label(parent, texts, heading, body, texts.delete, on_confirm);
+}
+
+pub fn confirm_destructive_action_with_label(
+    parent: &impl IsA<gtk::Window>,
+    texts: Texts,
+    heading: &str,
+    body: &str,
+    confirm_label: &str,
+    on_confirm: Rc<dyn Fn()>,
+) {
     let dialog = adw::Window::builder()
         .title(heading)
         .transient_for(parent)
@@ -39,7 +50,7 @@ pub fn confirm_destructive_action(
         .halign(gtk::Align::End)
         .build();
     let cancel = gtk::Button::with_label(texts.cancel);
-    let delete = gtk::Button::with_label(texts.delete);
+    let delete = gtk::Button::with_label(confirm_label);
     delete.add_css_class("destructive-action");
     button_row.append(&cancel);
     button_row.append(&delete);

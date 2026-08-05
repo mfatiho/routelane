@@ -11,7 +11,8 @@ pub mod window;
 mod experience_contract_tests {
     use super::experience::{
         activation_action, authorization_after_applied, authorization_after_error, dashboard_state,
-        status_presentation, ActivationAction, AuthorizationPresentation, PrimaryAction, SetupStep,
+        orphan_recovery_action, status_presentation, ActivationAction, AuthorizationPresentation,
+        PrimaryAction, RecoveryAction, SetupStep,
     };
     use crate::ui::i18n::LanguageTexts;
     use routelane::config::Language;
@@ -93,6 +94,11 @@ mod experience_contract_tests {
             assert!(!texts.add_first_lane.is_empty());
             assert!(!texts.authorization_waiting.is_empty());
             assert!(!texts.authorization_denied.is_empty());
+            assert!(!texts.orphan_recovery_heading.is_empty());
+            assert!(!texts.orphan_recovery_body.is_empty());
+            assert!(!texts.recover_and_retry.is_empty());
+            assert!(!texts.orphan_recovery_progress.is_empty());
+            assert!(!texts.orphan_recovery_failed.is_empty());
         }
     }
 
@@ -110,6 +116,26 @@ mod experience_contract_tests {
         assert_eq!(
             authorization_after_applied(),
             AuthorizationPresentation::Idle
+        );
+    }
+
+    #[test]
+    fn only_orphaned_resource_error_requests_recovery_confirmation() {
+        assert_eq!(
+            orphan_recovery_action("DAEMON_ORPHANED_RESOURCES", false),
+            RecoveryAction::AskForConfirmation
+        );
+        assert_eq!(
+            orphan_recovery_action("DAEMON_RECONCILIATION_FAILED", false),
+            RecoveryAction::Ignore
+        );
+    }
+
+    #[test]
+    fn automatic_retry_cannot_start_a_second_recovery_cycle() {
+        assert_eq!(
+            orphan_recovery_action("DAEMON_ORPHANED_RESOURCES", true),
+            RecoveryAction::Ignore
         );
     }
 
