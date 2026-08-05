@@ -423,7 +423,14 @@ fn root_worker_exercises_real_helper_transport() {
     assert_eq!(restored["generation"], 1);
     assert_eq!(helper.ok(json!({"method": "inspect"}))["generation"], 1);
 
-    let cleaned = helper.ok(json!({"method": "cleanup"}));
+    drop(helper);
+    fs::remove_file(&isolated_state).expect("simulate a lost validated helper journal");
+    let mut helper = HelperProcess::spawn(state_directory.path());
+    let orphaned = helper.ok(json!({"method": "inspect"}));
+    assert_eq!(orphaned["generation"], Value::Null);
+    assert_eq!(orphaned["routelane_table_present"], true);
+
+    let cleaned = helper.ok(json!({"method": "recover_orphaned_resources"}));
     assert_eq!(cleaned["cleaned"], true);
     assert_managed_resources_absent();
     let empty = helper.ok(json!({"method": "inspect"}));
@@ -431,7 +438,7 @@ fn root_worker_exercises_real_helper_transport() {
     assert_eq!(empty["routelane_table_present"], false);
     assert!(
         !isolated_state.exists(),
-        "Cleanup must remove the isolated helper journal"
+        "orphan recovery must remove the isolated helper journal"
     );
     assert_eq!(
         state_fingerprint("/run/routelane/applied-plan.json"),
