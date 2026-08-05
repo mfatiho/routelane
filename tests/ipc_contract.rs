@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use routelane::backend::{
     ApplyResponse, CleanupResponse, InspectResponse, KernelPlan, KernelSnapshot,
-    ResolutionSnapshot, RestoreResponse, SnapshotInput, TopologySnapshot,
+    OrphanRecoveryResponse, ResolutionSnapshot, RestoreResponse, SnapshotInput, TopologySnapshot,
 };
 use routelane::daemon::{
     AtomicJsonConfigRepository, ConfigRepository, DaemonError, DaemonService,
@@ -67,6 +67,8 @@ struct FakeHelper {
     cleanup_calls: Arc<Mutex<usize>>,
     inspect_calls: Arc<Mutex<usize>>,
     next_inspect_gate: Arc<Mutex<Option<InspectGate>>>,
+    orphaned: Arc<Mutex<bool>>,
+    recovery_calls: Arc<Mutex<usize>>,
 }
 
 #[derive(Clone)]
@@ -130,6 +132,14 @@ impl FakeHelper {
         };
         *self.next_inspect_gate.lock().unwrap() = Some(gate.clone());
         (gate.entered, gate.release)
+    }
+
+    fn seed_orphaned_resources(&self) {
+        *self.orphaned.lock().unwrap() = true;
+    }
+
+    fn recovery_calls(&self) -> usize {
+        *self.recovery_calls.lock().unwrap()
     }
 }
 
@@ -200,7 +210,8 @@ impl PrivilegedHelperClient for FakeHelper {
         }
         let plan = self.live.lock().unwrap().clone();
         let drift = matches!(*self.behavior.lock().unwrap(), HelperBehavior::Drift);
-        let nft = if plan.is_some() && !drift {
+        let orphaned = *self.orphaned.lock().unwrap();
+        let nft = if (plan.is_some() && !drift) || orphaned {
             br#"{"nftables":[{"table":{"family":"inet","name":"routelane"}}]}"#.as_slice()
         } else {
             br#"{"nftables":[]}"#.as_slice()
@@ -221,7 +232,7 @@ impl PrivilegedHelperClient for FakeHelper {
             generation: plan.as_ref().map(|plan| plan.generation),
             plan_hash: plan.as_ref().map(KernelPlan::content_hash),
             applied_plan: plan.clone(),
-            routelane_table_present: plan.is_some(),
+            routelane_table_present: plan.is_some() || orphaned,
             snapshot,
             diagnostics: vec![],
         };
@@ -248,6 +259,26 @@ impl PrivilegedHelperClient for FakeHelper {
                 })
             }
         }
+    }
+
+    async fn recover_orphaned_resources(&self) -> Result<OrphanRecoveryResponse, DaemonError> {
+        *self.recovery_calls.lock().unwrap() += 1;
+        match self.behavior.lock().unwrap().clone() {
+            HelperBehavior::Fail => {
+                return Err(DaemonError::helper("injected orphan recovery failure"));
+            }
+            HelperBehavior::AuthorizationDenied => {
+                return Err(DaemonError::authorization(
+                    "injected orphan recovery authorization denial",
+                ));
+            }
+            _ => {}
+        }
+        let cleaned = std::mem::take(&mut *self.orphaned.lock().unwrap());
+        Ok(OrphanRecoveryResponse {
+            cleaned,
+            diagnostics: vec![],
+        })
     }
 }
 
@@ -681,6 +712,49 @@ async fn restart_live_drift_is_failed_without_claiming_inactive_or_mutating() {
     let error = service.apply_profile(fixture_profile()).await.unwrap_err();
     assert_eq!(error.code(), "DAEMON_RECONCILIATION_FAILED");
     assert_eq!(helper.live_plan().unwrap().generation, 7);
+}
+
+#[tokio::test]
+async fn orphan_recovery_resets_failed_reconciliation_and_allows_apply() {
+    let helper = FakeHelper::default();
+    helper.seed_orphaned_resources();
+    let service = restarted_service(helper.clone(), MemoryConfig::default());
+
+    let first = service.apply_profile(fixture_profile()).await.unwrap_err();
+    assert_eq!(first.code(), "DAEMON_ORPHANED_RESOURCES");
+
+    let recovered = service.recover_orphaned_resources().await.unwrap();
+    assert!(recovered.cleaned);
+    assert_eq!(helper.recovery_calls(), 1);
+
+    service.apply_profile(fixture_profile()).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_orphan_recovery_keeps_reconciliation_blocked() {
+    let helper = FakeHelper::default();
+    helper.seed_orphaned_resources();
+    let service = restarted_service(helper.clone(), MemoryConfig::default());
+    assert_eq!(
+        service
+            .apply_profile(fixture_profile())
+            .await
+            .unwrap_err()
+            .code(),
+        "DAEMON_ORPHANED_RESOURCES"
+    );
+    helper.fail();
+
+    assert!(service.recover_orphaned_resources().await.is_err());
+    assert_eq!(helper.recovery_calls(), 1);
+    assert_eq!(
+        service
+            .apply_profile(fixture_profile())
+            .await
+            .unwrap_err()
+            .code(),
+        "DAEMON_ORPHANED_RESOURCES"
+    );
 }
 
 #[tokio::test]
