@@ -375,7 +375,9 @@ async fn forward_response(response: routelane::ipc::DaemonResponse, sender: &Sen
         Some(DaemonResult::ApplicationProcessesAdopted(result)) => {
             Some(DaemonToUi::ApplicationProcessesAdopted(result))
         }
-        Some(DaemonResult::OrphanedResourcesRecovered(_)) => None,
+        Some(DaemonResult::OrphanedResourcesRecovered(result)) => {
+            Some(DaemonToUi::OrphanedResourcesRecovered(result))
+        }
         Some(DaemonResult::Subscribed) | None => None,
     };
     if let Some(event) = event {

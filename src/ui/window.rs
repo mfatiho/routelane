@@ -16,9 +16,11 @@ use routelane::ipc::{DaemonEvent, DaemonRequest, DaemonStatus};
 
 use crate::models::{DaemonToUi, UiToDaemon};
 use crate::ui::application_row::{create_application_row, ApplicationRowContext};
+use crate::ui::confirm::confirm_destructive_action_with_label;
 use crate::ui::experience::{
-    authorization_after_applied, authorization_after_error, dashboard_state, status_presentation,
-    AuthorizationPresentation, DashboardState, PrimaryAction, SetupStep,
+    authorization_after_applied, authorization_after_error, dashboard_state,
+    orphan_recovery_action, status_presentation, AuthorizationPresentation, DashboardState,
+    PrimaryAction, RecoveryAction, SetupStep,
 };
 use crate::ui::i18n::LanguageTexts;
 use crate::ui::rule_row::{
@@ -580,6 +582,9 @@ pub fn build_window(
     let routing_active = Rc::new(Cell::new(false));
     let authorization = Rc::new(Cell::new(AuthorizationPresentation::Idle));
     let mutation_pending = Rc::new(Cell::new(false));
+    let pending_recovery_profile = Rc::new(RefCell::new(None::<Profile>));
+    let recovery_retry_used = Rc::new(Cell::new(false));
+    let recovery_in_progress = Rc::new(Cell::new(false));
     let last_applied_profile_id = Rc::new(RefCell::new(None::<ProfileId>));
     let last_daemon_generation = Rc::new(Cell::new(None::<u64>));
     let last_event_sequence = Rc::new(Cell::new(None::<u64>));
@@ -912,6 +917,8 @@ pub fn build_window(
         let save_profile = save_profile.clone();
         let sender = sender.clone();
         let mutation_pending = mutation_pending.clone();
+        let pending_recovery_profile = pending_recovery_profile.clone();
+        let recovery_retry_used = recovery_retry_used.clone();
         let sync_dashboard = sync_dashboard.clone();
         let health_content = health_content.clone();
         let window = window.clone();
@@ -939,6 +946,8 @@ pub fn build_window(
                     );
                 }
                 PrimaryAction::EnableRouting => {
+                    *pending_recovery_profile.borrow_mut() = Some(profile.borrow().clone());
+                    recovery_retry_used.set(false);
                     mutation_pending.set(true);
                     sync_dashboard(health_guess);
                     render_health(&health_content, &health_after_apply_request(), texts);
@@ -965,6 +974,8 @@ pub fn build_window(
         let updating_switch = updating_switch.clone();
         let health_content = health_content.clone();
         let mutation_pending = mutation_pending.clone();
+        let pending_recovery_profile = pending_recovery_profile.clone();
+        let recovery_retry_used = recovery_retry_used.clone();
         let sync_dashboard = sync_dashboard.clone();
         active.connect_state_set(move |_, state| {
             if updating_switch.get() || mutation_pending.get() {
@@ -977,6 +988,8 @@ pub fn build_window(
                 HealthState::Inactive
             });
             if state {
+                *pending_recovery_profile.borrow_mut() = Some(profile.borrow().clone());
+                recovery_retry_used.set(false);
                 render_health(&health_content, &health_after_apply_request(), texts);
                 save_profile(PostSaveAction::Request(apply_request(&profile.borrow())));
             } else {
@@ -1033,8 +1046,11 @@ pub fn build_window(
         let last_applied_profile_id = last_applied_profile_id.clone();
         let config_writable = config_writable.clone();
         let mutation_pending = mutation_pending.clone();
+        let pending_recovery_profile = pending_recovery_profile.clone();
+        let recovery_retry_used = recovery_retry_used.clone();
         let sync_dashboard = sync_dashboard.clone();
         let sync_lane_summary = sync_lane_summary.clone();
+        let window = window.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = receiver.recv().await {
                 match event {
@@ -1119,6 +1135,56 @@ pub fn build_window(
                         render_health(&health_content, &daemon_unavailable_view(detail), texts);
                     }
                     DaemonToUi::Error(error) => {
+                        if matches!(
+                            orphan_recovery_action(&error.code, recovery_retry_used.get()),
+                            RecoveryAction::AskForConfirmation
+                        ) {
+                            mutation_pending.set(false);
+                            sync_dashboard(HealthState::Inactive);
+                            let confirm_sender = sender.clone();
+                            let confirm_pending = mutation_pending.clone();
+                            let confirm_recovery = recovery_in_progress.clone();
+                            let confirm_dashboard = sync_dashboard.clone();
+                            let confirm_row = dashboard_row.clone();
+                            let on_confirm: Rc<dyn Fn()> = Rc::new(move || {
+                                confirm_pending.set(true);
+                                confirm_recovery.set(true);
+                                confirm_dashboard(HealthState::Applying);
+                                confirm_row.set_title(texts.orphan_recovery_progress);
+                                let sender = confirm_sender.clone();
+                                glib::MainContext::default().spawn_local(async move {
+                                    sender
+                                        .send(UiToDaemon::Request(
+                                            DaemonRequest::RecoverOrphanedResources,
+                                        ))
+                                        .await
+                                        .ok();
+                                });
+                            });
+                            let cancel_pending_profile = pending_recovery_profile.clone();
+                            let cancel_retry_used = recovery_retry_used.clone();
+                            let cancel_recovery = recovery_in_progress.clone();
+                            let cancel_active = active.clone();
+                            let cancel_dashboard = sync_dashboard.clone();
+                            let on_cancel: Rc<dyn Fn()> = Rc::new(move || {
+                                *cancel_pending_profile.borrow_mut() = None;
+                                cancel_retry_used.set(false);
+                                cancel_recovery.set(false);
+                                cancel_dashboard(HealthState::Inactive);
+                                cancel_active.grab_focus();
+                            });
+                            confirm_destructive_action_with_label(
+                                &window,
+                                texts,
+                                texts.orphan_recovery_heading,
+                                texts.orphan_recovery_body,
+                                texts.recover_and_retry,
+                                on_confirm,
+                                on_cancel,
+                            );
+                            continue;
+                        }
+                        let recovery_failed = recovery_in_progress.replace(false);
                         let authorization_denied = error.to_string().contains("AccessDenied")
                             || error.to_string().contains("authorization");
                         let outcome =
@@ -1138,7 +1204,14 @@ pub fn build_window(
                                 HealthState::Inactive
                             });
                         }
-                        show_copyable_error_toast(&toast_overlay, texts, &error.to_string());
+                        *pending_recovery_profile.borrow_mut() = None;
+                        recovery_retry_used.set(false);
+                        let detail = if recovery_failed {
+                            format!("{}: {}", texts.orphan_recovery_failed, error)
+                        } else {
+                            error.to_string()
+                        };
+                        show_copyable_error_toast(&toast_overlay, texts, &detail);
                         let sender = sender.clone();
                         glib::MainContext::default().spawn_local(async move {
                             sender
@@ -1153,6 +1226,9 @@ pub fn build_window(
                     }
                     DaemonToUi::Applied(result) => {
                         mutation_pending.set(false);
+                        *pending_recovery_profile.borrow_mut() = None;
+                        recovery_retry_used.set(false);
+                        recovery_in_progress.set(false);
                         authorization.set(authorization_after_applied());
                         rebuild_rule_rows(&rule_list);
                         rebuild_application_rows(&application_list);
@@ -1178,6 +1254,30 @@ pub fn build_window(
                             texts.application_adopted_suffix
                         );
                         toast_overlay.add_toast(&adw::Toast::new(&message));
+                    }
+                    DaemonToUi::OrphanedResourcesRecovered(result) => {
+                        log::debug!(
+                            "orphan recovery completed; network resources cleaned: {}",
+                            result.cleaned
+                        );
+                        recovery_in_progress.set(false);
+                        let request = retry_after_recovery(
+                            &mut pending_recovery_profile.borrow_mut(),
+                            recovery_retry_used.get(),
+                        );
+                        if let Some(request) = request {
+                            recovery_retry_used.set(true);
+                            mutation_pending.set(true);
+                            sync_dashboard(HealthState::Applying);
+                            dashboard_row.set_title(texts.orphan_recovery_progress);
+                            let sender = sender.clone();
+                            glib::MainContext::default().spawn_local(async move {
+                                sender.send(UiToDaemon::Request(request)).await.ok();
+                            });
+                        } else {
+                            mutation_pending.set(false);
+                            sync_dashboard(HealthState::Inactive);
+                        }
                     }
                     DaemonToUi::Deactivated => {
                         mutation_pending.set(false);
@@ -1475,6 +1575,13 @@ fn apply_request(profile: &Profile) -> DaemonRequest {
     DaemonRequest::ApplyProfile(candidate)
 }
 
+fn retry_after_recovery(pending: &mut Option<Profile>, retry_used: bool) -> Option<DaemonRequest> {
+    if retry_used {
+        return None;
+    }
+    pending.take().map(|profile| apply_request(&profile))
+}
+
 fn store_profile(document: &mut ConfigV2, current: Profile) {
     if let Some(stored) = document
         .profiles
@@ -1614,8 +1721,9 @@ mod tests {
         accept_connection_epoch, accept_daemon_event_revision, accept_daemon_status_revision,
         configuration_error_view, daemon_unavailable_view, dashboard_copy,
         health_after_apply_request, health_sections, health_view, reconcile_profiles,
-        refreshed_interface_selection, rule_dialog_restores_target_focus, rule_dialog_submission,
-        status_is_active, switch_state_after_persistence_failure, RuleDialogSubmission,
+        refreshed_interface_selection, retry_after_recovery, rule_dialog_restores_target_focus,
+        rule_dialog_submission, status_is_active, switch_state_after_persistence_failure,
+        RuleDialogSubmission,
     };
     use crate::ui::experience::{AuthorizationPresentation, DashboardState, PrimaryAction};
     use crate::ui::i18n::LanguageTexts;
@@ -1627,7 +1735,24 @@ mod tests {
         Diagnostic, DiagnosticCode, DiagnosticSubject, HealthReport, LaneHealth, Severity,
         SuggestedAction,
     };
-    use routelane::ipc::DaemonStatus;
+    use routelane::ipc::{DaemonRequest, DaemonStatus};
+
+    #[test]
+    fn successful_recovery_consumes_the_pending_profile_for_one_retry() {
+        let profile = super::empty_default_profile();
+        let mut pending = Some(profile.clone());
+
+        assert_eq!(
+            retry_after_recovery(&mut pending, false),
+            Some(DaemonRequest::ApplyProfile({
+                let mut enabled = profile;
+                enabled.enabled = true;
+                enabled
+            }))
+        );
+        assert!(pending.is_none());
+        assert!(retry_after_recovery(&mut pending, true).is_none());
+    }
 
     #[test]
     fn clears_selection_when_previous_interface_disappears() {
