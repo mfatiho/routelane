@@ -305,6 +305,17 @@ fn list_child_order(kind: ListChildKind) -> u8 {
     }
 }
 
+fn ordered_list_child_kinds(dynamic_count: usize) -> Vec<ListChildKind> {
+    let mut children = Vec::with_capacity(dynamic_count.saturating_add(1));
+    children.push(ListChildKind::FixedAction);
+    children.extend(std::iter::repeat_n(
+        ListChildKind::DynamicRow,
+        dynamic_count,
+    ));
+    children.sort_by_key(|kind| list_child_order(*kind));
+    children
+}
+
 fn open_application_dialog(parent: &adw::ApplicationWindow, context: ApplicationListContext) {
     let applications = routelane::application::discover_desktop_apps().unwrap_or_default();
     let dialog = adw::Window::builder()
@@ -717,20 +728,38 @@ pub fn build_window(
         .description(texts.rules_description)
         .build();
     rules_group.set_sensitive(editable);
-    let add_rule_button = gtk::Button::with_label(texts.add_rule);
+    let add_rule_button = gtk::Button::with_label(&format!("+ {}", texts.add_rule));
     add_rule_button.set_halign(gtk::Align::Start);
     add_rule_button.set_sensitive(editable);
-    rules_group.add(&add_rule_button);
+    let rule_action_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    rule_action_box.append(&add_rule_button);
+    let rule_action_row = adw::ActionRow::new();
+    rule_action_row.set_child(Some(&rule_action_box));
+    rules_group.add(&rule_action_row);
     page.add(&rules_group);
     let applications_group = adw::PreferencesGroup::builder()
         .title(texts.applications_title)
         .description(texts.applications_description)
         .build();
     applications_group.set_sensitive(editable);
-    let add_application_button = gtk::Button::with_label(texts.add_application);
+    let add_application_button = gtk::Button::with_label(&format!("+ {}", texts.add_application));
     add_application_button.set_halign(gtk::Align::Start);
     add_application_button.set_sensitive(editable);
-    applications_group.add(&add_application_button);
+    let application_action_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    application_action_box.append(&add_application_button);
+    let application_action_row = adw::ActionRow::new();
+    application_action_row.set_child(Some(&application_action_box));
+    applications_group.add(&application_action_row);
     page.add(&applications_group);
     let health_group = adw::PreferencesGroup::builder()
         .title(texts.health_title)
@@ -1472,6 +1501,10 @@ fn rebuild_rule_rows(context: &RuleListContext) {
     let mut rules = context.profile.borrow().rules.clone();
     rules.retain(|rule| matches!(rule.source, RuleSource::Any));
     rules.sort_by(Rule::execution_cmp);
+    debug_assert_eq!(
+        ordered_list_child_kinds(rules.len()).first(),
+        Some(&ListChildKind::FixedAction)
+    );
     for rule in rules {
         append_rule(context, &rule);
     }
@@ -1568,6 +1601,10 @@ fn rebuild_application_rows(context: &ApplicationListContext) {
     let mut rules = context.profile.borrow().rules.clone();
     rules.retain(|rule| matches!(rule.source, RuleSource::Application(_)));
     rules.sort_by(Rule::execution_cmp);
+    debug_assert_eq!(
+        ordered_list_child_kinds(rules.len()).first(),
+        Some(&ListChildKind::FixedAction)
+    );
     for rule in rules {
         append_application(context, &rule);
     }
@@ -1733,10 +1770,11 @@ mod tests {
     use super::{
         accept_connection_epoch, accept_daemon_event_revision, accept_daemon_status_revision,
         configuration_error_view, daemon_unavailable_view, dashboard_copy,
-        health_after_apply_request, health_sections, health_view, reconcile_profiles,
-        refreshed_interface_selection, list_child_order, retry_after_recovery,
-        rule_dialog_restores_target_focus, rule_dialog_submission, status_is_active,
-        switch_state_after_persistence_failure, ListChildKind, RuleDialogSubmission,
+        health_after_apply_request, health_sections, health_view, list_child_order,
+        ordered_list_child_kinds, reconcile_profiles, refreshed_interface_selection,
+        retry_after_recovery, rule_dialog_restores_target_focus, rule_dialog_submission,
+        status_is_active, switch_state_after_persistence_failure, ListChildKind,
+        RuleDialogSubmission,
     };
     use crate::ui::experience::{AuthorizationPresentation, DashboardState, PrimaryAction};
     use crate::ui::i18n::LanguageTexts;
@@ -1755,6 +1793,22 @@ mod tests {
         assert!(
             list_child_order(ListChildKind::FixedAction)
                 < list_child_order(ListChildKind::DynamicRow)
+        );
+    }
+
+    #[test]
+    fn rebuilding_a_list_keeps_exactly_one_action_before_dynamic_rows() {
+        assert_eq!(
+            ordered_list_child_kinds(0),
+            vec![ListChildKind::FixedAction]
+        );
+        assert_eq!(
+            ordered_list_child_kinds(2),
+            vec![
+                ListChildKind::FixedAction,
+                ListChildKind::DynamicRow,
+                ListChildKind::DynamicRow,
+            ]
         );
     }
 
