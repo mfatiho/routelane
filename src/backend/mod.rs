@@ -25,9 +25,9 @@ pub use planner::{compile_profile, Capability, PlanError};
 pub use policy_route::{build_policy_commands, CommandSpec, IpFamily, Program};
 pub use privileged::{
     validate_privileged_plan, ApplyResponse, AuthorizationError, Authorizer, CleanupResponse,
-    InspectResponse, PrivilegedBackend, PrivilegedError, PrivilegedService, RestoreResponse,
-    ServiceError, SystemPolkitAuthorizer, SystemPrivilegedBackend, ValidationError,
-    MAX_PLAN_JSON_BYTES,
+    InspectResponse, OrphanRecoveryResponse, PrivilegedBackend, PrivilegedError, PrivilegedService,
+    RestoreResponse, ServiceError, SystemPolkitAuthorizer, SystemPrivilegedBackend,
+    ValidationError, MAX_PLAN_JSON_BYTES,
 };
 #[cfg(feature = "root-integration")]
 pub use privileged::{CommandPrivilegedBackend, FileAppliedStateStore, ProcessCommandExecutor};

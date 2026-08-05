@@ -357,6 +357,15 @@ pub struct StoredAppliedState {
     pub cleanup_pending: bool,
     #[serde(default)]
     restore_receipt: Option<RestoreReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    orphan_cleanup: Option<OrphanedOwnership>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrphanedOwnership {
+    nft_fingerprint: Option<String>,
+    routing: RoutingOwnership,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,6 +439,7 @@ impl StoredAppliedState {
             pending_expectations: None,
             cleanup_pending: false,
             restore_receipt,
+            orphan_cleanup: None,
         }
     }
 }
@@ -788,6 +798,36 @@ where
     fn cleanup(&mut self) -> Result<CleanupResponse, PrivilegedError> {
         self.cleanup_with_receipt(None)
     }
+
+    fn recover_orphaned(&mut self) -> Result<OrphanRecoveryResponse, PrivilegedError> {
+        self.ensure_reconciled()?;
+        if self.current.is_some() {
+            return Err(PrivilegedError::new(
+                "validated RouteLane state must use normal cleanup",
+            ));
+        }
+        let ownership = capture_verified_orphaned_ownership(&mut self.executor)?;
+        if ownership.nft_fingerprint.is_none() && ownership.routing == RoutingOwnership::default() {
+            return Ok(OrphanRecoveryResponse {
+                cleaned: false,
+                diagnostics: vec![],
+            });
+        }
+        self.store.save(&StoredAppliedState {
+            active: None,
+            active_nft_fingerprint: None,
+            pending: None,
+            pending_expectations: None,
+            cleanup_pending: false,
+            restore_receipt: None,
+            orphan_cleanup: Some(ownership),
+        })?;
+        resume_orphan_cleanup(&mut self.executor, &mut self.store)?;
+        Ok(OrphanRecoveryResponse {
+            cleaned: true,
+            diagnostics: vec![],
+        })
+    }
 }
 
 impl<E, S> CommandPrivilegedBackend<E, S>
@@ -824,6 +864,7 @@ where
             pending_expectations: None,
             cleanup_pending: true,
             restore_receipt: restore_receipt.clone(),
+            orphan_cleanup: None,
         })?;
         let mut runner = CommandKernelRunner::new(&mut self.executor, Some(current));
         runner
@@ -886,6 +927,7 @@ where
             pending_expectations: Some(pending_expectations.clone()),
             cleanup_pending: false,
             restore_receipt: restore_receipt.clone(),
+            orphan_cleanup: None,
         })?;
         self.restore_receipt = None;
 
@@ -1021,7 +1063,10 @@ where
     fn ensure_reconciled(&mut self) -> Result<(), PrivilegedError> {
         let record = match self.store.load()? {
             Some(record)
-                if !self.initialized || record.pending.is_some() || record.cleanup_pending =>
+                if !self.initialized
+                    || record.pending.is_some()
+                    || record.cleanup_pending
+                    || record.orphan_cleanup.is_some() =>
             {
                 record
             }
@@ -1044,6 +1089,16 @@ where
             record.pending_expectations.as_ref(),
         )?;
         validate_restore_receipt(&record)?;
+
+        if record.orphan_cleanup.is_some() {
+            validate_orphan_journal(&record)?;
+            resume_orphan_cleanup(&mut self.executor, &mut self.store)?;
+            self.current = None;
+            self.current_nft_fingerprint = None;
+            self.restore_receipt = None;
+            self.initialized = true;
+            return Ok(());
+        }
 
         let active = record.active.as_ref().map(AppliedKernelState::from_plan);
         if record.cleanup_pending {
@@ -2138,7 +2193,7 @@ enum PendingNftPhase {
     RollbackAbsent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct RouteOwnership {
     family: u8,
     table: u32,
@@ -2146,7 +2201,7 @@ struct RouteOwnership {
     interface: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct RuleOwnership {
     family: u8,
     priority: u32,
@@ -2154,7 +2209,7 @@ struct RuleOwnership {
     mark: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 struct RoutingOwnership {
     routes: BTreeSet<RouteOwnership>,
     rules: BTreeSet<RuleOwnership>,
@@ -2461,6 +2516,280 @@ fn live_routing_ownership(
     collect_live_rules(&captured.ipv4_rules, 4, &mut ownership)?;
     collect_live_rules(&captured.ipv6_rules, 6, &mut ownership)?;
     Ok(ownership)
+}
+
+fn validate_orphan_journal(record: &StoredAppliedState) -> Result<(), PrivilegedError> {
+    if record.orphan_cleanup.is_none()
+        || record.active.is_some()
+        || record.active_nft_fingerprint.is_some()
+        || record.pending.is_some()
+        || record.pending_expectations.is_some()
+        || record.cleanup_pending
+        || record.restore_receipt.is_some()
+    {
+        return Err(PrivilegedError::new(
+            "invalid persisted state: orphan cleanup must be an isolated journal",
+        ));
+    }
+    Ok(())
+}
+
+fn capture_verified_orphaned_ownership(
+    executor: &mut impl CommandExecutor,
+) -> Result<OrphanedOwnership, PrivilegedError> {
+    let captured =
+        capture_snapshot(executor).map_err(|error| PrivilegedError::new(error.to_string()))?;
+    let routing = live_routing_ownership(&captured)?;
+    validate_orphan_routing(&routing)?;
+    let nft_fingerprint = if captured.snapshot.has_nft_table("inet", "routelane") {
+        let document =
+            read_nft_table(executor).map_err(|error| PrivilegedError::new(error.to_string()))?;
+        validate_orphan_nft_document(&document)?;
+        Some(
+            nft_document_fingerprint(&document)
+                .map_err(|error| PrivilegedError::new(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    if nft_fingerprint.is_none() && routing != RoutingOwnership::default() {
+        return Err(PrivilegedError::new(
+            "ambiguous RouteLane ownership: reserved routing resources have no ownership-marked nftables table",
+        ));
+    }
+    Ok(OrphanedOwnership {
+        nft_fingerprint,
+        routing,
+    })
+}
+
+fn validate_orphan_routing(ownership: &RoutingOwnership) -> Result<(), PrivilegedError> {
+    for rule in &ownership.rules {
+        let table_slot = rule.table.checked_sub(TABLE_BASE);
+        let priority_slot = rule.priority.checked_sub(RULE_PRIORITY_BASE);
+        let mark_slot = rule.mark.checked_sub(MARK_BASE);
+        if table_slot != priority_slot
+            || table_slot != mark_slot
+            || !ownership
+                .routes
+                .iter()
+                .any(|route| route.family == rule.family && route.table == rule.table)
+        {
+            return Err(PrivilegedError::new(
+                "ambiguous RouteLane ownership: policy rule does not match a reserved lane tuple",
+            ));
+        }
+    }
+    for route in &ownership.routes {
+        let matching = ownership
+            .rules
+            .iter()
+            .filter(|rule| rule.family == route.family && rule.table == route.table)
+            .count();
+        if matching != 1 {
+            return Err(PrivilegedError::new(
+                "ambiguous RouteLane ownership: routing table does not have one exact policy rule",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_orphan_nft_document(document: &serde_json::Value) -> Result<(), PrivilegedError> {
+    let objects = document
+        .get("nftables")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| PrivilegedError::new("RouteLane nftables ownership document is invalid"))?;
+    let mut tables = 0;
+    let mut outputs = 0;
+    let mut markers = 0;
+    for object in objects {
+        if object.get("metainfo").is_some() {
+            continue;
+        }
+        let (kind, value) = ["table", "chain", "rule"]
+            .into_iter()
+            .find_map(|kind| object.get(kind).map(|value| (kind, value)))
+            .ok_or_else(|| {
+                PrivilegedError::new("RouteLane nftables table contains an unknown object")
+            })?;
+        if value.get("family").and_then(serde_json::Value::as_str) != Some("inet")
+            || (kind != "table"
+                && value.get("table").and_then(serde_json::Value::as_str) != Some("routelane"))
+            || (kind == "table"
+                && value.get("name").and_then(serde_json::Value::as_str) != Some("routelane"))
+        {
+            return Err(PrivilegedError::new(
+                "RouteLane nftables ownership document crosses its reserved table boundary",
+            ));
+        }
+        match kind {
+            "table" => tables += 1,
+            "chain" => {
+                let name = value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| PrivilegedError::new("RouteLane nftables chain has no name"))?;
+                if name == "output" {
+                    outputs += 1;
+                } else if valid_state_chain_name(name) {
+                    markers += 1;
+                } else {
+                    return Err(PrivilegedError::new(
+                        "RouteLane nftables table contains an unrecognized ownership marker",
+                    ));
+                }
+            }
+            "rule" => {
+                if value.get("chain").and_then(serde_json::Value::as_str) != Some("output") {
+                    return Err(PrivilegedError::new(
+                        "RouteLane nftables rule is outside the owned output chain",
+                    ));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    if tables != 1 || outputs != 1 || markers != 1 {
+        return Err(PrivilegedError::new(
+            "RouteLane nftables table has no unique validated ownership marker",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_state_chain_name(name: &str) -> bool {
+    let Some((generation, fingerprint)) = name
+        .strip_prefix("state_g")
+        .and_then(|value| value.split_once('_'))
+    else {
+        return false;
+    };
+    generation.parse::<u64>().is_ok_and(|value| value > 0)
+        && fingerprint.len() == 16
+        && fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn orphan_journal(ownership: OrphanedOwnership) -> StoredAppliedState {
+    StoredAppliedState {
+        active: None,
+        active_nft_fingerprint: None,
+        pending: None,
+        pending_expectations: None,
+        cleanup_pending: false,
+        restore_receipt: None,
+        orphan_cleanup: Some(ownership),
+    }
+}
+
+fn resume_orphan_cleanup(
+    executor: &mut impl CommandExecutor,
+    store: &mut impl AppliedStateStore,
+) -> Result<(), PrivilegedError> {
+    let record = store
+        .load()?
+        .ok_or_else(|| PrivilegedError::new("orphan cleanup journal is missing"))?;
+    validate_orphan_journal(&record)?;
+    let mut ownership = record.orphan_cleanup.expect("validated orphan journal");
+    let captured =
+        capture_snapshot(executor).map_err(|error| PrivilegedError::new(error.to_string()))?;
+    let live = live_routing_ownership(&captured)?;
+    if !live.routes.is_subset(&ownership.routing.routes)
+        || !live.rules.is_subset(&ownership.routing.rules)
+    {
+        return Err(PrivilegedError::new(
+            "orphan cleanup journal conflicts with live routing resources",
+        ));
+    }
+    ownership.routing = live;
+    store.save(&orphan_journal(ownership.clone()))?;
+
+    for rule in ownership.routing.rules.clone() {
+        let family = if rule.family == 4 {
+            IpFamily::V4
+        } else {
+            IpFamily::V6
+        };
+        let command = ip_command(
+            family,
+            [
+                "rule".to_owned(),
+                "del".to_owned(),
+                "fwmark".to_owned(),
+                format!("{:#010x}", rule.mark),
+                "lookup".to_owned(),
+                rule.table.to_string(),
+                "priority".to_owned(),
+                rule.priority.to_string(),
+            ],
+        );
+        run_required(
+            executor,
+            &command,
+            "remove verified orphan RouteLane policy rule",
+        )
+        .map_err(|error| PrivilegedError::new(error.to_string()))?;
+        ownership.routing.rules.remove(&rule);
+        store.save(&orphan_journal(ownership.clone()))?;
+    }
+    for route in ownership.routing.routes.clone() {
+        let family = if route.family == 4 {
+            IpFamily::V4
+        } else {
+            IpFamily::V6
+        };
+        let command = ip_command(
+            family,
+            [
+                "route".to_owned(),
+                "flush".to_owned(),
+                "table".to_owned(),
+                route.table.to_string(),
+            ],
+        );
+        run_required(
+            executor,
+            &command,
+            "flush verified orphan RouteLane routing table",
+        )
+        .map_err(|error| PrivilegedError::new(error.to_string()))?;
+        ownership
+            .routing
+            .routes
+            .retain(|value| value.family != route.family || value.table != route.table);
+        store.save(&orphan_journal(ownership.clone()))?;
+    }
+    if let Some(expected) = ownership.nft_fingerprint.as_deref() {
+        let document =
+            read_nft_table(executor).map_err(|error| PrivilegedError::new(error.to_string()))?;
+        let live = nft_document_fingerprint(&document)
+            .map_err(|error| PrivilegedError::new(error.to_string()))?;
+        if live != expected {
+            return Err(PrivilegedError::new(
+                "orphan cleanup journal does not exactly own the live inet/routelane table",
+            ));
+        }
+        run_nft_batch(
+            executor,
+            b"delete table inet routelane\n".to_vec(),
+            "delete verified orphan RouteLane nftables table",
+        )
+        .map_err(|error| PrivilegedError::new(error.to_string()))?;
+        ownership.nft_fingerprint = None;
+        store.save(&orphan_journal(ownership))?;
+    }
+    let captured =
+        capture_snapshot(executor).map_err(|error| PrivilegedError::new(error.to_string()))?;
+    if captured.snapshot.has_nft_table("inet", "routelane")
+        || live_routing_ownership(&captured)? != RoutingOwnership::default()
+    {
+        return Err(PrivilegedError::new(
+            "verified orphan RouteLane resources remain after cleanup",
+        ));
+    }
+    store.clear()
 }
 
 fn collect_live_routes(
@@ -3343,6 +3672,12 @@ pub struct CleanupResponse {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanRecoveryResponse {
+    pub cleaned: bool,
+    pub diagnostics: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivilegedError {
     message: String,
@@ -3373,6 +3708,7 @@ pub trait PrivilegedBackend: Send {
     ) -> Result<RestoreResponse, PrivilegedError>;
     fn inspect(&mut self) -> Result<InspectResponse, PrivilegedError>;
     fn cleanup(&mut self) -> Result<CleanupResponse, PrivilegedError>;
+    fn recover_orphaned(&mut self) -> Result<OrphanRecoveryResponse, PrivilegedError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3522,9 +3858,9 @@ mod tests {
         validate_privileged_plan, validate_root_owned_file_attributes, AppliedStateStore,
         ApplyResponse, AuthorizationError, Authorizer, CleanupResponse, CommandExecutor,
         CommandInvocation, CommandOutput, CommandPrivilegedBackend, InspectResponse,
-        PrivilegedBackend, PrivilegedError, PrivilegedService, RestoreReceipt, RestoreResponse,
-        ServiceError, StoredAppliedState, ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES,
-        NFT_BINARY,
+        OrphanRecoveryResponse, PrivilegedBackend, PrivilegedError, PrivilegedService,
+        RestoreReceipt, RestoreResponse, ServiceError, StoredAppliedState, ValidationError,
+        IP_BINARY, MAX_PLAN_JSON_BYTES, NFT_BINARY,
     };
     use crate::backend::{
         CommandSpec, CompiledAction, CompiledRule, CompiledTarget, IpFamily, KernelPlan,
@@ -4367,6 +4703,53 @@ mod tests {
     }
 
     #[test]
+    fn recovery_cleans_an_exact_live_generation_after_its_journal_is_lost() {
+        let state = Arc::new(Mutex::new(FakeKernelState::default()));
+        let executor = FakeCommandExecutor {
+            state: Arc::clone(&state),
+        };
+        let plan = fixture_valid_plan();
+        CommandPrivilegedBackend::new(executor.clone())
+            .apply(&plan)
+            .unwrap();
+
+        let mut restarted_without_journal = CommandPrivilegedBackend::new(executor);
+        let result = restarted_without_journal.recover_orphaned().unwrap();
+
+        assert!(result.cleaned);
+        let state = state.lock().unwrap();
+        assert!(!state.has_route);
+        assert!(!state.has_rule);
+        assert!(!state.has_table);
+    }
+
+    #[test]
+    fn recovery_rejects_a_routelane_table_without_a_valid_state_marker() {
+        let state = Arc::new(Mutex::new(FakeKernelState::default()));
+        let executor = FakeCommandExecutor {
+            state: Arc::clone(&state),
+        };
+        CommandPrivilegedBackend::new(executor.clone())
+            .apply(&fixture_valid_plan())
+            .unwrap();
+        {
+            let mut state = state.lock().unwrap();
+            state.marker = Some("state_invalid".to_owned());
+            state.nft_objects = None;
+        }
+
+        let error = CommandPrivilegedBackend::new(executor)
+            .recover_orphaned()
+            .unwrap_err();
+
+        assert!(error.to_string().contains("ownership marker"));
+        let state = state.lock().unwrap();
+        assert!(state.has_route);
+        assert!(state.has_rule);
+        assert!(state.has_table);
+    }
+
+    #[test]
     fn command_backend_applies_and_inspects_exact_gatewayless_route() {
         let state = Arc::new(Mutex::new(FakeKernelState::default()));
         let executor = FakeCommandExecutor {
@@ -4641,6 +5024,7 @@ mod tests {
                 ),
                 cleanup_pending: false,
                 restore_receipt: Some(RestoreReceipt::new(&failed_candidate, Some(&previous))),
+                orphan_cleanup: None,
             });
         }
         let mut restarted = CommandPrivilegedBackend::with_store(
@@ -4692,6 +5076,7 @@ mod tests {
                 pending_expectations: None,
                 cleanup_pending: true,
                 restore_receipt: Some(RestoreReceipt::new(&failed_candidate, None)),
+                orphan_cleanup: None,
             });
         }
         let mut restarted = CommandPrivilegedBackend::with_store(
@@ -4746,6 +5131,7 @@ mod tests {
                 ),
                 cleanup_pending: false,
                 restore_receipt: Some(RestoreReceipt::new(&different_candidate, Some(&previous))),
+                orphan_cleanup: None,
             });
         }
         let journal_before = store.state.lock().unwrap().clone();
@@ -5179,6 +5565,7 @@ mod tests {
             pending_expectations: Some(expectations),
             cleanup_pending: false,
             restore_receipt: None,
+            orphan_cleanup: None,
         };
         assert!(
             serde_json::to_vec(&journal).unwrap().len() < super::MAX_STATE_BYTES as usize,
@@ -5351,6 +5738,7 @@ mod tests {
                 ),
                 cleanup_pending: false,
                 restore_receipt: None,
+                orphan_cleanup: None,
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -5412,6 +5800,7 @@ mod tests {
                 ),
                 cleanup_pending: false,
                 restore_receipt: None,
+                orphan_cleanup: None,
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -5479,6 +5868,7 @@ mod tests {
                     ),
                     cleanup_pending: false,
                     restore_receipt: None,
+                    orphan_cleanup: None,
                 });
             }
             let mut crash_executor = FakeCommandExecutor {
@@ -5543,6 +5933,7 @@ mod tests {
                 ),
                 cleanup_pending: false,
                 restore_receipt: None,
+                orphan_cleanup: None,
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -5599,6 +5990,7 @@ mod tests {
                 ),
                 cleanup_pending: false,
                 restore_receipt: None,
+                orphan_cleanup: None,
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -5658,6 +6050,7 @@ mod tests {
                 ),
                 cleanup_pending: false,
                 restore_receipt: None,
+                orphan_cleanup: None,
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -5850,6 +6243,7 @@ mod tests {
             pending_expectations: None,
             cleanup_pending: false,
             restore_receipt: None,
+            orphan_cleanup: None,
         });
         let mut backend = CommandPrivilegedBackend::with_store(
             FakeCommandExecutor {
@@ -5979,6 +6373,14 @@ mod tests {
                 diagnostics: vec![],
             })
         }
+
+        fn recover_orphaned(&mut self) -> Result<OrphanRecoveryResponse, PrivilegedError> {
+            self.events.lock().unwrap().push("recover_orphaned");
+            Ok(OrphanRecoveryResponse {
+                cleaned: true,
+                diagnostics: vec![],
+            })
+        }
     }
 
     struct BlockingBackend;
@@ -6003,6 +6405,13 @@ mod tests {
 
         fn cleanup(&mut self) -> Result<CleanupResponse, PrivilegedError> {
             Ok(CleanupResponse {
+                cleaned: true,
+                diagnostics: vec![],
+            })
+        }
+
+        fn recover_orphaned(&mut self) -> Result<OrphanRecoveryResponse, PrivilegedError> {
+            Ok(OrphanRecoveryResponse {
                 cleaned: true,
                 diagnostics: vec![],
             })

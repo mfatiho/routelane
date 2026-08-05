@@ -164,9 +164,7 @@ impl std::error::Error for IpcError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DaemonEnvelope, DaemonRequest, DaemonResult, OrphanRecoveryResult,
-    };
+    use super::{DaemonEnvelope, DaemonRequest, DaemonResult, OrphanRecoveryResult};
 
     #[test]
     fn orphan_recovery_request_and_result_have_stable_wire_names() {
@@ -174,9 +172,8 @@ mod tests {
         let encoded = serde_json::to_value(&request).unwrap();
         assert_eq!(encoded["request"]["method"], "RecoverOrphanedResources");
 
-        let result = DaemonResult::OrphanedResourcesRecovered(OrphanRecoveryResult {
-            cleaned: true,
-        });
+        let result =
+            DaemonResult::OrphanedResourcesRecovered(OrphanRecoveryResult { cleaned: true });
         let encoded = serde_json::to_value(result).unwrap();
         assert_eq!(encoded["kind"], "OrphanedResourcesRecovered");
         assert_eq!(encoded["value"]["cleaned"], true);
