@@ -854,7 +854,6 @@ where
             &mut self.executor,
             Some(&current),
             self.current_nft_fingerprint.as_deref(),
-            false,
         )?;
 
         self.store.save(&StoredAppliedState {
@@ -1106,7 +1105,6 @@ where
                 &mut self.executor,
                 active.as_ref(),
                 record.active_nft_fingerprint.as_deref(),
-                true,
             )?;
             let mut runner = CommandKernelRunner::new(&mut self.executor, active.clone());
             runner
@@ -2066,7 +2064,6 @@ fn verify_cleanup_table_ownership(
     executor: &mut impl CommandExecutor,
     active: Option<&AppliedKernelState>,
     active_nft_fingerprint: Option<&str>,
-    allow_command_prefix: bool,
 ) -> Result<(), PrivilegedError> {
     let captured =
         capture_snapshot(executor).map_err(|error| PrivilegedError::new(error.to_string()))?;
@@ -2079,19 +2076,13 @@ fn verify_cleanup_table_ownership(
         ))
     })?;
     let live_routing = live_routing_ownership(&captured)?;
-    let live_routing_fingerprint = routing_ownership_fingerprint(&live_routing)?;
-    let valid_routing = if allow_command_prefix {
-        cleanup_routing_fingerprints(active.plan())?.contains(&live_routing_fingerprint)
-    } else {
-        live_routing == plan_routing_ownership(active.plan())
-    };
-    if !valid_routing {
+    if !routing_ownership_is_subset(&live_routing, &plan_routing_ownership(active.plan())) {
         return Err(PrivilegedError::new(
-            "cleanup journal does not match an exact RouteLane cleanup command prefix",
+            "cleanup journal does not own the exact live RouteLane routing subset",
         ));
     }
     if !captured.snapshot.has_nft_table("inet", "routelane") {
-        return if allow_command_prefix && live_routing == RoutingOwnership::default() {
+        return if live_routing == RoutingOwnership::default() {
             Ok(())
         } else {
             Err(PrivilegedError::new(
@@ -2110,35 +2101,6 @@ fn verify_cleanup_table_ownership(
         ));
     }
     Ok(())
-}
-
-fn cleanup_routing_fingerprints(plan: &KernelPlan) -> Result<Vec<String>, PrivilegedError> {
-    let mut state = plan_routing_ownership(plan);
-    let mut fingerprints = vec![routing_ownership_fingerprint(&state)?];
-    let mut removed_rules = BTreeSet::new();
-    for lane in plan
-        .lanes
-        .iter()
-        .filter(|lane| lane.availability == super::LaneAvailability::Available)
-    {
-        for family in [IpFamily::V4, IpFamily::V6] {
-            if lane_route_ownership(lane, family).is_none() {
-                continue;
-            }
-            let rule = lane_rule_ownership(lane, family);
-            if removed_rules.insert(rule.clone()) {
-                state.rules.remove(&rule);
-                push_routing_fingerprint(&mut fingerprints, &state)?;
-            }
-        }
-    }
-    for (family, table) in plan_route_keys(plan) {
-        state
-            .routes
-            .retain(|route| route.family != family_number(family) || route.table != table);
-        push_routing_fingerprint(&mut fingerprints, &state)?;
-    }
-    Ok(fingerprints)
 }
 
 fn verify_pending_table_ownership(
@@ -2213,6 +2175,10 @@ struct RuleOwnership {
 struct RoutingOwnership {
     routes: BTreeSet<RouteOwnership>,
     rules: BTreeSet<RuleOwnership>,
+}
+
+fn routing_ownership_is_subset(live: &RoutingOwnership, expected: &RoutingOwnership) -> bool {
+    live.routes.is_subset(&expected.routes) && live.rules.is_subset(&expected.rules)
 }
 
 fn validate_pending_routing_resources(
@@ -2465,17 +2431,6 @@ fn routing_ownership_fingerprint(ownership: &RoutingOwnership) -> Result<String,
     let encoded = serde_json::to_vec(ownership)
         .map_err(|error| PrivilegedError::new(format!("encode routing ownership: {error}")))?;
     Ok(blake3::hash(&encoded).to_hex().to_string())
-}
-
-fn push_routing_fingerprint(
-    fingerprints: &mut Vec<String>,
-    ownership: &RoutingOwnership,
-) -> Result<(), PrivilegedError> {
-    let fingerprint = routing_ownership_fingerprint(ownership)?;
-    if !fingerprints.contains(&fingerprint) {
-        fingerprints.push(fingerprint);
-    }
-    Ok(())
 }
 
 fn lane_route_ownership(lane: &super::LanePlan, family: IpFamily) -> Option<RouteOwnership> {
@@ -4801,6 +4756,25 @@ mod tests {
 
         assert!(recovered.cleaned);
         let state = state.lock().unwrap();
+        assert!(!state.has_route);
+        assert!(!state.has_table);
+    }
+
+    #[test]
+    fn cleanup_accepts_exact_rules_after_routes_were_already_removed() {
+        let state = Arc::new(Mutex::new(FakeKernelState::default()));
+        let executor = FakeCommandExecutor {
+            state: Arc::clone(&state),
+        };
+        let mut backend = CommandPrivilegedBackend::new(executor);
+        backend.apply(&fixture_valid_plan()).unwrap();
+        state.lock().unwrap().has_route = false;
+
+        let cleaned = backend.cleanup().unwrap();
+
+        assert!(cleaned.cleaned);
+        let state = state.lock().unwrap();
+        assert!(!state.has_rule);
         assert!(!state.has_route);
         assert!(!state.has_table);
     }
