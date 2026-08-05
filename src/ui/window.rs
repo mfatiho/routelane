@@ -292,6 +292,19 @@ struct ApplicationListContext {
     window: adw::ApplicationWindow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListChildKind {
+    FixedAction,
+    DynamicRow,
+}
+
+fn list_child_order(kind: ListChildKind) -> u8 {
+    match kind {
+        ListChildKind::FixedAction => 0,
+        ListChildKind::DynamicRow => 1,
+    }
+}
+
 fn open_application_dialog(parent: &adw::ApplicationWindow, context: ApplicationListContext) {
     let applications = routelane::application::discover_desktop_apps().unwrap_or_default();
     let dialog = adw::Window::builder()
@@ -1721,9 +1734,9 @@ mod tests {
         accept_connection_epoch, accept_daemon_event_revision, accept_daemon_status_revision,
         configuration_error_view, daemon_unavailable_view, dashboard_copy,
         health_after_apply_request, health_sections, health_view, reconcile_profiles,
-        refreshed_interface_selection, retry_after_recovery, rule_dialog_restores_target_focus,
-        rule_dialog_submission, status_is_active, switch_state_after_persistence_failure,
-        RuleDialogSubmission,
+        refreshed_interface_selection, list_child_order, retry_after_recovery,
+        rule_dialog_restores_target_focus, rule_dialog_submission, status_is_active,
+        switch_state_after_persistence_failure, ListChildKind, RuleDialogSubmission,
     };
     use crate::ui::experience::{AuthorizationPresentation, DashboardState, PrimaryAction};
     use crate::ui::i18n::LanguageTexts;
@@ -1736,6 +1749,14 @@ mod tests {
         SuggestedAction,
     };
     use routelane::ipc::{DaemonRequest, DaemonStatus};
+
+    #[test]
+    fn list_action_is_ordered_before_empty_or_populated_dynamic_rows() {
+        assert!(
+            list_child_order(ListChildKind::FixedAction)
+                < list_child_order(ListChildKind::DynamicRow)
+        );
+    }
 
     #[test]
     fn successful_recovery_consumes_the_pending_profile_for_one_retry() {
