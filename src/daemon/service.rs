@@ -16,7 +16,8 @@ use tokio::sync::{broadcast, Mutex};
 use crate::application::{matching_processes, RunningProcess};
 use crate::backend::{
     compile_profile, AppliedKernelState, ApplyResponse, CleanupResponse, InspectResponse,
-    KernelPlan, ResolutionSnapshot, RestoreResponse, RouteMode, TopologySnapshot,
+    KernelPlan, OrphanRecoveryResponse, ResolutionSnapshot, RestoreResponse, RouteMode,
+    TopologySnapshot,
 };
 use crate::dns::periodic::resolve_domain;
 use crate::domain::{
@@ -29,7 +30,8 @@ use crate::health::{
 };
 use crate::ipc::{
     ApplicationAdoptionResult, ApplicationLaunchResult, ApplyProfileResult, DaemonEnvelope,
-    DaemonEvent, DaemonRequest, DaemonResponse, DaemonResult, IpcError, IPC_PROTOCOL_VERSION,
+    DaemonEvent, DaemonRequest, DaemonResponse, DaemonResult, IpcError, OrphanRecoveryResult,
+    IPC_PROTOCOL_VERSION,
 };
 
 use super::DaemonState;
@@ -126,6 +128,7 @@ pub trait PrivilegedHelperClient: Send + Sync {
     ) -> Result<RestoreResponse, DaemonError>;
     async fn inspect(&self) -> Result<InspectResponse, DaemonError>;
     async fn cleanup(&self) -> Result<CleanupResponse, DaemonError>;
+    async fn recover_orphaned_resources(&self) -> Result<OrphanRecoveryResponse, DaemonError>;
     async fn prepare_application_cgroup(&self, _rule_id: &RuleId) -> Result<PathBuf, DaemonError> {
         Err(DaemonError::helper(
             "application cgroup operations are unavailable",
@@ -256,9 +259,10 @@ where
                 .adopt_application_processes(profile_id, rule_id)
                 .await
                 .map(DaemonResult::ApplicationProcessesAdopted),
-            DaemonRequest::RecoverOrphanedResources => Err(DaemonError::validation(
-                "orphaned resource recovery is unavailable",
-            )),
+            DaemonRequest::RecoverOrphanedResources => self
+                .recover_orphaned_resources()
+                .await
+                .map(DaemonResult::OrphanedResourcesRecovered),
             DaemonRequest::Deactivate => {
                 self.deactivate().await.map(|()| DaemonResult::Deactivated)
             }
@@ -513,6 +517,40 @@ where
             });
         }
         Ok(())
+    }
+
+    pub async fn recover_orphaned_resources(&self) -> Result<OrphanRecoveryResult, DaemonError> {
+        let _mutation = self.mutation.lock().await;
+        let recoverable = self
+            .state
+            .lock()
+            .await
+            .last_error
+            .as_ref()
+            .is_some_and(|error| error.code == "DAEMON_ORPHANED_RESOURCES");
+        if !recoverable {
+            return Err(DaemonError::new(
+                "DAEMON_ORPHAN_RECOVERY_UNAVAILABLE",
+                "orphan recovery requires a detected orphaned-resource conflict",
+            ));
+        }
+        let recovered = self.helper.recover_orphaned_resources().await?;
+        {
+            let mut gate = self.reconciliation.lock().await;
+            *gate = ReconciliationGate::default();
+            self.reconciliation_attempts.store(0, Ordering::Release);
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.applied = None;
+            state.applied_profile = None;
+            state.generation = 0;
+            state.last_error = None;
+        }
+        self.ensure_reconciled().await.result?;
+        Ok(OrphanRecoveryResult {
+            cleaned: recovered.cleaned,
+        })
     }
 
     async fn record_failure(&self, error: DaemonError) {
@@ -804,8 +842,9 @@ where
                 || inspected.routelane_table_present
             {
                 return self
-                    .record_reconciliation_drift(
+                    .record_reconciliation_drift_with_code(
                         None,
+                        "DAEMON_ORPHANED_RESOURCES",
                         "helper reported owned resources without a validated applied plan",
                     )
                     .await;
@@ -863,7 +902,17 @@ where
         plan: Option<&KernelPlan>,
         detail: &str,
     ) -> Result<(), DaemonError> {
-        let error = DaemonError::new("DAEMON_RECONCILIATION_FAILED", detail);
+        self.record_reconciliation_drift_with_code(plan, "DAEMON_RECONCILIATION_FAILED", detail)
+            .await
+    }
+
+    async fn record_reconciliation_drift_with_code(
+        &self,
+        plan: Option<&KernelPlan>,
+        code: &str,
+        detail: &str,
+    ) -> Result<(), DaemonError> {
+        let error = DaemonError::new(code, detail);
         let mut state = self.state.lock().await;
         if let Some(plan) = plan {
             state.applied = Some(AppliedKernelState::from_plan(plan));
@@ -1098,6 +1147,17 @@ impl PrivilegedHelperClient for SystemPrivilegedHelperClient {
             .map_err(|error| helper_call_error("Cleanup", error))?;
         serde_json::from_str(&response_json)
             .map_err(|error| DaemonError::helper(format!("decode Cleanup response: {error}")))
+    }
+
+    async fn recover_orphaned_resources(&self) -> Result<OrphanRecoveryResponse, DaemonError> {
+        let proxy = self.proxy().await?;
+        let response_json: String = proxy
+            .call("RecoverOrphanedResources", &())
+            .await
+            .map_err(|error| helper_call_error("RecoverOrphanedResources", error))?;
+        serde_json::from_str(&response_json).map_err(|error| {
+            DaemonError::helper(format!("decode RecoverOrphanedResources response: {error}"))
+        })
     }
 
     async fn prepare_application_cgroup(&self, rule_id: &RuleId) -> Result<PathBuf, DaemonError> {
