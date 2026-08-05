@@ -3802,6 +3802,14 @@ where
         self.run_backend(PrivilegedBackend::cleanup).await
     }
 
+    pub async fn recover_orphaned_resources(
+        &self,
+        sender: Option<&str>,
+    ) -> Result<OrphanRecoveryResponse, ServiceError> {
+        self.authorize(sender).await?;
+        self.run_backend(PrivilegedBackend::recover_orphaned).await
+    }
+
     pub async fn authorize_mutation(&self, sender: Option<&str>) -> Result<(), ServiceError> {
         self.authorize(sender).await.map(|_| ())
     }
@@ -6445,6 +6453,22 @@ mod tests {
 
         let error = service
             .apply_plan(Some(":1.42"), "{not valid json")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ServiceError::Authorization(AuthorizationError::Denied)
+        );
+        assert_eq!(*events.lock().unwrap(), vec!["authorize"]);
+    }
+
+    #[tokio::test]
+    async fn orphan_recovery_requires_mutation_authorization() {
+        let (service, events) = fixture_service(Err(AuthorizationError::Denied));
+
+        let error = service
+            .recover_orphaned_resources(Some(":1.42"))
             .await
             .unwrap_err();
 

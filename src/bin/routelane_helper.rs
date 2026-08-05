@@ -114,6 +114,30 @@ impl DbusHelper {
         serialize_response(&response)
     }
 
+    async fn recover_orphaned_resources(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let sender = header.sender().map(|sender| sender.as_str());
+        self.core
+            .authorize_mutation(sender)
+            .await
+            .map_err(to_fdo_error)?;
+        let cgroups = self
+            .cgroups
+            .verified_orphan_directories()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let response = self
+            .core
+            .recover_orphaned_resources(sender)
+            .await
+            .map_err(to_fdo_error)?;
+        self.cgroups
+            .remove_verified_orphan_directories(&cgroups)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        serialize_response(&response)
+    }
+
     async fn prepare_application_cgroup(
         &self,
         rule_id: &str,
@@ -232,6 +256,7 @@ enum RootIntegrationRequest {
         previous_json: Option<String>,
     },
     Cleanup,
+    RecoverOrphanedResources,
     SetFailPoint {
         value: Option<String>,
     },
@@ -291,6 +316,11 @@ async fn run_root_integration_stdio() -> Result<(), Box<dyn std::error::Error>> 
                 .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
             Ok(RootIntegrationRequest::Cleanup) => service
                 .cleanup(Some(TEST_SENDER))
+                .await
+                .map(|response| serde_json::json!({"ok": response}))
+                .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
+            Ok(RootIntegrationRequest::RecoverOrphanedResources) => service
+                .recover_orphaned_resources(Some(TEST_SENDER))
                 .await
                 .map(|response| serde_json::json!({"ok": response}))
                 .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
