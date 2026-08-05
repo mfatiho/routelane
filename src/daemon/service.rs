@@ -256,6 +256,9 @@ where
                 .adopt_application_processes(profile_id, rule_id)
                 .await
                 .map(DaemonResult::ApplicationProcessesAdopted),
+            DaemonRequest::RecoverOrphanedResources => Err(DaemonError::validation(
+                "orphaned resource recovery is unavailable",
+            )),
             DaemonRequest::Deactivate => {
                 self.deactivate().await.map(|()| DaemonResult::Deactivated)
             }

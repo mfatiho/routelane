@@ -44,6 +44,7 @@ pub enum DaemonRequest {
         profile_id: ProfileId,
         rule_id: RuleId,
     },
+    RecoverOrphanedResources,
     Deactivate,
     Subscribe,
 }
@@ -85,6 +86,7 @@ pub enum DaemonResult {
     Applied(ApplyProfileResult),
     ApplicationLaunched(ApplicationLaunchResult),
     ApplicationProcessesAdopted(ApplicationAdoptionResult),
+    OrphanedResourcesRecovered(OrphanRecoveryResult),
     Deactivated,
     Subscribed,
 }
@@ -114,6 +116,11 @@ pub struct ApplicationLaunchResult {
 pub struct ApplicationAdoptionResult {
     pub adopted_count: u32,
     pub skipped_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanRecoveryResult {
+    pub cleaned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,3 +161,24 @@ impl std::fmt::Display for IpcError {
 }
 
 impl std::error::Error for IpcError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DaemonEnvelope, DaemonRequest, DaemonResult, OrphanRecoveryResult,
+    };
+
+    #[test]
+    fn orphan_recovery_request_and_result_have_stable_wire_names() {
+        let request = DaemonEnvelope::new("recover-1", DaemonRequest::RecoverOrphanedResources);
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["request"]["method"], "RecoverOrphanedResources");
+
+        let result = DaemonResult::OrphanedResourcesRecovered(OrphanRecoveryResult {
+            cleaned: true,
+        });
+        let encoded = serde_json::to_value(result).unwrap();
+        assert_eq!(encoded["kind"], "OrphanedResourcesRecovered");
+        assert_eq!(encoded["value"]["cleaned"], true);
+    }
+}
