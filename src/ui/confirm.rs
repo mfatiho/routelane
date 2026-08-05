@@ -12,7 +12,15 @@ pub fn confirm_destructive_action(
     body: &str,
     on_confirm: Rc<dyn Fn()>,
 ) {
-    confirm_destructive_action_with_label(parent, texts, heading, body, texts.delete, on_confirm);
+    confirm_destructive_action_with_label(
+        parent,
+        texts,
+        heading,
+        body,
+        texts.delete,
+        on_confirm,
+        Rc::new(|| {}),
+    );
 }
 
 pub fn confirm_destructive_action_with_label(
@@ -22,6 +30,7 @@ pub fn confirm_destructive_action_with_label(
     body: &str,
     confirm_label: &str,
     on_confirm: Rc<dyn Fn()>,
+    on_cancel: Rc<dyn Fn()>,
 ) {
     let dialog = adw::Window::builder()
         .title(heading)
@@ -62,7 +71,10 @@ pub fn confirm_destructive_action_with_label(
 
     cancel.connect_clicked({
         let dialog = dialog.clone();
-        move |_| dialog.close()
+        move |_| {
+            on_cancel();
+            dialog.close();
+        }
     });
     delete.connect_clicked({
         let dialog = dialog.clone();
