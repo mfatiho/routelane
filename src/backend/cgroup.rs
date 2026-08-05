@@ -152,9 +152,17 @@ impl ApplicationCgroupManager {
         for entry in fs::read_dir(&self.root).map_err(io_error)? {
             let entry = entry.map_err(io_error)?;
             let file_type = entry.file_type().map_err(io_error)?;
-            if !file_type.is_dir() || file_type.is_symlink() {
+            if file_type.is_symlink() {
                 return Err(CgroupError::Io(
-                    "RouteLane application cgroup root contains a non-directory entry".to_owned(),
+                    "RouteLane application cgroup root contains a symbolic link".to_owned(),
+                ));
+            }
+            if file_type.is_file() {
+                continue;
+            }
+            if !file_type.is_dir() {
+                return Err(CgroupError::Io(
+                    "RouteLane application cgroup root contains an unsupported entry".to_owned(),
                 ));
             }
             let name = entry
@@ -342,6 +350,19 @@ mod tests {
             Err(CgroupError::Io(_))
         ));
         assert!(manager.root.join("browser").exists());
+    }
+
+    #[test]
+    fn orphan_preflight_ignores_root_cgroup_control_files() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let browser = manager.prepare(&RuleId::from("browser"), 1000).unwrap();
+        fs::write(manager.root.join("cgroup.controllers"), "cpu memory").unwrap();
+
+        assert_eq!(
+            manager.verified_orphan_directories().unwrap(),
+            vec![browser]
+        );
     }
 
     struct Fixture {
