@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -60,17 +61,28 @@ impl fmt::Display for DesktopError {
 impl std::error::Error for DesktopError {}
 
 pub fn discover_desktop_apps() -> Result<Vec<DesktopApp>, DesktopError> {
-    let mut paths = Vec::new();
-    if let Some(home) = std::env::var_os("XDG_DATA_HOME") {
-        paths.push(PathBuf::from(home).join("applications"));
-    } else if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".local/share/applications"));
-    }
-    paths.extend([
-        PathBuf::from("/usr/local/share/applications"),
-        PathBuf::from("/usr/share/applications"),
-    ]);
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+    let data_dirs = std::env::var_os("XDG_DATA_DIRS");
+    let paths = desktop_application_paths(data_home, data_dirs.as_deref());
     discover_from_paths(&paths)
+}
+
+fn desktop_application_paths(
+    data_home: Option<PathBuf>,
+    data_dirs: Option<&OsStr>,
+) -> Vec<PathBuf> {
+    let mut paths = data_home
+        .into_iter()
+        .map(|path| path.join("applications"))
+        .collect::<Vec<_>>();
+    let data_dirs = data_dirs.filter(|value| !value.is_empty());
+    let system_paths = data_dirs
+        .map(std::env::split_paths)
+        .unwrap_or_else(|| std::env::split_paths(OsStr::new("/usr/local/share:/usr/share")));
+    paths.extend(system_paths.map(|path| path.join("applications")));
+    paths
 }
 
 pub fn discover_from_paths(paths: &[PathBuf]) -> Result<Vec<DesktopApp>, DesktopError> {
@@ -185,12 +197,33 @@ fn resolve_executable(executable: &str, search_path: &[PathBuf]) -> Option<PathB
 
 #[cfg(test)]
 mod tests {
-    use super::{discover_from_paths, discover_from_paths_with_search_path, DesktopApp};
+    use super::{
+        desktop_application_paths, discover_from_paths, discover_from_paths_with_search_path,
+        DesktopApp,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn desktop_paths_include_every_xdg_data_directory() {
+        assert_eq!(
+            desktop_application_paths(
+                Some(PathBuf::from("/home/test/.local/share")),
+                Some(std::ffi::OsStr::new(
+                    "/usr/local/share:/usr/share:/var/lib/snapd/desktop",
+                )),
+            ),
+            vec![
+                PathBuf::from("/home/test/.local/share/applications"),
+                PathBuf::from("/usr/local/share/applications"),
+                PathBuf::from("/usr/share/applications"),
+                PathBuf::from("/var/lib/snapd/desktop/applications"),
+            ]
+        );
+    }
 
     #[test]
     fn discovery_ignores_hidden_entries_and_extracts_exec_path() {
