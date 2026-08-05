@@ -8,6 +8,6 @@ pub use framing::{read_frame, write_frame, MAX_FRAME_BYTES};
 pub use protocol::{
     ApplicationAdoptionResult, ApplicationLaunchResult, ApplyProfileResult, DaemonEnvelope,
     DaemonEvent, DaemonRequest, DaemonResponse, DaemonResult, DaemonStatus, IpcError,
-    IPC_PROTOCOL_VERSION,
+    OrphanRecoveryResult, IPC_PROTOCOL_VERSION,
 };
 pub use server::{socket_path, DaemonRequestHandler, UnixSocketServer};
