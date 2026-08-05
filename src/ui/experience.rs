@@ -80,6 +80,20 @@ pub enum ActivationAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    Ignore,
+    AskForConfirmation,
+}
+
+pub fn orphan_recovery_action(error_code: &str, retry_used: bool) -> RecoveryAction {
+    if error_code == "DAEMON_ORPHANED_RESOURCES" && !retry_used {
+        RecoveryAction::AskForConfirmation
+    } else {
+        RecoveryAction::Ignore
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DashboardState {
     pub setup_step: Option<SetupStep>,
     pub primary_action: PrimaryAction,
