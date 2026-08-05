@@ -2568,27 +2568,33 @@ fn validate_orphan_routing(ownership: &RoutingOwnership) -> Result<(), Privilege
         let table_slot = rule.table.checked_sub(TABLE_BASE);
         let priority_slot = rule.priority.checked_sub(RULE_PRIORITY_BASE);
         let mark_slot = rule.mark.checked_sub(MARK_BASE);
-        if table_slot != priority_slot
-            || table_slot != mark_slot
-            || !ownership
-                .routes
-                .iter()
-                .any(|route| route.family == rule.family && route.table == rule.table)
-        {
+        if table_slot != priority_slot || table_slot != mark_slot {
             return Err(PrivilegedError::new(
                 "ambiguous RouteLane ownership: policy rule does not match a reserved lane tuple",
             ));
         }
-    }
-    for route in &ownership.routes {
-        let matching = ownership
+        if ownership
             .rules
             .iter()
-            .filter(|rule| rule.family == route.family && rule.table == route.table)
-            .count();
-        if matching != 1 {
+            .filter(|candidate| candidate.family == rule.family && candidate.table == rule.table)
+            .count()
+            != 1
+        {
             return Err(PrivilegedError::new(
-                "ambiguous RouteLane ownership: routing table does not have one exact policy rule",
+                "ambiguous RouteLane ownership: routing table has multiple policy rules",
+            ));
+        }
+    }
+    for route in &ownership.routes {
+        if ownership
+            .routes
+            .iter()
+            .filter(|candidate| candidate.family == route.family && candidate.table == route.table)
+            .count()
+            != 1
+        {
+            return Err(PrivilegedError::new(
+                "ambiguous RouteLane ownership: routing table has multiple default routes",
             ));
         }
     }
@@ -4755,6 +4761,48 @@ mod tests {
         assert!(state.has_route);
         assert!(state.has_rule);
         assert!(state.has_table);
+    }
+
+    #[test]
+    fn recovery_accepts_valid_policy_rules_after_routes_were_already_removed() {
+        let state = Arc::new(Mutex::new(FakeKernelState::default()));
+        let executor = FakeCommandExecutor {
+            state: Arc::clone(&state),
+        };
+        CommandPrivilegedBackend::new(executor.clone())
+            .apply(&fixture_valid_plan())
+            .unwrap();
+        state.lock().unwrap().has_route = false;
+
+        let recovered = CommandPrivilegedBackend::new(executor)
+            .recover_orphaned()
+            .unwrap();
+
+        assert!(recovered.cleaned);
+        let state = state.lock().unwrap();
+        assert!(!state.has_rule);
+        assert!(!state.has_table);
+    }
+
+    #[test]
+    fn recovery_accepts_valid_routes_after_policy_rules_were_already_removed() {
+        let state = Arc::new(Mutex::new(FakeKernelState::default()));
+        let executor = FakeCommandExecutor {
+            state: Arc::clone(&state),
+        };
+        CommandPrivilegedBackend::new(executor.clone())
+            .apply(&fixture_valid_plan())
+            .unwrap();
+        state.lock().unwrap().has_rule = false;
+
+        let recovered = CommandPrivilegedBackend::new(executor)
+            .recover_orphaned()
+            .unwrap();
+
+        assert!(recovered.cleaned);
+        let state = state.lock().unwrap();
+        assert!(!state.has_route);
+        assert!(!state.has_table);
     }
 
     #[test]
