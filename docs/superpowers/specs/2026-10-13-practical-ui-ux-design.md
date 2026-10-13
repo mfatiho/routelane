@@ -1,8 +1,8 @@
 # RouteLane: pratik ve güvenilir UI/UX tasarımı
 
 Tarih: 13 Ekim 2026.
-Durum: Dört bölümlü yaklaşım kullanıcı tarafından onaylandı. Bu yazılı tasarım
-incelemeye hazırdır; uygulama planı ve kod değişiklikleri henüz onay aşamasına geçmedi.
+Durum: Yaklaşım ve yazılı tasarım kullanıcı tarafından onaylandı.
+Uygulama planı incelemeye hazır; ürün kodunda bu tasarım için henüz değişiklik yapılmadı.
 
 ## 1. Amaç ve kapsam
 
