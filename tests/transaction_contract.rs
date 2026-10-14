@@ -279,9 +279,14 @@ impl KernelRunner for InMemoryKernel {
 
 fn fixture_kernel_plan(generation: u64) -> KernelPlan {
     KernelPlan {
+        primary: Default::default(),
+        local_networks: vec![],
         generation,
         profile_id: ProfileId::from("default"),
         lanes: vec![LanePlan {
+            identity: None,
+            source_v4: vec![],
+            source_v6: vec![],
             id: LaneId::from("privacy"),
             interface: "wg0".to_owned(),
             route_v4: Some(RouteMode::Via("10.0.0.1".parse().unwrap())),
@@ -293,6 +298,7 @@ fn fixture_kernel_plan(generation: u64) -> KernelPlan {
             failure_policy: LaneFailurePolicy::Inactive,
         }],
         rules: vec![CompiledRule {
+            family: routelane::backend::IpFamily::V4,
             id: RuleId::from("block-example"),
             priority: 10,
             target: CompiledTarget::Network("203.0.113.0/24".parse().unwrap()),

@@ -97,6 +97,18 @@ impl TopologySnapshot {
         &self.conflicts
     }
 
+    pub fn connected_networks(&self) -> Vec<IpNet> {
+        let mut networks = self
+            .interfaces
+            .values()
+            .filter(|entry| entry.link_ready)
+            .flat_map(|entry| entry.connected_networks.iter().copied())
+            .collect::<Vec<_>>();
+        networks.sort();
+        networks.dedup();
+        networks
+    }
+
     pub fn system_default(&self, family: IpFamily) -> Result<Option<&str>, TopologyError> {
         match &self.defaults[family_index(family)] {
             DefaultSelection::None => Ok(None),

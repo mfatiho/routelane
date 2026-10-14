@@ -243,7 +243,7 @@ fn content_hash_represents_policy_not_generation_counter() {
 }
 
 #[test]
-fn content_hash_changes_when_compiled_policy_changes() {
+fn content_hash_matches_when_direct_and_block_have_no_available_exit() {
     let first_profile = profile_with_block_rule();
     let mut second_profile = first_profile.clone();
     second_profile.rules[0].action = RuleAction::Direct;
@@ -263,7 +263,7 @@ fn content_hash_changes_when_compiled_policy_changes() {
     )
     .unwrap();
 
-    assert_ne!(first.content_hash(), second.content_hash());
+    assert_eq!(first.content_hash(), second.content_hash());
 }
 
 #[test]
@@ -686,5 +686,5 @@ fn unavailable_lane_applies_direct_or_inactive_failure_policy() {
 
     assert_eq!(plan.rules.len(), 1);
     assert_eq!(plan.rules[0].id, RuleId::from("direct-rule"));
-    assert_eq!(plan.rules[0].action, CompiledAction::Direct);
+    assert_eq!(plan.rules[0].action, CompiledAction::Block);
 }

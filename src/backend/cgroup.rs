@@ -314,6 +314,7 @@ mod tests {
     #[test]
     fn application_rule_ids_are_extracted_from_a_validated_kernel_plan() {
         let rules = vec![crate::backend::CompiledRule {
+            family: crate::backend::IpFamily::V4,
             id: RuleId::from("browser"),
             priority: 1,
             target: crate::backend::CompiledTarget::Cgroup("routelane.apps/browser".to_owned()),

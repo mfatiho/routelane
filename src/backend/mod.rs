@@ -23,8 +23,10 @@ pub use plan::{
     ResolutionSnapshot, RouteMode, MARK_BASE, MARK_MAX, RULE_PRIORITY_BASE, RULE_PRIORITY_MAX,
     TABLE_BASE, TABLE_MAX,
 };
-pub use planner::{compile_profile, Capability, PlanError};
-pub use policy_route::{build_policy_commands, CommandSpec, IpFamily, Program};
+pub use planner::{compile_profile, compile_profile_with_primary, Capability, PlanError};
+pub use policy_route::{
+    build_policy_commands, build_terminal_policy_commands, CommandSpec, IpFamily, Program,
+};
 pub use primary::{FamilyExit, FamilyPair, PrimaryDecision, PrimarySelector};
 pub use privileged::{
     validate_privileged_plan, ApplyResponse, AuthorizationError, Authorizer, CleanupResponse,

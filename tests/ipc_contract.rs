@@ -343,6 +343,8 @@ fn restarted_service(helper: FakeHelper, config: MemoryConfig) -> Arc<TestServic
 
 fn applied_fixture_plan(generation: u64) -> KernelPlan {
     KernelPlan {
+        primary: Default::default(),
+        local_networks: vec![],
         generation,
         profile_id: ProfileId::from("default"),
         lanes: vec![],

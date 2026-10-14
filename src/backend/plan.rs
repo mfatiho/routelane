@@ -4,6 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+use super::{InterfaceIdentity, IpFamily, PrimaryDecision};
 use crate::domain::{LaneFailurePolicy, LaneId, ProfileId, RuleId};
 
 pub const TABLE_BASE: u32 = 20_000;
@@ -15,6 +16,8 @@ pub const RULE_PRIORITY_MAX: u32 = 10_099;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KernelPlan {
+    pub primary: PrimaryDecision,
+    pub local_networks: Vec<IpNet>,
     pub generation: u64,
     pub profile_id: ProfileId,
     pub lanes: Vec<LanePlan>,
@@ -25,12 +28,16 @@ impl KernelPlan {
     pub fn content_hash(&self) -> PlanHash {
         #[derive(Serialize)]
         struct PolicyContent<'a> {
+            primary: &'a PrimaryDecision,
+            local_networks: &'a [IpNet],
             profile_id: &'a ProfileId,
             lanes: &'a [LanePlan],
             rules: &'a [CompiledRule],
         }
 
         let content = PolicyContent {
+            primary: &self.primary,
+            local_networks: &self.local_networks,
             profile_id: &self.profile_id,
             lanes: &self.lanes,
             rules: &self.rules,
@@ -44,6 +51,9 @@ impl KernelPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanePlan {
+    pub identity: Option<InterfaceIdentity>,
+    pub source_v4: Vec<Ipv4Addr>,
+    pub source_v6: Vec<Ipv6Addr>,
     pub id: LaneId,
     pub interface: String,
     pub route_v4: Option<RouteMode<Ipv4Addr>>,
@@ -78,6 +88,7 @@ pub enum LaneAvailability {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledRule {
+    pub family: IpFamily,
     pub id: RuleId,
     pub priority: u32,
     pub target: CompiledTarget,

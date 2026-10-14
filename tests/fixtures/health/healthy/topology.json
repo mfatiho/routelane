@@ -1,12 +1,45 @@
 {
   "interfaces": {
     "enp1s0": {
-      "route_v4": {"Via": "192.0.2.1"},
-      "route_v6": null
+      "route_v4": {
+        "Via": "192.0.2.1"
+      },
+      "route_v6": null,
+      "identity": {
+        "ifindex": 2,
+        "name": "enp1s0",
+        "kind": "ether",
+        "hardware_address": "02:00:00:00:00:02"
+      },
+      "source_v4": [
+        "192.0.2.2"
+      ],
+      "source_v6": [],
+      "link_ready": true,
+      "connected_networks": []
     },
     "wg0": {
-      "route_v4": {"Via": "10.0.0.1"},
-      "route_v6": {"Via": "2001:db8::1"}
+      "route_v4": {
+        "Via": "10.0.0.1"
+      },
+      "route_v6": {
+        "Via": "2001:db8::1"
+      },
+      "identity": {
+        "ifindex": 3,
+        "name": "wg0",
+        "kind": "wireguard",
+        "hardware_address": null
+      },
+      "source_v4": [
+        "10.0.0.2"
+      ],
+      "source_v6": [
+        "2001:db8::2"
+      ],
+      "link_ready": true,
+      "connected_networks": []
     }
-  }
+  },
+  "observed": true
 }

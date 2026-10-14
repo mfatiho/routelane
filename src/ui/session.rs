@@ -655,6 +655,8 @@ mod tests {
 
     fn applied_response(id: &str, generation: u64) -> DaemonResponse {
         let hash = KernelPlan {
+            primary: Default::default(),
+            local_networks: vec![],
             generation,
             profile_id: "work".into(),
             lanes: vec![],
