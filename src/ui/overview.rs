@@ -312,6 +312,7 @@ mod tests {
     #[test]
     fn counts_all_connections_and_separates_apps_from_target_rules() {
         let mut profile = Profile {
+            routing: Default::default(),
             id: "work".into(),
             name: "Work".into(),
             enabled: false,

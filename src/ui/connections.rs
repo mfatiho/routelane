@@ -440,6 +440,7 @@ mod tests {
     use super::*;
     fn profile() -> Profile {
         Profile {
+            routing: Default::default(),
             id: "work".into(),
             name: "Work".into(),
             enabled: false,

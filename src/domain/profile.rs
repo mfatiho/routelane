@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Rule, RuleAction, RuleId, RuleSource, RuleTarget};
+use super::{RoutingPolicy, Rule, RuleAction, RuleId, RuleSource, RuleTarget};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -64,6 +64,7 @@ pub struct Profile {
     pub enabled: bool,
     pub lanes: Vec<Lane>,
     pub rules: Vec<Rule>,
+    pub routing: RoutingPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +81,8 @@ pub enum DomainError {
     UnknownLane(LaneId),
     SelfReferentialFallback(LaneId),
     FallbackCycle(LaneId),
+    PrimaryIsBackup(LaneId),
+    DuplicateBackupLane(LaneId),
 }
 
 pub fn validate_profile(profile: &Profile) -> Result<(), DomainError> {
@@ -111,6 +114,7 @@ pub fn validate_profile(profile: &Profile) -> Result<(), DomainError> {
     }
 
     let mut rule_ids = BTreeSet::new();
+    profile.routing.validate(&profile.lanes)?;
     let mut application_desktop_ids = BTreeSet::new();
     for rule in &profile.rules {
         if !rule_ids.insert(rule.id.clone()) {
@@ -242,6 +246,7 @@ mod tests {
 
     fn fixture_profile(lanes: Vec<Lane>, rules: Vec<Rule>) -> Profile {
         Profile {
+            routing: Default::default(),
             id: ProfileId::from("default"),
             name: "Default".to_owned(),
             enabled: true,

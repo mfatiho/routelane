@@ -385,6 +385,7 @@ pub(crate) mod tests {
             action: RuleAction::Route("vpn".into()),
         };
         let profile = Rc::new(RefCell::new(Profile {
+            routing: Default::default(),
             id: "work".into(),
             name: "Work".into(),
             enabled: false,
@@ -517,6 +518,7 @@ pub(crate) mod tests {
             launch: None,
         };
         let mut p = Profile {
+            routing: Default::default(),
             id: "work".into(),
             name: "Work".into(),
             enabled: false,

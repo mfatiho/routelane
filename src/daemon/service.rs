@@ -1274,7 +1274,7 @@ impl ConfigRepository for AtomicJsonConfigRepository {
         if json.len() as u64 > MAX_CONFIG_BYTES {
             return Err(DaemonError::config("desired profile file is too large"));
         }
-        let mut desired: Option<Profile> = serde_json::from_slice(&json)
+        let mut desired = crate::config::decode_desired_profile(&json)
             .map_err(|error| DaemonError::config(format!("decode desired profile: {error}")))?;
         if let Some(profile) = &mut desired {
             normalize_lane_names(profile);
@@ -1292,7 +1292,7 @@ impl ConfigRepository for AtomicJsonConfigRepository {
             .ok_or_else(|| DaemonError::config("desired profile path has no parent"))?;
         ensure_owned_private_directory(parent)?;
         validate_existing_destination(&self.path)?;
-        let json = serde_json::to_vec(&desired)
+        let json = crate::config::encode_desired_profile(desired)
             .map_err(|error| DaemonError::config(format!("encode desired profile: {error}")))?;
         if json.len() as u64 > MAX_CONFIG_BYTES {
             return Err(DaemonError::config("desired profile is too large"));

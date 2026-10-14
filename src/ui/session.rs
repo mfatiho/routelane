@@ -1,5 +1,5 @@
 use crate::models::{DaemonToUi, UiRequest};
-use routelane::config::{ConfigV2, PersistenceRequest};
+use routelane::config::{ConfigV3, PersistenceRequest};
 use routelane::domain::{HealthState, Profile, Rule, RuleSource};
 use routelane::ipc::{
     DaemonEvent, DaemonRequest, DaemonResponse, DaemonResult, DaemonStatus, IpcError,
@@ -176,7 +176,7 @@ impl UiSession {
 
     pub fn begin_save(
         &mut self,
-        config: ConfigV2,
+        config: ConfigV3,
         profile: Profile,
         follow_up: AfterSave,
     ) -> Result<Vec<UiEffect>, UiGateError> {
@@ -589,6 +589,7 @@ mod tests {
 
     fn profile() -> Profile {
         Profile {
+            routing: Default::default(),
             id: "work".into(),
             name: "Work".into(),
             enabled: false,
@@ -746,7 +747,7 @@ mod tests {
     fn language_quits_only_after_its_own_successful_persistence() {
         let mut s = session(true, false);
         let effects = s
-            .begin_save(ConfigV2::default(), profile(), AfterSave::QuitApplication)
+            .begin_save(ConfigV3::default(), profile(), AfterSave::QuitApplication)
             .unwrap();
         let generation = match &effects[0] {
             UiEffect::Persist(r) => r.generation,
@@ -759,7 +760,7 @@ mod tests {
             [UiEffect::QuitApplication]
         ));
         let mut s = session(true, false);
-        s.begin_save(ConfigV2::default(), profile(), AfterSave::QuitApplication)
+        s.begin_save(ConfigV3::default(), profile(), AfterSave::QuitApplication)
             .unwrap();
         assert!(s.handle_persistence(1, Err("failed".into())).is_empty());
     }
@@ -821,7 +822,7 @@ mod tests {
     #[test]
     fn persistence_result_can_start_only_its_own_followup() {
         let mut s = session(true, false);
-        let config = ConfigV2 {
+        let config = ConfigV3 {
             profiles: vec![profile()],
             ..Default::default()
         };
@@ -851,7 +852,7 @@ mod tests {
         let mut s = session(true, true);
         let effects = s
             .begin_save(
-                ConfigV2::default(),
+                ConfigV3::default(),
                 profile(),
                 AfterSave::Request(DaemonRequest::ApplyProfile(profile())),
             )

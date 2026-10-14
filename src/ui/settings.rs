@@ -198,6 +198,7 @@ mod tests {
 
     fn profile() -> Profile {
         Profile {
+            routing: Default::default(),
             id: ProfileId::from("default"),
             name: "Default".to_owned(),
             enabled: false,

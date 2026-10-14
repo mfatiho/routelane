@@ -616,6 +616,7 @@ mod tests {
                         last_error: None,
                     }),
                     DaemonRequest::ListProfiles => DaemonResult::Profiles(vec![Profile {
+                        routing: Default::default(),
                         id: ProfileId::from("canonical"),
                         name: "Canonical".to_owned(),
                         enabled: false,

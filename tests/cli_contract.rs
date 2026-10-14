@@ -461,7 +461,10 @@ async fn an_unresponsive_daemon_times_out_with_a_bounded_error() {
 #[test]
 fn fixtures_encode_the_public_health_and_profile_shapes() {
     assert_eq!(inactive_status().health.state, HealthState::Inactive);
-    let document: serde_json::Value = serde_json::from_str(profile_json()).unwrap();
-    let profile: Profile = serde_json::from_value(document["profiles"][0].clone()).unwrap();
+    let document = routelane::config::ConfigDocument::from_json(profile_json())
+        .unwrap()
+        .into_current()
+        .unwrap();
+    let profile: &Profile = &document.profiles[0];
     assert_eq!(profile.id, "work".into());
 }

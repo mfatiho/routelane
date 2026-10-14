@@ -10,6 +10,9 @@ use crate::domain::{
 };
 use anyhow::{bail, Context};
 
+mod v2;
+pub use v2::ConfigV2;
+
 pub const MAX_CONFIG_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -55,12 +58,15 @@ pub struct PersistedRule {
     pub interface: String,
 }
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ConfigV2 {
+pub struct ConfigV3 {
     pub schema_version: u32,
+    /// Retained across saves until the user acknowledges the changed Direct semantics.
+    #[serde(default)]
+    pub routing_notice_pending: bool,
     #[serde(default)]
     pub language: Language,
     #[serde(default)]
@@ -69,8 +75,43 @@ pub struct ConfigV2 {
 
 #[derive(Debug)]
 pub enum ConfigDocument {
+    V3(ConfigV3),
     V2(ConfigV2),
     Legacy(PersistedState),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DesiredProfileV3 {
+    schema_version: u32,
+    profile: Option<Profile>,
+}
+
+pub(crate) fn decode_desired_profile(json: &[u8]) -> anyhow::Result<Option<Profile>> {
+    let value: serde_json::Value = serde_json::from_slice(json)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    if value.get("schema_version").is_some() {
+        let document: DesiredProfileV3 = serde_json::from_value(value)?;
+        if document.schema_version != CURRENT_SCHEMA_VERSION {
+            bail!(
+                "unsupported desired profile schema version {}",
+                document.schema_version
+            );
+        }
+        Ok(document.profile)
+    } else {
+        let legacy: v2::ProfileV2 = serde_json::from_value(value)?;
+        Ok(Some(legacy.into()))
+    }
+}
+
+pub(crate) fn encode_desired_profile(profile: Option<&Profile>) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&DesiredProfileV3 {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        profile: profile.cloned(),
+    })?)
 }
 
 impl ConfigDocument {
@@ -84,9 +125,12 @@ impl ConfigDocument {
             match raw_version.as_u64() {
                 Some(version) if version == u64::from(CURRENT_SCHEMA_VERSION) => {
                     let current = serde_json::from_value(value)
-                        .context("version 2 configuration is invalid")?;
-                    Ok(Self::V2(current))
+                        .context("version 3 configuration is invalid")?;
+                    Ok(Self::V3(current))
                 }
+                Some(2) => serde_json::from_value(value)
+                    .map(Self::V2)
+                    .context("version 2 configuration is invalid"),
                 Some(version) => bail!("unsupported configuration schema version {version}"),
                 None => bail!("schema_version must be the integer {CURRENT_SCHEMA_VERSION}"),
             }
@@ -104,9 +148,15 @@ impl ConfigDocument {
         }
     }
 
-    pub fn into_current(self) -> anyhow::Result<ConfigV2> {
+    pub fn into_current(self) -> anyhow::Result<ConfigV3> {
         let mut current = match self {
-            Self::V2(current) => current,
+            Self::V3(current) => current,
+            Self::V2(old) => ConfigV3 {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                language: old.language,
+                profiles: old.profiles.into_iter().map(Profile::from).collect(),
+                routing_notice_pending: true,
+            },
             Self::Legacy(legacy) => migrate_legacy(legacy)?,
         };
         current.schema_version = CURRENT_SCHEMA_VERSION;
@@ -121,17 +171,18 @@ impl ConfigDocument {
     }
 }
 
-impl Default for ConfigV2 {
+impl Default for ConfigV3 {
     fn default() -> Self {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
+            routing_notice_pending: false,
             language: Language::default(),
             profiles: Vec::new(),
         }
     }
 }
 
-fn migrate_legacy(legacy: PersistedState) -> anyhow::Result<ConfigV2> {
+fn migrate_legacy(legacy: PersistedState) -> anyhow::Result<ConfigV3> {
     let mut interfaces = Vec::new();
     if let Some(interface) = legacy
         .alt_interface
@@ -201,6 +252,7 @@ fn migrate_legacy(legacy: PersistedState) -> anyhow::Result<ConfigV2> {
         Vec::new()
     } else {
         vec![Profile {
+            routing: Default::default(),
             id: ProfileId::from("default"),
             name: "Default".to_owned(),
             enabled: false,
@@ -209,8 +261,9 @@ fn migrate_legacy(legacy: PersistedState) -> anyhow::Result<ConfigV2> {
         }]
     };
 
-    Ok(ConfigV2 {
+    Ok(ConfigV3 {
         schema_version: CURRENT_SCHEMA_VERSION,
+        routing_notice_pending: true,
         language: legacy.language,
         profiles,
     })
@@ -237,11 +290,11 @@ pub struct ConfigRepository {
 #[derive(Debug, Clone)]
 pub struct PersistenceRequest {
     pub generation: u64,
-    pub config: ConfigV2,
+    pub config: ConfigV3,
 }
 
 impl PersistenceRequest {
-    pub fn new(generation: u64, config: ConfigV2) -> Self {
+    pub fn new(generation: u64, config: ConfigV3) -> Self {
         Self { generation, config }
     }
 }
@@ -293,14 +346,14 @@ impl ConfigRepository {
         Self::new(config_path())
     }
 
-    pub fn load(&self) -> anyhow::Result<ConfigV2> {
+    pub fn load(&self) -> anyhow::Result<ConfigV3> {
         if !self.path.exists() {
-            return Ok(ConfigV2::default());
+            return Ok(ConfigV3::default());
         }
         load_config_file(&self.path)
     }
 
-    pub fn save(&self, config: &ConfigV2) -> anyhow::Result<()> {
+    pub fn save(&self, config: &ConfigV3) -> anyhow::Result<()> {
         let mut current = config.clone();
         current.schema_version = CURRENT_SCHEMA_VERSION;
         for profile in &mut current.profiles {
@@ -379,7 +432,7 @@ fn validate_config_profiles(profiles: &[Profile]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn load_config_file(path: &Path) -> anyhow::Result<ConfigV2> {
+pub fn load_config_file(path: &Path) -> anyhow::Result<ConfigV3> {
     validate_existing_file(path)?;
     let mut file = open_existing_file_nonblocking(path)?;
     let metadata = file.metadata()?;
@@ -571,7 +624,7 @@ mod tests {
             .into_current()
             .unwrap();
 
-        assert_eq!(migrated.schema_version, 2);
+        assert_eq!(migrated.schema_version, 3);
         assert_eq!(migrated.profiles[0].name, "Default");
         assert_eq!(migrated.profiles[0].lanes[0].interface.as_str(), "tun0");
         assert_eq!(
@@ -615,7 +668,7 @@ mod tests {
             .unwrap()
             .into_current()
             .unwrap();
-        assert_eq!(stored.schema_version, 2);
+        assert_eq!(stored.schema_version, 3);
         assert_eq!(
             std::fs::read_to_string(path.with_extension("json.bak")).unwrap(),
             legacy
@@ -643,7 +696,7 @@ mod tests {
     fn schema_version_is_strict_and_never_falls_back_to_legacy() {
         for invalid in [
             r#"{"schema_version":"2","language":"tr","profiles":[]}"#,
-            r#"{"schema_version":3,"language":"tr","profiles":[]}"#,
+            r#"{"schema_version":4,"language":"tr","profiles":[]}"#,
             r#"{"schema_version":2.0,"language":"tr","profiles":[]}"#,
             r#"{"language":"tr","profiles":[]}"#,
         ] {
@@ -669,9 +722,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.json");
         let worker = PersistenceWorker::spawn(ConfigRepository::new(&path));
-        let first = ConfigV2 {
+        let first = ConfigV3 {
             language: Language::Tr,
-            ..ConfigV2::default()
+            ..ConfigV3::default()
         };
         let mut second = first.clone();
         second.language = Language::En;
@@ -700,8 +753,9 @@ mod tests {
         let original = br#"{"schema_version":2,"language":"tr","profiles":[]}"#;
         std::fs::write(&path, original).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let mut invalid = ConfigV2::default();
+        let mut invalid = ConfigV3::default();
         invalid.profiles.push(Profile {
+            routing: Default::default(),
             id: ProfileId::from("bad"),
             name: "Bad".to_owned(),
             enabled: false,
@@ -737,6 +791,7 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let profile = Profile {
+            routing: Default::default(),
             id: ProfileId::from("work"),
             name: "Work".to_owned(),
             enabled: false,
@@ -746,6 +801,7 @@ mod tests {
         let mut duplicate_id = profile.clone();
         duplicate_id.name = "Privacy".to_owned();
         let duplicate_name = Profile {
+            routing: Default::default(),
             id: ProfileId::from("privacy"),
             name: " work ".to_owned(),
             ..profile.clone()
@@ -755,7 +811,7 @@ mod tests {
             vec![profile.clone(), duplicate_id],
             vec![profile.clone(), duplicate_name],
         ] {
-            let document = ConfigV2 {
+            let document = ConfigV3 {
                 profiles,
                 ..Default::default()
             };

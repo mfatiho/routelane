@@ -48,6 +48,7 @@ fn rule_with(
 
 fn profile(lanes: Vec<Lane>, rules: Vec<Rule>) -> Profile {
     Profile {
+        routing: Default::default(),
         id: ProfileId::from("default"),
         name: "Default".to_owned(),
         enabled: true,
