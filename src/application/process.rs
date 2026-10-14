@@ -12,6 +12,7 @@ mod tests {
             desktop_id: None,
             executable_path: PathBuf::from("/usr/bin/browser"),
             include_children: true,
+            launch: None,
         };
         let processes = vec![
             RunningProcess::new(42, 101, PathBuf::from("/usr/bin/browser")),

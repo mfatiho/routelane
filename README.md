@@ -53,11 +53,24 @@ route, rule, nftables, ownership, and conflict evidence.
 ## Guided desktop journey
 
 1. Open RouteLane; if it is already running, its existing window is focused.
-2. Choose a lane/interface in Preferences when the setup card asks for one.
-3. Add a domain, IP, or CIDR rule, then select Enable routing.
-4. Complete the desktop Polkit prompt when RouteLane needs to modify routing.
-5. In Applications, select an installed program and lane. RouteLane can launch
-   it inside that lane or move matching processes that are already running.
+2. In Connections, add a named network interface and choose what happens if it
+   becomes unavailable. Blocking assigned traffic is the protective default.
+3. Add an installed program in Applications, or a domain/IP/CIDR in Rules.
+   Editors save only when you select Save; Cancel and Escape discard the draft.
+   Direct and Block rules do not require a connection definition.
+4. Select Enable routing in the persistent status area. Complete the desktop
+   Polkit prompt if requested. Saved settings and verified applied settings are
+   shown separately; a disconnected daemon is not presented as inactive.
+5. Start an application after its saved profile is verified. Applying to running
+   processes requires a scope confirmation; other windows and browser tabs may
+   be affected, and existing connections are not guaranteed to move.
+
+Overview summarizes every configured connection and local health evidence.
+Rules and Applications keep Add and Search above their lists; contextual menus
+provide editing, deletion and ordering without permanently expanded controls.
+Ctrl+F focuses search, Ctrl+N opens the current section's editor, and Escape
+cancels dialogs. Preferences contains language settings, with confirmation before
+saving a language change and exiting for restart.
 
 Application routing applies to every new connection from the selected process
 tree, including CDN, authentication, and browser verification endpoints. For a
@@ -241,6 +254,20 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release --bins
 ./packaging/deb/build-deb.sh
 ```
+
+The real GTK window and add dialogs can also be tested without the user's
+desktop session or configuration. This needs `dbus-run-session` and
+`gtk4-broadwayd`, but no root access or new Rust dependencies:
+
+```bash
+bash scripts/run-gtk-smoke.sh
+```
+
+The script uses a private session bus and temporary configuration/runtime
+directory. It opens the actual window, exercises both add dialogs, and checks
+that refresh preserves search, row identity and focus. It also covers safe
+dialog cancellation, validation, language confirmation and once-only application
+launch submission. It is a smoke test, not end-to-end network verification.
 
 Root namespace integration is separate:
 

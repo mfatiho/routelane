@@ -31,10 +31,18 @@ string_id!(RuleId);
 string_id!(ServicePackId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationLaunch {
+    pub executable: PathBuf,
+    pub arguments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicationSelector {
     pub desktop_id: Option<String>,
     pub executable_path: PathBuf,
     pub include_children: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<ApplicationLaunch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +124,7 @@ mod tests {
             desktop_id: Some("org.example.App".to_owned()),
             executable_path: "/usr/bin/example".into(),
             include_children: true,
+            launch: None,
         };
         let source = RuleSource::Application(selector.clone());
 

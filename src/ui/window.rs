@@ -1,1642 +1,57 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::rc::Rc;
-use std::sync::{atomic::Ordering, Arc, Mutex};
+use std::rc::{Rc, Weak};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use async_channel::{Receiver, Sender};
-use glib::signal::Inhibit;
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
-use routelane::domain::{
-    ApplicationSelector, HealthState, Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource,
-    RuleTarget,
-};
-use routelane::health::HealthReport;
-use routelane::ipc::{DaemonEvent, DaemonRequest, DaemonStatus};
+use routelane::config::{ConfigRepository, ConfigV2, PersistenceWorker};
+use routelane::domain::{HealthState, Profile, Rule, RuleAction, RuleId, RuleSource};
+use routelane::ipc::{DaemonRequest, DaemonResult};
 
 use crate::models::{DaemonToUi, UiToDaemon};
-use crate::ui::application_row::{create_application_row, ApplicationRowContext};
-use crate::ui::confirm::confirm_destructive_action_with_label;
-use crate::ui::experience::{
-    authorization_after_applied, authorization_after_error, dashboard_state,
-    orphan_recovery_action, status_presentation, AuthorizationPresentation, DashboardState,
-    PrimaryAction, RecoveryAction, SetupStep,
+use crate::ui::application_editor::open_application_editor;
+use crate::ui::application_row::{
+    application_action_request, create_compact_application_row, ApplicationAction,
+    CompactApplicationRow,
 };
-use crate::ui::i18n::LanguageTexts;
+use crate::ui::confirm::{confirm_destructive_action, confirm_destructive_action_with_label};
+use crate::ui::connections::ConnectionsPage;
+use crate::ui::controller::UiController;
+use crate::ui::desktop_catalog::{application_display_name, load_catalog, DesktopCatalog};
+use crate::ui::experience::{dashboard_state, PrimaryAction};
+use crate::ui::form::MenuAction;
+use crate::ui::i18n::{LanguageTexts, Texts};
+use crate::ui::list_page::ListPage;
+use crate::ui::overview::{status_copy, Overview};
+use crate::ui::rule_editor::{
+    action_text, move_rule, open_rule_editor, rule_matches_query, target_text,
+};
 use crate::ui::rule_row::{
-    create_rule_row, set_rule_enabled_request, ReorderDirection, RuleEdit, RuleRowContext,
+    create_compact_rule_row, set_rule_enabled_request, CompactRuleRow, ReorderDirection,
 };
-use crate::ui::settings::build_settings_dialog;
+use crate::ui::session::{AfterSave, SaveState, UiSession};
+use crate::ui::settings::build_general_settings_dialog;
+use crate::ui::shell::{Section, Shell};
 use crate::ui::tray::{spawn_tray, TrayCommand, APP_ICON_NAME};
-use routelane::config::{
-    ConfigRepository, ConfigV2, Language, PersistenceRequest, PersistenceWorker,
-};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HealthDiagnosticView {
-    pub summary: String,
-    pub action: Option<String>,
-    pub technical_detail: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConnectionHealthView {
-    pub aggregate: String,
-    pub apply_generation: Option<String>,
-    pub lanes: Vec<(String, String)>,
-    pub diagnostics: Vec<HealthDiagnosticView>,
-}
-
-pub fn health_view(report: &HealthReport, generation: Option<u64>) -> ConnectionHealthView {
-    ConnectionHealthView {
-        aggregate: format!("{:?}", report.state),
-        apply_generation: generation.map(|value| value.to_string()),
-        lanes: report
-            .lanes
-            .iter()
-            .map(|(lane, state)| (lane.as_str().to_owned(), format!("{state:?}")))
-            .collect(),
-        diagnostics: report
-            .diagnostics
-            .iter()
-            .map(|diagnostic| HealthDiagnosticView {
-                summary: diagnostic.summary.clone(),
-                action: diagnostic
-                    .suggested_action
-                    .as_ref()
-                    .map(|action| action.description.clone()),
-                technical_detail: diagnostic.technical_detail.clone(),
-            })
-            .collect(),
+fn empty_default_profile() -> Profile {
+    Profile {
+        id: "default".into(),
+        name: "Default".into(),
+        enabled: false,
+        lanes: vec![],
+        rules: vec![],
     }
-}
-
-fn health_after_apply_request() -> ConnectionHealthView {
-    health_view(&HealthReport::applying(), None)
-}
-
-pub fn daemon_unavailable_view(detail: impl Into<String>) -> ConnectionHealthView {
-    ConnectionHealthView {
-        aggregate: "DaemonUnavailable".to_owned(),
-        apply_generation: None,
-        lanes: Vec::new(),
-        diagnostics: vec![HealthDiagnosticView {
-            summary: "RouteLane daemon is unavailable".to_owned(),
-            action: Some("Start the RouteLane user service and try again".to_owned()),
-            technical_detail: detail.into(),
-        }],
-    }
-}
-
-pub fn configuration_error_view(
-    detail: impl Into<String>,
-    texts: crate::ui::i18n::Texts,
-) -> ConnectionHealthView {
-    ConnectionHealthView {
-        aggregate: "ConfigurationError".to_owned(),
-        apply_generation: None,
-        lanes: Vec::new(),
-        diagnostics: vec![HealthDiagnosticView {
-            summary: texts.configuration_error_summary.to_owned(),
-            action: Some(texts.configuration_error_action.to_owned()),
-            technical_detail: detail.into(),
-        }],
-    }
-}
-
-fn health_sections(
-    config_error: Option<&str>,
-    daemon: ConnectionHealthView,
-    texts: crate::ui::i18n::Texts,
-) -> (Option<ConnectionHealthView>, ConnectionHealthView) {
-    (
-        config_error.map(|error| configuration_error_view(error, texts)),
-        daemon,
-    )
-}
-
-fn reconcile_profiles(
-    document: &mut ConfigV2,
-    selected: &mut Profile,
-    mut canonical: Vec<Profile>,
-) {
-    if canonical.is_empty() {
-        return;
-    }
-    canonical.sort_by(|left, right| left.id.cmp(&right.id));
-    let selected_replacement = canonical
-        .iter()
-        .find(|profile| profile.id == selected.id)
-        .cloned();
-    for profile in canonical {
-        store_profile(document, profile);
-    }
-    document
-        .profiles
-        .sort_by(|left, right| left.id.cmp(&right.id));
-    if let Some(replacement) = selected_replacement {
-        *selected = replacement;
-    }
-}
-
-fn switch_state_after_persistence_failure(applied_profile_id: Option<&ProfileId>) -> bool {
-    applied_profile_id.is_some()
-}
-
-fn status_is_active(status: &DaemonStatus) -> bool {
-    status.applied_profile_id.is_some()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DashboardCopy {
-    title: &'static str,
-    subtitle: &'static str,
-    action: &'static str,
-    icon_name: &'static str,
-    shows_progress: bool,
-}
-
-fn dashboard_copy(
-    texts: crate::ui::i18n::Texts,
-    state: DashboardState,
-    health: HealthState,
-) -> DashboardCopy {
-    match (state.authorization, state.setup_step, state.primary_action) {
-        (AuthorizationPresentation::Waiting, _, _) => DashboardCopy {
-            title: texts.authorization_waiting,
-            subtitle: texts.authorization_waiting,
-            action: texts.retry_authorization,
-            icon_name: "process-working-symbolic",
-            shows_progress: true,
-        },
-        (AuthorizationPresentation::Denied, _, _) => DashboardCopy {
-            title: texts.authorization_denied,
-            subtitle: texts.retry_authorization,
-            action: texts.retry_authorization,
-            icon_name: "dialog-password-symbolic",
-            shows_progress: false,
-        },
-        (_, Some(SetupStep::AddLane), _) => DashboardCopy {
-            title: texts.inactive,
-            subtitle: texts.add_first_lane,
-            action: texts.open_preferences,
-            icon_name: "list-add-symbolic",
-            shows_progress: false,
-        },
-        (_, Some(SetupStep::AddRule), _) => DashboardCopy {
-            title: texts.inactive,
-            subtitle: texts.add_first_rule,
-            action: texts.add_rule,
-            icon_name: "list-add-symbolic",
-            shows_progress: false,
-        },
-        (_, None, action) => {
-            let presentation = status_presentation(health, state.authorization, texts);
-            let action = match action {
-                PrimaryAction::DisableRouting => texts.disable_routing,
-                _ => texts.enable_routing,
-            };
-            DashboardCopy {
-                title: presentation.title,
-                subtitle: presentation.detail,
-                action,
-                icon_name: presentation.icon_name,
-                shows_progress: matches!(health, HealthState::Applying),
-            }
-        }
-    }
-}
-
-fn accept_connection_epoch(
-    last_epoch: &Cell<Option<u64>>,
-    last_generation: &Cell<Option<u64>>,
-    last_sequence: &Cell<Option<u64>>,
-    epoch: u64,
-) -> bool {
-    if last_epoch.get().is_some_and(|current| epoch <= current) {
-        return false;
-    }
-    last_epoch.set(Some(epoch));
-    last_generation.set(None);
-    last_sequence.set(None);
-    true
-}
-
-fn accept_daemon_status_revision(
-    last_generation: &Cell<Option<u64>>,
-    last_sequence: &Cell<Option<u64>>,
-    generation: u64,
-    event_sequence: u64,
-) -> bool {
-    if last_generation
-        .get()
-        .is_some_and(|current| generation < current)
-        || last_sequence
-            .get()
-            .is_some_and(|current| event_sequence < current)
-    {
-        return false;
-    }
-    last_generation.set(Some(generation));
-    last_sequence.set(Some(event_sequence));
-    true
-}
-
-fn accept_daemon_event_revision(
-    last_generation: &Cell<Option<u64>>,
-    last_sequence: &Cell<Option<u64>>,
-    generation: u64,
-    sequence: u64,
-) -> bool {
-    if last_generation
-        .get()
-        .is_some_and(|current| generation < current)
-        || last_sequence
-            .get()
-            .is_some_and(|current| sequence <= current)
-    {
-        return false;
-    }
-    last_generation.set(Some(generation));
-    last_sequence.set(Some(sequence));
-    true
-}
-
-#[derive(Debug)]
-enum PostSaveAction {
-    None,
-    Request(DaemonRequest),
-    QuitApplication,
-}
-
-#[derive(Clone)]
-struct RuleListContext {
-    group: adw::PreferencesGroup,
-    rows: Rc<RefCell<Vec<adw::ActionRow>>>,
-    profile: Rc<RefCell<Profile>>,
-    routing_active: Rc<Cell<bool>>,
-    texts: crate::ui::i18n::Texts,
-    save_profile: Rc<dyn Fn(PostSaveAction)>,
-    window: adw::ApplicationWindow,
-}
-
-#[derive(Clone)]
-struct ApplicationListContext {
-    group: adw::PreferencesGroup,
-    rows: Rc<RefCell<Vec<adw::ActionRow>>>,
-    profile: Rc<RefCell<Profile>>,
-    routing_active: Rc<Cell<bool>>,
-    texts: crate::ui::i18n::Texts,
-    save_profile: Rc<dyn Fn(PostSaveAction)>,
-    sender: Sender<UiToDaemon>,
-    window: adw::ApplicationWindow,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListChildKind {
-    FixedAction,
-    DynamicRow,
-}
-
-fn list_child_order(kind: ListChildKind) -> u8 {
-    match kind {
-        ListChildKind::FixedAction => 0,
-        ListChildKind::DynamicRow => 1,
-    }
-}
-
-fn ordered_list_child_kinds(dynamic_count: usize) -> Vec<ListChildKind> {
-    let mut children = Vec::with_capacity(dynamic_count.saturating_add(1));
-    children.push(ListChildKind::FixedAction);
-    children.extend(std::iter::repeat_n(
-        ListChildKind::DynamicRow,
-        dynamic_count,
-    ));
-    children.sort_by_key(|kind| list_child_order(*kind));
-    children
-}
-
-fn open_application_dialog(parent: &adw::ApplicationWindow, context: ApplicationListContext) {
-    let applications = routelane::application::discover_desktop_apps().unwrap_or_default();
-    let dialog = adw::Window::builder()
-        .title(context.texts.add_application)
-        .transient_for(parent)
-        .modal(true)
-        .default_width(480)
-        .build();
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(24)
-        .margin_bottom(24)
-        .margin_start(24)
-        .margin_end(24)
-        .build();
-    let names = applications
-        .iter()
-        .map(|application| application.display_name.as_str())
-        .collect::<Vec<_>>();
-    let application = gtk::DropDown::builder()
-        .model(&gtk::StringList::new(&names))
-        .hexpand(true)
-        .build();
-    let lane_names = context
-        .profile
-        .borrow()
-        .lanes
-        .iter()
-        .map(|lane| lane.name.clone())
-        .collect::<Vec<_>>();
-    let lanes = lane_names.iter().map(String::as_str).collect::<Vec<_>>();
-    let lane = gtk::DropDown::builder()
-        .model(&gtk::StringList::new(&lanes))
-        .hexpand(true)
-        .build();
-    let feedback = gtk::Label::builder()
-        .label(context.texts.applications_description)
-        .xalign(0.0)
-        .wrap(true)
-        .visible(applications.is_empty())
-        .build();
-    let buttons = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .build();
-    let cancel = gtk::Button::with_label(context.texts.cancel);
-    let submit = gtk::Button::with_label(context.texts.add_application);
-    submit.add_css_class("suggested-action");
-    submit.set_sensitive(!applications.is_empty() && !lanes.is_empty());
-    buttons.append(&cancel);
-    buttons.append(&submit);
-    content.append(&application);
-    content.append(&lane);
-    content.append(&feedback);
-    content.append(&buttons);
-    dialog.set_content(Some(&content));
-    cancel.connect_clicked({
-        let dialog = dialog.clone();
-        move |_| dialog.close()
-    });
-    submit.connect_clicked({
-        let dialog = dialog.clone();
-        move |_| {
-            let Some(selected_application) = applications.get(application.selected() as usize)
-            else {
-                return;
-            };
-            let Some(selected_lane) = context
-                .profile
-                .borrow()
-                .lanes
-                .get(lane.selected() as usize)
-                .map(|lane| lane.id.clone())
-            else {
-                return;
-            };
-            let rule = Rule {
-                id: RuleId::from(format!("app-{}", uuid::Uuid::new_v4()).as_str()),
-                enabled: true,
-                priority: next_rule_priority(&context.profile.borrow()),
-                source: RuleSource::Application(ApplicationSelector {
-                    desktop_id: Some(selected_application.desktop_id.clone()),
-                    executable_path: selected_application.executable_path.clone(),
-                    include_children: true,
-                }),
-                target: RuleTarget::Any,
-                action: RuleAction::Route(selected_lane),
-            };
-            context.profile.borrow_mut().rules.push(rule);
-            let action = if context.routing_active.get() {
-                PostSaveAction::Request(apply_request(&context.profile.borrow()))
-            } else {
-                PostSaveAction::None
-            };
-            (context.save_profile)(action);
-            rebuild_application_rows(&context);
-            dialog.close();
-        }
-    });
-    dialog.present();
-}
-
-fn open_rule_dialog(
-    parent: &adw::ApplicationWindow,
-    texts: crate::ui::i18n::Texts,
-    profile: Rc<RefCell<Profile>>,
-    routing_active: Rc<Cell<bool>>,
-    save_profile: Rc<dyn Fn(PostSaveAction)>,
-    rule_list: RuleListContext,
-) {
-    let dialog = adw::Window::builder()
-        .title(texts.add_address_title)
-        .transient_for(parent)
-        .modal(true)
-        .default_width(480)
-        .build();
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(24)
-        .margin_bottom(24)
-        .margin_start(24)
-        .margin_end(24)
-        .build();
-    let target = gtk::Entry::builder()
-        .placeholder_text(texts.address_placeholder)
-        .tooltip_text(texts.rule_target_label)
-        .hexpand(true)
-        .build();
-    let target_label = gtk::Label::builder()
-        .label(texts.rule_target_label)
-        .halign(gtk::Align::Start)
-        .build();
-    target_label.set_mnemonic_widget(Some(&target));
-    let feedback = gtk::Label::builder().xalign(0.0).wrap(true).build();
-    feedback.add_css_class("error");
-    feedback.set_visible(false);
-    let actions =
-        gtk::StringList::new(&[texts.action_route, texts.action_direct, texts.action_block]);
-    let action = gtk::DropDown::builder()
-        .model(&actions)
-        .tooltip_text(texts.rule_action_label)
-        .build();
-    let action_label = gtk::Label::builder()
-        .label(texts.rule_action_label)
-        .halign(gtk::Align::Start)
-        .build();
-    action_label.set_mnemonic_widget(Some(&action));
-    let button_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .build();
-    let cancel = gtk::Button::with_label(texts.cancel);
-    let submit = gtk::Button::with_label(texts.add_rule);
-    submit.add_css_class("suggested-action");
-    button_row.append(&cancel);
-    button_row.append(&submit);
-
-    content.append(&target_label);
-    content.append(&target);
-    content.append(&feedback);
-    content.append(&action_label);
-    content.append(&action);
-    content.append(&button_row);
-    dialog.set_content(Some(&content));
-    dialog.set_default_widget(Some(&submit));
-
-    cancel.connect_clicked({
-        let dialog = dialog.clone();
-        move |_| dialog.close()
-    });
-
-    let submit_rule: Rc<dyn Fn()> = {
-        let dialog = dialog.clone();
-        let target = target.clone();
-        let feedback = feedback.clone();
-        let action = action.clone();
-        Rc::new(move || {
-            let text = target.text().trim().to_owned();
-            let submission = rule_dialog_submission(&text);
-            let restore_target_focus = rule_dialog_restores_target_focus(&submission);
-            let target_value = match submission {
-                RuleDialogSubmission::Invalid => {
-                    target.add_css_class("error");
-                    feedback.set_label(texts.invalid_rule_target);
-                    feedback.set_visible(true);
-                    if restore_target_focus {
-                        target.grab_focus();
-                    }
-                    return;
-                }
-                RuleDialogSubmission::Valid(target_value) => {
-                    target.remove_css_class("error");
-                    feedback.set_visible(false);
-                    target_value
-                }
-            };
-            let rule_action = match action.selected() {
-                1 => RuleAction::Direct,
-                2 => RuleAction::Block,
-                _ => profile
-                    .borrow()
-                    .lanes
-                    .first()
-                    .map(|lane| RuleAction::Route(lane.id.clone()))
-                    .unwrap_or(RuleAction::Direct),
-            };
-            let rule = Rule {
-                id: RuleId::from(format!("rule-{}", uuid::Uuid::new_v4()).as_str()),
-                enabled: true,
-                priority: next_rule_priority(&profile.borrow()),
-                source: RuleSource::Any,
-                target: target_value,
-                action: rule_action,
-            };
-            profile.borrow_mut().rules.push(rule.clone());
-            let post_save_action = if routing_active.get() {
-                PostSaveAction::Request(apply_request(&profile.borrow()))
-            } else {
-                PostSaveAction::None
-            };
-            save_profile(post_save_action);
-            append_rule(&rule_list, &rule);
-            target.set_text("");
-            action.set_selected(0);
-            dialog.close();
-        })
-    };
-    submit.connect_clicked({
-        let submit_rule = submit_rule.clone();
-        move |_| submit_rule()
-    });
-    target.connect_activate(move |_| submit_rule());
-    dialog.present();
-    target.grab_focus();
-}
-
-pub fn build_window(
-    app: &adw::Application,
-    sender: Sender<UiToDaemon>,
-    receiver: Receiver<DaemonToUi>,
-) -> adw::ApplicationWindow {
-    gtk::Window::set_default_icon_name(APP_ICON_NAME);
-    let repository = ConfigRepository::user_default();
-    let (mut document, load_error) = match repository.load() {
-        Ok(document) => (document, None),
-        Err(error) => (Default::default(), Some(error.to_string())),
-    };
-    if document.profiles.is_empty() {
-        document.profiles.push(empty_default_profile());
-    }
-    let language = document.language;
-    let texts = language.texts();
-    let document = Rc::new(RefCell::new(document));
-    let profile = Rc::new(RefCell::new(document.borrow().profiles[0].clone()));
-
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("RouteLane")
-        .default_width(720)
-        .default_height(720)
-        .build();
-    let copy_error_action =
-        gtk::gio::SimpleAction::new("copy-error", Some(glib::VariantTy::STRING));
-    {
-        let window = window.clone();
-        copy_error_action.connect_activate(move |_, parameter| {
-            if let Some(text) = parameter.and_then(glib::Variant::str) {
-                window.clipboard().set_text(text);
-            }
-        });
-    }
-    window.add_action(&copy_error_action);
-    let header = adw::HeaderBar::new();
-    let title = adw::WindowTitle::builder()
-        .title("RouteLane")
-        .subtitle(texts.inactive)
-        .build();
-    header.set_title_widget(Some(&title));
-    let active = gtk::Switch::builder()
-        .tooltip_text(texts.service_tooltip)
-        .valign(gtk::Align::Center)
-        .build();
-    let updating_switch = Rc::new(Cell::new(false));
-    let routing_active = Rc::new(Cell::new(false));
-    let authorization = Rc::new(Cell::new(AuthorizationPresentation::Idle));
-    let mutation_pending = Rc::new(Cell::new(false));
-    let pending_recovery_profile = Rc::new(RefCell::new(None::<Profile>));
-    let recovery_retry_used = Rc::new(Cell::new(false));
-    let recovery_in_progress = Rc::new(Cell::new(false));
-    let last_applied_profile_id = Rc::new(RefCell::new(None::<ProfileId>));
-    let last_daemon_generation = Rc::new(Cell::new(None::<u64>));
-    let last_event_sequence = Rc::new(Cell::new(None::<u64>));
-    let last_connection_epoch = Rc::new(Cell::new(None::<u64>));
-    let settings = gtk::Button::builder()
-        .icon_name("preferences-system-symbolic")
-        .tooltip_text(texts.settings_title)
-        .build();
-    settings.add_css_class("flat");
-    let editable = load_error.is_none();
-    let config_writable = Rc::new(Cell::new(editable));
-    active.set_sensitive(editable);
-    settings.set_sensitive(editable);
-    header.pack_end(&settings);
-    header.pack_end(&active);
-
-    let page = adw::PreferencesPage::new();
-    let initial_dashboard = dashboard_state(&profile.borrow(), HealthState::Inactive, false);
-    let initial_dashboard_copy = dashboard_copy(texts, initial_dashboard, HealthState::Inactive);
-    let dashboard_group = adw::PreferencesGroup::builder().title("RouteLane").build();
-    let dashboard_row = adw::ActionRow::builder()
-        .title(initial_dashboard_copy.title)
-        .subtitle(initial_dashboard_copy.subtitle)
-        .build();
-    let dashboard_icon = gtk::Image::from_icon_name(initial_dashboard_copy.icon_name);
-    dashboard_row.add_prefix(&dashboard_icon);
-    let dashboard_progress = gtk::Spinner::new();
-    dashboard_progress.set_visible(initial_dashboard_copy.shows_progress);
-    if initial_dashboard_copy.shows_progress {
-        dashboard_progress.start();
-    }
-    dashboard_row.add_suffix(&dashboard_progress);
-    let dashboard_primary = gtk::Button::with_label(initial_dashboard_copy.action);
-    dashboard_primary.add_css_class("suggested-action");
-    dashboard_primary.set_sensitive(initial_dashboard.primary_action_enabled);
-    dashboard_row.add_suffix(&dashboard_primary);
-    dashboard_group.add(&dashboard_row);
-    page.add(&dashboard_group);
-    let active_lane_group = adw::PreferencesGroup::builder()
-        .title(texts.active_lane_title)
-        .build();
-    let active_lane_row = adw::ActionRow::new();
-    active_lane_group.add(&active_lane_row);
-    let sync_lane_summary: Rc<dyn Fn()> = {
-        let profile = profile.clone();
-        let active_lane_group = active_lane_group.clone();
-        let active_lane_row = active_lane_row.clone();
-        Rc::new(move || {
-            let profile = profile.borrow();
-            let Some(lane) = profile.lanes.first() else {
-                active_lane_group.set_visible(false);
-                return;
-            };
-            let failure_policy = match lane.failure_policy {
-                routelane::domain::LaneFailurePolicy::Block => texts.failure_block,
-                routelane::domain::LaneFailurePolicy::Direct => texts.failure_direct,
-                routelane::domain::LaneFailurePolicy::Inactive => texts.failure_inactive,
-            };
-            active_lane_row.set_title(&lane.name);
-            active_lane_row.set_subtitle(&format!(
-                "{}: {} • {}: {}",
-                texts.lane_summary_interface,
-                lane.interface.as_str(),
-                texts.lane_summary_failure_policy,
-                failure_policy
-            ));
-            active_lane_group.set_visible(true);
-        })
-    };
-    sync_lane_summary();
-    page.add(&active_lane_group);
-    let sync_dashboard: Rc<dyn Fn(HealthState)> = {
-        let profile = profile.clone();
-        let mutation_pending = mutation_pending.clone();
-        let dashboard_row = dashboard_row.clone();
-        let dashboard_icon = dashboard_icon.clone();
-        let dashboard_progress = dashboard_progress.clone();
-        let dashboard_primary = dashboard_primary.clone();
-        let active = active.clone();
-        let config_writable = config_writable.clone();
-        Rc::new(move |health: HealthState| {
-            let state = dashboard_state(&profile.borrow(), health, mutation_pending.get());
-            let copy = dashboard_copy(texts, state, health);
-            dashboard_row.set_title(copy.title);
-            dashboard_row.set_subtitle(copy.subtitle);
-            dashboard_icon.set_icon_name(Some(copy.icon_name));
-            dashboard_progress.set_visible(copy.shows_progress);
-            if copy.shows_progress {
-                dashboard_progress.start();
-            } else {
-                dashboard_progress.stop();
-            }
-            dashboard_primary.set_label(copy.action);
-            dashboard_primary.set_sensitive(state.primary_action_enabled && config_writable.get());
-            active.set_sensitive(config_writable.get() && !mutation_pending.get());
-        })
-    };
-    let config_error_group = adw::PreferencesGroup::builder()
-        .title(texts.configuration_title)
-        .build();
-    let config_error_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    let config_error_row = adw::ActionRow::new();
-    config_error_row.set_child(Some(&config_error_content));
-    config_error_group.add(&config_error_row);
-    let (initial_config_error, initial_daemon_health) = health_sections(
-        load_error.as_deref(),
-        health_view(&HealthReport::inactive(), None),
-        texts,
-    );
-    config_error_group.set_visible(initial_config_error.is_some());
-    if let Some(error) = initial_config_error {
-        render_health(&config_error_content, &error, texts);
-    }
-    page.add(&config_error_group);
-    let rules_group = adw::PreferencesGroup::builder()
-        .title(texts.rules_title)
-        .description(texts.rules_description)
-        .build();
-    rules_group.set_sensitive(editable);
-    let add_rule_button = gtk::Button::with_label(&format!("+ {}", texts.add_rule));
-    add_rule_button.set_halign(gtk::Align::Start);
-    add_rule_button.set_sensitive(editable);
-    let rule_action_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .margin_top(6)
-        .margin_bottom(6)
-        .build();
-    rule_action_box.append(&add_rule_button);
-    let rule_action_row = adw::ActionRow::new();
-    rule_action_row.set_child(Some(&rule_action_box));
-    rules_group.add(&rule_action_row);
-    page.add(&rules_group);
-    let applications_group = adw::PreferencesGroup::builder()
-        .title(texts.applications_title)
-        .description(texts.applications_description)
-        .build();
-    applications_group.set_sensitive(editable);
-    let add_application_button = gtk::Button::with_label(&format!("+ {}", texts.add_application));
-    add_application_button.set_halign(gtk::Align::Start);
-    add_application_button.set_sensitive(editable);
-    let application_action_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .margin_top(6)
-        .margin_bottom(6)
-        .build();
-    application_action_box.append(&add_application_button);
-    let application_action_row = adw::ActionRow::new();
-    application_action_row.set_child(Some(&application_action_box));
-    applications_group.add(&application_action_row);
-    page.add(&applications_group);
-    let health_group = adw::PreferencesGroup::builder()
-        .title(texts.health_title)
-        .build();
-    let health_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    let health_row = adw::ActionRow::new();
-    health_row.set_child(Some(&health_content));
-    health_group.add(&health_row);
-    render_health(&health_content, &initial_daemon_health, texts);
-    page.add(&health_group);
-
-    let toast_overlay = adw::ToastOverlay::new();
-    toast_overlay.set_child(Some(&page));
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    body.append(&header);
-    body.append(&toast_overlay);
-    window.set_content(Some(&body));
-
-    let persistence = load_error
-        .is_none()
-        .then(|| PersistenceWorker::spawn(repository));
-    let persistence_requests = persistence.as_ref().map(|worker| worker.requests.clone());
-    let persistence_results = persistence.as_ref().map(|worker| worker.results.clone());
-    let persistence_generation = Rc::new(Cell::new(0_u64));
-    let pending_actions = Rc::new(RefCell::new(BTreeMap::<u64, PostSaveAction>::new()));
-    let persist_document: Rc<dyn Fn(PostSaveAction)> = {
-        let document = document.clone();
-        let generation = persistence_generation.clone();
-        let pending = pending_actions.clone();
-        Rc::new(move |action| {
-            let Some(requests) = persistence_requests.clone() else {
-                return;
-            };
-            let next = generation.get().saturating_add(1);
-            generation.set(next);
-            pending.borrow_mut().insert(next, action);
-            let request = PersistenceRequest::new(next, document.borrow().clone());
-            glib::MainContext::default().spawn_local(async move {
-                if requests.send(request).await.is_err() {
-                    log::warn!("configuration persistence worker stopped");
-                }
-            });
-        })
-    };
-    let save_profile: Rc<dyn Fn(PostSaveAction)> = {
-        let document = document.clone();
-        let profile = profile.clone();
-        let persist_document = persist_document.clone();
-        Rc::new(move |action| {
-            let current = profile.borrow().clone();
-            store_profile(&mut document.borrow_mut(), current);
-            persist_document(action);
-        })
-    };
-
-    if let Some(results) = persistence_results {
-        let pending = pending_actions.clone();
-        let sender = sender.clone();
-        let toast_overlay = toast_overlay.clone();
-        let config_error_content = config_error_content.clone();
-        let config_error_group = config_error_group.clone();
-        let active = active.clone();
-        let updating_switch = updating_switch.clone();
-        let last_applied_profile_id = last_applied_profile_id.clone();
-        let config_writable = config_writable.clone();
-        let settings = settings.clone();
-        let add_rule_button = add_rule_button.clone();
-        let add_application_button = add_application_button.clone();
-        let rules_group = rules_group.clone();
-        let dashboard_primary = dashboard_primary.clone();
-        let app = app.clone();
-        glib::MainContext::default().spawn_local(async move {
-            while let Ok(result) = results.recv().await {
-                let action = pending
-                    .borrow_mut()
-                    .remove(&result.generation)
-                    .unwrap_or(PostSaveAction::None);
-                match result.result {
-                    Ok(()) => match action {
-                        PostSaveAction::Request(request) => {
-                            sender.send(UiToDaemon::Request(request)).await.ok();
-                        }
-                        PostSaveAction::QuitApplication => app.quit(),
-                        PostSaveAction::None => {}
-                    },
-                    Err(error) => {
-                        config_writable.set(false);
-                        let restored_active = switch_state_after_persistence_failure(
-                            last_applied_profile_id.borrow().as_ref(),
-                        );
-                        updating_switch.set(true);
-                        active.set_active(restored_active);
-                        updating_switch.set(false);
-                        active.set_sensitive(false);
-                        settings.set_sensitive(false);
-                        add_rule_button.set_sensitive(false);
-                        add_application_button.set_sensitive(false);
-                        dashboard_primary.set_sensitive(false);
-                        rules_group.set_sensitive(false);
-                        config_error_group.set_visible(true);
-                        render_health(
-                            &config_error_content,
-                            &configuration_error_view(&error, texts),
-                            texts,
-                        );
-                        show_copyable_error_toast(&toast_overlay, texts, &error);
-                        sender
-                            .send(UiToDaemon::Request(DaemonRequest::GetStatus))
-                            .await
-                            .ok();
-                    }
-                }
-            }
-        });
-    }
-
-    let rows = Rc::new(RefCell::new(Vec::<adw::ActionRow>::new()));
-    let rule_list = RuleListContext {
-        group: rules_group.clone(),
-        rows: rows.clone(),
-        profile: profile.clone(),
-        routing_active: routing_active.clone(),
-        texts,
-        save_profile: save_profile.clone(),
-        window: window.clone(),
-    };
-    rebuild_rule_rows(&rule_list);
-    let application_rows = Rc::new(RefCell::new(Vec::<adw::ActionRow>::new()));
-    let application_list = ApplicationListContext {
-        group: applications_group.clone(),
-        rows: application_rows,
-        profile: profile.clone(),
-        routing_active: routing_active.clone(),
-        texts,
-        save_profile: save_profile.clone(),
-        sender: sender.clone(),
-        window: window.clone(),
-    };
-    rebuild_application_rows(&application_list);
-
-    {
-        let window = window.clone();
-        let profile = profile.clone();
-        let save_profile = save_profile.clone();
-        let document = document.clone();
-        let persist_document = persist_document.clone();
-        let rule_list = rule_list.clone();
-        let application_list = application_list.clone();
-        let routing_active = routing_active.clone();
-        let sync_lane_summary = sync_lane_summary.clone();
-        settings.connect_clicked(move |_| {
-            let initial_language = document.borrow().language;
-            let on_language: Rc<dyn Fn(Language)> = {
-                let document = document.clone();
-                let persist_document = persist_document.clone();
-                Rc::new(move |language| {
-                    {
-                        document.borrow_mut().language = language;
-                    }
-                    persist_document(PostSaveAction::QuitApplication);
-                })
-            };
-            let on_lane_change: Rc<dyn Fn()> = {
-                let save_profile = save_profile.clone();
-                let rule_list = rule_list.clone();
-                let routing_active = routing_active.clone();
-                let sync_lane_summary = sync_lane_summary.clone();
-                let profile = profile.clone();
-                let application_list = application_list.clone();
-                Rc::new(move || {
-                    let action = if routing_active.get() {
-                        PostSaveAction::Request(apply_request(&profile.borrow()))
-                    } else {
-                        PostSaveAction::None
-                    };
-                    save_profile(action);
-                    rebuild_rule_rows(&rule_list);
-                    rebuild_application_rows(&application_list);
-                    sync_lane_summary();
-                })
-            };
-            let dialog = build_settings_dialog(
-                &window,
-                texts,
-                profile.clone(),
-                on_lane_change,
-                initial_language,
-                on_language,
-            );
-            dialog.present();
-        });
-    }
-    {
-        let profile = profile.clone();
-        let settings = settings.clone();
-        let routing_active = routing_active.clone();
-        let save_profile = save_profile.clone();
-        let sender = sender.clone();
-        let mutation_pending = mutation_pending.clone();
-        let pending_recovery_profile = pending_recovery_profile.clone();
-        let recovery_retry_used = recovery_retry_used.clone();
-        let sync_dashboard = sync_dashboard.clone();
-        let health_content = health_content.clone();
-        let window = window.clone();
-        let rule_list = rule_list.clone();
-        dashboard_primary.connect_clicked(move |_| {
-            if mutation_pending.get() {
-                return;
-            }
-            let health_guess = if routing_active.get() {
-                HealthState::Healthy
-            } else {
-                HealthState::Inactive
-            };
-            let state = dashboard_state(&profile.borrow(), health_guess, false);
-            match state.primary_action {
-                PrimaryAction::OpenPreferences => settings.emit_clicked(),
-                PrimaryAction::OpenRuleDialog => {
-                    open_rule_dialog(
-                        &window,
-                        texts,
-                        profile.clone(),
-                        routing_active.clone(),
-                        save_profile.clone(),
-                        rule_list.clone(),
-                    );
-                }
-                PrimaryAction::EnableRouting => {
-                    *pending_recovery_profile.borrow_mut() = Some(profile.borrow().clone());
-                    recovery_retry_used.set(false);
-                    mutation_pending.set(true);
-                    sync_dashboard(health_guess);
-                    render_health(&health_content, &health_after_apply_request(), texts);
-                    save_profile(PostSaveAction::Request(apply_request(&profile.borrow())));
-                }
-                PrimaryAction::DisableRouting => {
-                    mutation_pending.set(true);
-                    sync_dashboard(health_guess);
-                    let sender = sender.clone();
-                    glib::MainContext::default().spawn_local(async move {
-                        sender
-                            .send(UiToDaemon::Request(DaemonRequest::Deactivate))
-                            .await
-                            .ok();
-                    });
-                }
-            }
-        });
-    }
-    {
-        let sender = sender.clone();
-        let profile = profile.clone();
-        let save_profile = save_profile.clone();
-        let updating_switch = updating_switch.clone();
-        let health_content = health_content.clone();
-        let mutation_pending = mutation_pending.clone();
-        let pending_recovery_profile = pending_recovery_profile.clone();
-        let recovery_retry_used = recovery_retry_used.clone();
-        let sync_dashboard = sync_dashboard.clone();
-        active.connect_state_set(move |_, state| {
-            if updating_switch.get() || mutation_pending.get() {
-                return Inhibit(false);
-            }
-            mutation_pending.set(true);
-            sync_dashboard(if state {
-                HealthState::Healthy
-            } else {
-                HealthState::Inactive
-            });
-            if state {
-                *pending_recovery_profile.borrow_mut() = Some(profile.borrow().clone());
-                recovery_retry_used.set(false);
-                render_health(&health_content, &health_after_apply_request(), texts);
-                save_profile(PostSaveAction::Request(apply_request(&profile.borrow())));
-            } else {
-                let sender = sender.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    sender
-                        .send(UiToDaemon::Request(DaemonRequest::Deactivate))
-                        .await
-                        .ok();
-                });
-            }
-            Inhibit(false)
-        });
-    }
-    {
-        let window = window.clone();
-        let profile = profile.clone();
-        let routing_active = routing_active.clone();
-        let save_profile = save_profile.clone();
-        let rule_list = rule_list.clone();
-        add_rule_button.connect_clicked(move |_| {
-            open_rule_dialog(
-                &window,
-                texts,
-                profile.clone(),
-                routing_active.clone(),
-                save_profile.clone(),
-                rule_list.clone(),
-            );
-        });
-    }
-    {
-        let window = window.clone();
-        let application_list = application_list.clone();
-        add_application_button.connect_clicked(move |_| {
-            open_application_dialog(&window, application_list.clone());
-        });
-    }
-
-    {
-        let active = active.clone();
-        let updating_switch = updating_switch.clone();
-        let routing_active = routing_active.clone();
-        let title = title.clone();
-        let health_content = health_content.clone();
-        let profile = profile.clone();
-        let dashboard_row = dashboard_row.clone();
-        let dashboard_primary = dashboard_primary.clone();
-        let authorization = authorization.clone();
-        let rule_list = rule_list.clone();
-        let application_list = application_list.clone();
-        let document = document.clone();
-        let persist_document = persist_document.clone();
-        let last_applied_profile_id = last_applied_profile_id.clone();
-        let config_writable = config_writable.clone();
-        let mutation_pending = mutation_pending.clone();
-        let pending_recovery_profile = pending_recovery_profile.clone();
-        let recovery_retry_used = recovery_retry_used.clone();
-        let sync_dashboard = sync_dashboard.clone();
-        let sync_lane_summary = sync_lane_summary.clone();
-        let window = window.clone();
-        glib::MainContext::default().spawn_local(async move {
-            while let Ok(event) = receiver.recv().await {
-                match event {
-                    DaemonToUi::ConnectionEstablished { epoch } => {
-                        accept_connection_epoch(
-                            &last_connection_epoch,
-                            &last_daemon_generation,
-                            &last_event_sequence,
-                            epoch,
-                        );
-                    }
-                    DaemonToUi::Status(status) => {
-                        if !accept_daemon_status_revision(
-                            &last_daemon_generation,
-                            &last_event_sequence,
-                            status.generation,
-                            status.event_sequence,
-                        ) {
-                            continue;
-                        }
-                        let is_active = status_is_active(&status);
-                        *last_applied_profile_id.borrow_mut() = status.applied_profile_id.clone();
-                        routing_active.set(is_active);
-                        updating_switch.set(true);
-                        active.set_active(is_active);
-                        rebuild_application_rows(&application_list);
-                        updating_switch.set(false);
-                        title.set_subtitle(&format!("{:?}", status.health.state));
-                        mutation_pending.set(false);
-                        sync_dashboard(status.health.state);
-                        render_health(
-                            &health_content,
-                            &health_view(&status.health, Some(status.generation)),
-                            texts,
-                        );
-                    }
-                    DaemonToUi::Event(event) => {
-                        let (generation, sequence, health) = match event {
-                            DaemonEvent::StateChanged {
-                                generation,
-                                sequence,
-                                health,
-                            }
-                            | DaemonEvent::OperationFailed {
-                                generation,
-                                sequence,
-                                health,
-                                ..
-                            } => (generation, sequence, health),
-                        };
-                        if !accept_daemon_event_revision(
-                            &last_daemon_generation,
-                            &last_event_sequence,
-                            generation,
-                            sequence,
-                        ) {
-                            continue;
-                        }
-                        title.set_subtitle(&format!("{:?}", health.state));
-                        render_health(
-                            &health_content,
-                            &health_view(&health, Some(generation)),
-                            texts,
-                        );
-                        let sender = sender.clone();
-                        glib::MainContext::default().spawn_local(async move {
-                            sender
-                                .send(UiToDaemon::Request(DaemonRequest::GetStatus))
-                                .await
-                                .ok();
-                            sender
-                                .send(UiToDaemon::Request(DaemonRequest::ListProfiles))
-                                .await
-                                .ok();
-                        });
-                    }
-                    DaemonToUi::DaemonUnavailable(detail) => {
-                        mutation_pending.set(false);
-                        active.set_sensitive(false);
-                        dashboard_primary.set_sensitive(false);
-                        title.set_subtitle("DaemonUnavailable");
-                        render_health(&health_content, &daemon_unavailable_view(detail), texts);
-                    }
-                    DaemonToUi::Error(error) => {
-                        if matches!(
-                            orphan_recovery_action(&error.code, recovery_retry_used.get()),
-                            RecoveryAction::AskForConfirmation
-                        ) {
-                            mutation_pending.set(false);
-                            sync_dashboard(HealthState::Inactive);
-                            let confirm_sender = sender.clone();
-                            let confirm_pending = mutation_pending.clone();
-                            let confirm_recovery = recovery_in_progress.clone();
-                            let confirm_dashboard = sync_dashboard.clone();
-                            let confirm_row = dashboard_row.clone();
-                            let on_confirm: Rc<dyn Fn()> = Rc::new(move || {
-                                confirm_pending.set(true);
-                                confirm_recovery.set(true);
-                                confirm_dashboard(HealthState::Applying);
-                                confirm_row.set_title(texts.orphan_recovery_progress);
-                                let sender = confirm_sender.clone();
-                                glib::MainContext::default().spawn_local(async move {
-                                    sender
-                                        .send(UiToDaemon::Request(
-                                            DaemonRequest::RecoverOrphanedResources,
-                                        ))
-                                        .await
-                                        .ok();
-                                });
-                            });
-                            let cancel_pending_profile = pending_recovery_profile.clone();
-                            let cancel_retry_used = recovery_retry_used.clone();
-                            let cancel_recovery = recovery_in_progress.clone();
-                            let cancel_active = active.clone();
-                            let cancel_dashboard = sync_dashboard.clone();
-                            let on_cancel: Rc<dyn Fn()> = Rc::new(move || {
-                                *cancel_pending_profile.borrow_mut() = None;
-                                cancel_retry_used.set(false);
-                                cancel_recovery.set(false);
-                                cancel_dashboard(HealthState::Inactive);
-                                cancel_active.grab_focus();
-                            });
-                            confirm_destructive_action_with_label(
-                                &window,
-                                texts,
-                                texts.orphan_recovery_heading,
-                                texts.orphan_recovery_body,
-                                texts.recover_and_retry,
-                                on_confirm,
-                                on_cancel,
-                            );
-                            continue;
-                        }
-                        let recovery_failed = recovery_in_progress.replace(false);
-                        let authorization_denied = error.to_string().contains("AccessDenied")
-                            || error.to_string().contains("authorization");
-                        let outcome =
-                            authorization_after_error(routing_active.get(), authorization_denied);
-                        mutation_pending.set(false);
-                        authorization.set(outcome.authorization);
-                        if matches!(outcome.authorization, AuthorizationPresentation::Denied) {
-                            dashboard_row.set_title(texts.authorization_denied);
-                            dashboard_row.set_subtitle(texts.retry_authorization);
-                            dashboard_primary.set_label(texts.retry_authorization);
-                            dashboard_primary.set_sensitive(outcome.primary_action_enabled);
-                            active.set_sensitive(config_writable.get());
-                        } else {
-                            sync_dashboard(if outcome.routing_active {
-                                HealthState::Healthy
-                            } else {
-                                HealthState::Inactive
-                            });
-                        }
-                        *pending_recovery_profile.borrow_mut() = None;
-                        recovery_retry_used.set(false);
-                        let detail = if recovery_failed {
-                            format!("{}: {}", texts.orphan_recovery_failed, error)
-                        } else {
-                            error.to_string()
-                        };
-                        show_copyable_error_toast(&toast_overlay, texts, &detail);
-                        let sender = sender.clone();
-                        glib::MainContext::default().spawn_local(async move {
-                            sender
-                                .send(UiToDaemon::Request(DaemonRequest::GetStatus))
-                                .await
-                                .ok();
-                            sender
-                                .send(UiToDaemon::Request(DaemonRequest::ListProfiles))
-                                .await
-                                .ok();
-                        });
-                    }
-                    DaemonToUi::Applied(result) => {
-                        mutation_pending.set(false);
-                        *pending_recovery_profile.borrow_mut() = None;
-                        recovery_retry_used.set(false);
-                        recovery_in_progress.set(false);
-                        authorization.set(authorization_after_applied());
-                        rebuild_rule_rows(&rule_list);
-                        rebuild_application_rows(&application_list);
-                        title.set_subtitle(&format!("Applying generation {}", result.generation));
-                        sync_dashboard(HealthState::Applying);
-                        let sender = sender.clone();
-                        glib::MainContext::default().spawn_local(async move {
-                            sender
-                                .send(UiToDaemon::Request(DaemonRequest::GetStatus))
-                                .await
-                                .ok();
-                        });
-                    }
-                    DaemonToUi::ApplicationLaunched(result) => {
-                        let message = format!("{} PID {}", texts.application_launched, result.pid);
-                        toast_overlay.add_toast(&adw::Toast::new(&message));
-                    }
-                    DaemonToUi::ApplicationProcessesAdopted(result) => {
-                        let message = format!(
-                            "{}{}{}",
-                            texts.application_adopted_prefix,
-                            result.adopted_count,
-                            texts.application_adopted_suffix
-                        );
-                        toast_overlay.add_toast(&adw::Toast::new(&message));
-                    }
-                    DaemonToUi::OrphanedResourcesRecovered(result) => {
-                        log::debug!(
-                            "orphan recovery completed; network resources cleaned: {}",
-                            result.cleaned
-                        );
-                        recovery_in_progress.set(false);
-                        let request = retry_after_recovery(
-                            &mut pending_recovery_profile.borrow_mut(),
-                            recovery_retry_used.get(),
-                        );
-                        if let Some(request) = request {
-                            recovery_retry_used.set(true);
-                            mutation_pending.set(true);
-                            sync_dashboard(HealthState::Applying);
-                            dashboard_row.set_title(texts.orphan_recovery_progress);
-                            let sender = sender.clone();
-                            glib::MainContext::default().spawn_local(async move {
-                                sender.send(UiToDaemon::Request(request)).await.ok();
-                            });
-                        } else {
-                            mutation_pending.set(false);
-                            sync_dashboard(HealthState::Inactive);
-                        }
-                    }
-                    DaemonToUi::Deactivated => {
-                        mutation_pending.set(false);
-                        routing_active.set(false);
-                        updating_switch.set(true);
-                        active.set_active(false);
-                        rebuild_application_rows(&application_list);
-                        updating_switch.set(false);
-                        sync_dashboard(HealthState::Inactive);
-                        render_health(
-                            &health_content,
-                            &health_view(&HealthReport::inactive(), None),
-                            texts,
-                        );
-                    }
-                    DaemonToUi::Profiles(profiles) => {
-                        log::debug!("daemon returned {} profile(s)", profiles.len());
-                        if !profiles.is_empty() {
-                            {
-                                let mut document = document.borrow_mut();
-                                let mut selected = profile.borrow_mut();
-                                reconcile_profiles(&mut document, &mut selected, profiles);
-                            }
-                            persist_document(PostSaveAction::None);
-                            rebuild_rule_rows(&rule_list);
-                            rebuild_application_rows(&application_list);
-                            sync_lane_summary();
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    let (tray_sender, tray_receiver) =
-        glib::MainContext::channel::<TrayCommand>(glib::PRIORITY_DEFAULT);
-    let tray_language = Arc::new(Mutex::new(language));
-    let tray_available = spawn_tray(tray_sender, tray_language);
-    {
-        let window = window.clone();
-        let app = app.clone();
-        tray_receiver.attach(None, move |command| {
-            match command {
-                TrayCommand::ShowWindow => window.present(),
-                TrayCommand::Quit => app.quit(),
-            }
-            glib::Continue(true)
-        });
-    }
-    window.connect_close_request(move |window| {
-        if tray_available.load(Ordering::Relaxed) {
-            window.hide();
-            Inhibit(true)
-        } else {
-            Inhibit(false)
-        }
-    });
-    window.present();
-    window
-}
-
-fn append_rule(context: &RuleListContext, rule: &Rule) {
-    let lanes = context
-        .profile
-        .borrow()
-        .lanes
-        .iter()
-        .map(|lane| (lane.id.clone(), lane.name.clone()))
-        .collect::<Vec<_>>();
-    let on_change: Rc<dyn Fn(Rule, RuleEdit)> = {
-        let profile = context.profile.clone();
-        let save = context.save_profile.clone();
-        let routing_active = context.routing_active.clone();
-        Rc::new(move |updated, edit| {
-            let updated_id = updated.id.clone();
-            let changed = {
-                let mut profile = profile.borrow_mut();
-                if let Some(rule) = profile.rules.iter_mut().find(|rule| rule.id == updated.id) {
-                    *rule = updated;
-                    true
-                } else {
-                    false
-                }
-            };
-            if changed {
-                let action = if routing_active.get() {
-                    match edit {
-                        RuleEdit::Enabled(enabled) => {
-                            PostSaveAction::Request(set_rule_enabled_request(
-                                profile.borrow().id.clone(),
-                                updated_id,
-                                enabled,
-                            ))
-                        }
-                        RuleEdit::Definition => {
-                            PostSaveAction::Request(apply_request(&profile.borrow()))
-                        }
-                    }
-                } else {
-                    PostSaveAction::None
-                };
-                save(action);
-            }
-        })
-    };
-    let on_delete: Rc<dyn Fn(RuleId)> = {
-        let profile = context.profile.clone();
-        let save = context.save_profile.clone();
-        let routing_active = context.routing_active.clone();
-        Rc::new(move |id| {
-            {
-                profile.borrow_mut().rules.retain(|rule| rule.id != id);
-            }
-            let action = if routing_active.get() {
-                PostSaveAction::Request(apply_request(&profile.borrow()))
-            } else {
-                PostSaveAction::None
-            };
-            save(action);
-        })
-    };
-    let on_reorder: Rc<dyn Fn(RuleId, ReorderDirection)> = {
-        let profile = context.profile.clone();
-        let save = context.save_profile.clone();
-        let routing_active = context.routing_active.clone();
-        let context = context.clone();
-        Rc::new(move |id, direction| {
-            let mut ordered: Vec<Rule> = profile.borrow().rules.clone();
-            ordered.sort_by(Rule::execution_cmp);
-            let Some(index) = ordered.iter().position(|rule| rule.id == id) else {
-                return;
-            };
-            let neighbor_index = match direction {
-                ReorderDirection::Up => index.checked_sub(1),
-                ReorderDirection::Down => index.checked_add(1).filter(|i| *i < ordered.len()),
-            };
-            let Some(neighbor_index) = neighbor_index else {
-                return;
-            };
-            let this_priority = ordered[index].priority;
-            let neighbor_id = ordered[neighbor_index].id.clone();
-            let neighbor_priority = ordered[neighbor_index].priority;
-            {
-                let mut profile = profile.borrow_mut();
-                for rule in profile.rules.iter_mut() {
-                    if rule.id == id {
-                        rule.priority = neighbor_priority;
-                    } else if rule.id == neighbor_id {
-                        rule.priority = this_priority;
-                    }
-                }
-            }
-            let action = if routing_active.get() {
-                PostSaveAction::Request(apply_request(&profile.borrow()))
-            } else {
-                PostSaveAction::None
-            };
-            save(action);
-            rebuild_rule_rows(&context);
-        })
-    };
-    let row_context = RuleRowContext {
-        lanes,
-        texts: context.texts,
-        parent: context.window.clone(),
-        on_change,
-        on_delete,
-        on_reorder,
-    };
-    let row = create_rule_row(rule, row_context);
-    context.group.add(&row);
-    context.rows.borrow_mut().push(row);
-}
-
-fn rebuild_rule_rows(context: &RuleListContext) {
-    for row in context.rows.borrow_mut().drain(..) {
-        context.group.remove(&row);
-    }
-    let mut rules = context.profile.borrow().rules.clone();
-    rules.retain(|rule| matches!(rule.source, RuleSource::Any));
-    rules.sort_by(Rule::execution_cmp);
-    debug_assert_eq!(
-        ordered_list_child_kinds(rules.len()).first(),
-        Some(&ListChildKind::FixedAction)
-    );
-    for rule in rules {
-        append_rule(context, &rule);
-    }
-}
-
-fn append_application(context: &ApplicationListContext, rule: &Rule) {
-    let lanes = context
-        .profile
-        .borrow()
-        .lanes
-        .iter()
-        .map(|lane| (lane.id.clone(), lane.name.clone()))
-        .collect::<Vec<_>>();
-    let on_change: Rc<dyn Fn(Rule, RuleEdit)> = {
-        let profile = context.profile.clone();
-        let save = context.save_profile.clone();
-        let routing_active = context.routing_active.clone();
-        Rc::new(move |updated, edit| {
-            let updated_id = updated.id.clone();
-            let changed = {
-                let mut profile = profile.borrow_mut();
-                if let Some(rule) = profile.rules.iter_mut().find(|rule| rule.id == updated.id) {
-                    *rule = updated;
-                    true
-                } else {
-                    false
-                }
-            };
-            if changed {
-                let action = if routing_active.get() {
-                    match edit {
-                        RuleEdit::Enabled(enabled) => {
-                            PostSaveAction::Request(set_rule_enabled_request(
-                                profile.borrow().id.clone(),
-                                updated_id,
-                                enabled,
-                            ))
-                        }
-                        RuleEdit::Definition => {
-                            PostSaveAction::Request(apply_request(&profile.borrow()))
-                        }
-                    }
-                } else {
-                    PostSaveAction::None
-                };
-                save(action);
-            }
-        })
-    };
-    let on_delete: Rc<dyn Fn(RuleId)> = {
-        let profile = context.profile.clone();
-        let save = context.save_profile.clone();
-        let routing_active = context.routing_active.clone();
-        Rc::new(move |id| {
-            profile.borrow_mut().rules.retain(|rule| rule.id != id);
-            let action = if routing_active.get() {
-                PostSaveAction::Request(apply_request(&profile.borrow()))
-            } else {
-                PostSaveAction::None
-            };
-            save(action);
-        })
-    };
-    let on_request: Rc<dyn Fn(DaemonRequest)> = {
-        let sender = context.sender.clone();
-        Rc::new(move |request| {
-            let sender = sender.clone();
-            glib::MainContext::default().spawn_local(async move {
-                sender.send(UiToDaemon::Request(request)).await.ok();
-            });
-        })
-    };
-    let row = create_application_row(
-        rule,
-        ApplicationRowContext {
-            profile_id: context.profile.borrow().id.clone(),
-            lanes,
-            texts: context.texts,
-            parent: context.window.clone(),
-            on_change,
-            on_delete,
-            on_request,
-            routing_active: context.routing_active.get(),
-        },
-    );
-    context.group.add(&row);
-    context.rows.borrow_mut().push(row);
-}
-
-fn rebuild_application_rows(context: &ApplicationListContext) {
-    for row in context.rows.borrow_mut().drain(..) {
-        context.group.remove(&row);
-    }
-    let mut rules = context.profile.borrow().rules.clone();
-    rules.retain(|rule| matches!(rule.source, RuleSource::Application(_)));
-    rules.sort_by(Rule::execution_cmp);
-    debug_assert_eq!(
-        ordered_list_child_kinds(rules.len()).first(),
-        Some(&ListChildKind::FixedAction)
-    );
-    for rule in rules {
-        append_application(context, &rule);
-    }
-}
-
-fn next_rule_priority(profile: &Profile) -> u32 {
-    profile
-        .rules
-        .iter()
-        .map(|rule| rule.priority)
-        .max()
-        .map_or(100, |highest| highest.saturating_add(10))
-}
-
-fn apply_request(profile: &Profile) -> DaemonRequest {
-    let mut candidate = profile.clone();
-    candidate.enabled = true;
-    DaemonRequest::ApplyProfile(candidate)
-}
-
-fn retry_after_recovery(pending: &mut Option<Profile>, retry_used: bool) -> Option<DaemonRequest> {
-    if retry_used {
-        return None;
-    }
-    pending.take().map(|profile| apply_request(&profile))
 }
 
 fn store_profile(document: &mut ConfigV2, current: Profile) {
     if let Some(stored) = document
         .profiles
         .iter_mut()
-        .find(|stored| stored.id == current.id)
+        .find(|profile| profile.id == current.id)
     {
         *stored = current;
     } else {
@@ -1644,583 +59,1589 @@ fn store_profile(document: &mut ConfigV2, current: Profile) {
     }
 }
 
-fn parse_target(value: &str) -> Option<RuleTarget> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if value == "*" {
-        return Some(RuleTarget::Any);
-    }
-    if let Ok(network) = value.parse() {
-        return Some(RuleTarget::Cidr(network));
-    }
-    if let Ok(address) = value.parse() {
-        return Some(RuleTarget::Ip(address));
-    }
-    value
-        .strip_prefix("*.")
-        .map(|_| RuleTarget::WildcardDomain(value.to_owned()))
-        .or_else(|| Some(RuleTarget::Domain(value.to_ascii_lowercase())))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RuleDialogSubmission {
-    Invalid,
-    Valid(RuleTarget),
-}
-
-fn rule_dialog_submission(value: &str) -> RuleDialogSubmission {
-    parse_target(value)
-        .map(RuleDialogSubmission::Valid)
-        .unwrap_or(RuleDialogSubmission::Invalid)
-}
-
-fn rule_dialog_restores_target_focus(submission: &RuleDialogSubmission) -> bool {
-    matches!(submission, RuleDialogSubmission::Invalid)
-}
-
-fn show_copyable_error_toast(
-    toast_overlay: &adw::ToastOverlay,
-    texts: crate::ui::i18n::Texts,
-    message: &str,
+fn reconcile_profiles(
+    document: &mut ConfigV2,
+    selected: &mut Profile,
+    canonical: Vec<Profile>,
+    replace_selected: bool,
 ) {
-    let toast = adw::Toast::builder()
-        .title(message)
-        .button_label(texts.copy_error)
-        .action_name("win.copy-error")
-        .action_target(&message.to_variant())
-        .timeout(0)
-        .build();
-    toast_overlay.add_toast(&toast);
+    for profile in canonical {
+        if profile.id == selected.id && !replace_selected {
+            continue;
+        }
+        if profile.id == selected.id {
+            *selected = profile.clone();
+        }
+        store_profile(document, profile);
+    }
+    document.profiles.sort_by(|a, b| a.id.cmp(&b.id));
 }
 
-fn render_health(container: &gtk::Box, view: &ConnectionHealthView, texts: crate::ui::i18n::Texts) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
+struct WindowUi {
+    window: glib::WeakRef<adw::ApplicationWindow>,
+    texts: Texts,
+    document: Rc<RefCell<ConfigV2>>,
+    profile: Rc<RefCell<Profile>>,
+    controller: Rc<UiController>,
+    shell: Shell,
+    overview: Overview,
+    rules: ListPage,
+    applications: ListPage,
+    connections: ConnectionsPage,
+    catalog: RefCell<DesktopCatalog>,
+    rendered: RefCell<Option<Profile>>,
+    rule_rows: RefCell<BTreeMap<RuleId, CompactRuleRow>>,
+    app_rows: RefCell<BTreeMap<RuleId, CompactApplicationRow>>,
+    settings: RefCell<Option<adw::PreferencesWindow>>,
+    toast: adw::ToastOverlay,
+    last_notice: RefCell<Option<String>>,
+    recovery_dialog_open: Cell<bool>,
+    quick_application: gtk::Button,
+    preferences: gtk::Button,
+}
+
+impl WindowUi {
+    fn save_profile(
+        self: &Rc<Self>,
+        candidate: Profile,
+        enabled_change: Option<(RuleId, bool)>,
+    ) -> bool {
+        if let Err(error) = routelane::domain::validate_profile(&candidate) {
+            log::warn!("invalid UI candidate: {error:?}");
+            return false;
+        }
+        let mut document = self.document.borrow().clone();
+        store_profile(&mut document, candidate.clone());
+        let session = self.controller.session();
+        let active_here = session
+            .confirmed_status()
+            .is_some_and(|s| s.applied_profile_id.as_ref() == Some(&candidate.id));
+        let aligned = !session.needs_reapply(&self.profile.borrow());
+        drop(session);
+        let follow_up = if active_here {
+            if let Some((id, enabled)) = enabled_change.filter(|_| aligned) {
+                AfterSave::Request(set_rule_enabled_request(candidate.id.clone(), id, enabled))
+            } else {
+                let mut request_profile = candidate.clone();
+                request_profile.enabled = true;
+                AfterSave::Request(DaemonRequest::ApplyProfile(request_profile))
+            }
+        } else {
+            AfterSave::None
+        };
+        if !self
+            .controller
+            .save(document.clone(), candidate.clone(), follow_up)
+        {
+            return false;
+        }
+        *self.document.borrow_mut() = document;
+        *self.profile.borrow_mut() = candidate;
+        self.render();
+        true
     }
-    container.append(
-        &gtk::Label::builder()
-            .label(&view.aggregate)
-            .xalign(0.0)
-            .build(),
-    );
-    if let Some(last) = &view.apply_generation {
-        container.append(
-            &gtk::Label::builder()
-                .label(&format!("{}: {}", texts.apply_generation, last))
-                .xalign(0.0)
-                .build(),
+
+    fn apply(self: &Rc<Self>) {
+        let candidate = self.profile.borrow().clone();
+        let mut request_profile = candidate.clone();
+        request_profile.enabled = true;
+        let mut document = self.document.borrow().clone();
+        store_profile(&mut document, candidate.clone());
+        self.controller.save(
+            document,
+            candidate,
+            AfterSave::Request(DaemonRequest::ApplyProfile(request_profile)),
         );
     }
-    for (lane, state) in &view.lanes {
-        container.append(
-            &gtk::Label::builder()
-                .label(&format!("{lane}: {state}"))
-                .xalign(0.0)
-                .build(),
+
+    fn save_rule(self: &Rc<Self>, rule: Rule) -> bool {
+        let mut candidate = self.profile.borrow().clone();
+        if let Some(existing) = candidate
+            .rules
+            .iter_mut()
+            .find(|existing| existing.id == rule.id)
+        {
+            *existing = rule;
+        } else {
+            candidate.rules.push(rule);
+        }
+        self.save_profile(candidate, None)
+    }
+
+    fn toggle(self: &Rc<Self>, id: RuleId, enabled: bool) {
+        let mut candidate = self.profile.borrow().clone();
+        let Some(rule) = candidate.rules.iter_mut().find(|rule| rule.id == id) else {
+            return;
+        };
+        if rule.enabled == enabled {
+            return;
+        }
+        rule.enabled = enabled;
+        if !self.save_profile(candidate, Some((id, enabled))) {
+            self.rendered.borrow_mut().take();
+            self.render();
+        }
+    }
+
+    fn open_rule(self: &Rc<Self>, editing: Option<RuleId>) {
+        if !self.editable() {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        open_rule_editor(
+            &window,
+            self.texts,
+            self.profile.clone(),
+            editing,
+            Rc::new(move |rule| weak.upgrade().is_some_and(|ui| ui.save_rule(rule))),
         );
     }
-    for diagnostic in &view.diagnostics {
-        let summary = diagnostic
-            .action
-            .as_ref()
-            .map(|action| format!("{} — {}", diagnostic.summary, action))
-            .unwrap_or_else(|| diagnostic.summary.clone());
-        container.append(
-            &gtk::Label::builder()
-                .label(&summary)
-                .xalign(0.0)
-                .wrap(true)
-                .build(),
+
+    fn open_application(self: &Rc<Self>, editing: Option<RuleId>) {
+        if !self.editable() {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        open_application_editor(
+            &window,
+            self.texts,
+            self.profile.clone(),
+            editing,
+            Rc::new(move |rule| weak.upgrade().is_some_and(|ui| ui.save_rule(rule))),
         );
-        let expander = gtk::Expander::builder()
-            .label(texts.technical_details)
-            .child(
-                &gtk::Label::builder()
-                    .label(&diagnostic.technical_detail)
-                    .xalign(0.0)
-                    .selectable(true)
-                    .wrap(true)
-                    .build(),
+    }
+
+    fn editable(&self) -> bool {
+        let session = self.controller.session();
+        session.config_writable() && session.snapshot_known() && !session.is_busy()
+    }
+
+    fn delete(self: &Rc<Self>, id: RuleId) {
+        if !self.editable() {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let current = self
+            .profile
+            .borrow()
+            .rules
+            .iter()
+            .find(|rule| rule.id == id)
+            .cloned();
+        let Some(rule) = current else {
+            return;
+        };
+        let title = match &rule.source {
+            RuleSource::Application(selector) => {
+                application_display_name(selector, &self.catalog.borrow())
+            }
+            _ => target_text(&rule.target),
+        };
+        let weak = Rc::downgrade(self);
+        confirm_destructive_action(
+            &window,
+            self.texts,
+            self.texts.confirm_delete_rule_heading,
+            &title,
+            Rc::new(move || {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                let mut candidate = ui.profile.borrow().clone();
+                if !candidate.rules.iter().any(|rule| rule.id == id) {
+                    return;
+                }
+                candidate.rules.retain(|rule| rule.id != id);
+                ui.save_profile(candidate, None);
+            }),
+        );
+    }
+
+    fn move_rule(self: &Rc<Self>, id: RuleId, direction: ReorderDirection) {
+        if !self.editable() {
+            return;
+        }
+        let mut candidate = self.profile.borrow().clone();
+        if move_rule(&mut candidate, &id, direction) {
+            self.save_profile(candidate, None);
+        }
+    }
+
+    fn application_action(self: &Rc<Self>, id: RuleId, action: ApplicationAction) {
+        let profile = self.profile.borrow().clone();
+        let Some(rule) = profile.rules.iter().find(|rule| rule.id == id) else {
+            return;
+        };
+        if !self
+            .controller
+            .session()
+            .application_actions_enabled(&profile, rule)
+        {
+            return;
+        }
+        let request = application_action_request(profile.id.clone(), id, action);
+        if action == ApplicationAction::Launch {
+            self.controller.request(request, Some(profile));
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        confirm_destructive_action_with_label(
+            &window,
+            self.texts,
+            self.texts.ux.adopt_confirm,
+            self.texts.ux.scope_warning,
+            self.texts.ux.adopt_confirm,
+            Rc::new(move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.controller
+                        .request(request.clone(), Some(ui.profile.borrow().clone()));
+                }
+            }),
+            Rc::new(|| {}),
+        );
+    }
+
+    fn menu(self: &Rc<Self>, rule: &Rule, index: usize, total: usize) -> Vec<MenuAction> {
+        let mut actions: Vec<MenuAction> = vec![];
+        let weak = Rc::downgrade(self);
+        let id = rule.id.clone();
+        let app = matches!(rule.source, RuleSource::Application(_));
+        actions.push((
+            self.texts.ux.edit,
+            true,
+            Rc::new(move || {
+                if let Some(ui) = weak.upgrade() {
+                    if app {
+                        ui.open_application(Some(id.clone()));
+                    } else {
+                        ui.open_rule(Some(id.clone()));
+                    }
+                }
+            }),
+        ));
+        if app {
+            let weak = Rc::downgrade(self);
+            let id = rule.id.clone();
+            let eligible = self
+                .controller
+                .session()
+                .application_actions_enabled(&self.profile.borrow(), rule);
+            actions.push((
+                self.texts.ux.adopt_confirm,
+                eligible,
+                Rc::new(move || {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.application_action(id.clone(), ApplicationAction::AdoptRunningProcesses);
+                    }
+                }),
+            ));
+        } else {
+            for (label, direction, allowed) in [
+                (self.texts.move_rule_up, ReorderDirection::Up, index > 0),
+                (
+                    self.texts.move_rule_down,
+                    ReorderDirection::Down,
+                    index + 1 < total,
+                ),
+            ] {
+                let weak = Rc::downgrade(self);
+                let id = rule.id.clone();
+                actions.push((
+                    label,
+                    allowed,
+                    Rc::new(move || {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.move_rule(id.clone(), direction);
+                        }
+                    }),
+                ));
+            }
+        }
+        let weak = Rc::downgrade(self);
+        let id = rule.id.clone();
+        actions.push((
+            self.texts.delete,
+            true,
+            Rc::new(move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.delete(id.clone());
+                }
+            }),
+        ));
+        actions
+    }
+
+    fn rebuild_rows(self: &Rc<Self>, profile: &Profile) {
+        for row in self.rule_rows.borrow_mut().values() {
+            self.rules.group.remove(&row.row);
+        }
+        for row in self.app_rows.borrow_mut().values() {
+            self.applications.group.remove(&row.row);
+        }
+        self.rule_rows.borrow_mut().clear();
+        self.app_rows.borrow_mut().clear();
+        let mut ordered = profile.rules.clone();
+        ordered.sort_by(Rule::execution_cmp);
+        for (index, rule) in ordered.iter().enumerate() {
+            let weak = Rc::downgrade(self);
+            let on_toggle: Rc<dyn Fn(RuleId, bool)> = Rc::new(move |id, enabled| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.toggle(id, enabled);
+                }
+            });
+            let actions = self.menu(rule, index, ordered.len());
+            let subtitle = action_text(&rule.action, &profile.lanes, self.texts);
+            match &rule.source {
+                RuleSource::Any => {
+                    let row = create_compact_rule_row(
+                        rule,
+                        &target_text(&rule.target),
+                        &subtitle,
+                        self.texts,
+                        on_toggle,
+                        actions,
+                    );
+                    self.rules.group.add(&row.row);
+                    self.rule_rows.borrow_mut().insert(rule.id.clone(), row);
+                }
+                RuleSource::Application(selector) => {
+                    let title = application_display_name(selector, &self.catalog.borrow());
+                    let catalog = self.catalog.borrow();
+                    let icon = catalog
+                        .find(selector)
+                        .and_then(|choice| choice.icon_name.as_deref())
+                        .unwrap_or("application-x-executable-symbolic");
+                    let weak = Rc::downgrade(self);
+                    let id = rule.id.clone();
+                    let row = create_compact_application_row(
+                        rule,
+                        (&title, icon),
+                        &subtitle,
+                        self.texts,
+                        on_toggle,
+                        Rc::new(move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.application_action(id.clone(), ApplicationAction::Launch);
+                            }
+                        }),
+                        actions,
+                    );
+                    if let RuleAction::Route(lane) = &rule.action {
+                        let lanes = profile
+                            .lanes
+                            .iter()
+                            .map(|lane| (lane.id.clone(), lane.name.clone()))
+                            .collect::<Vec<_>>();
+                        row.row.set_tooltip_text(Some(
+                            &crate::ui::application_row::application_subtitle(
+                                lane,
+                                &lanes,
+                                self.texts.application_scope_prefix,
+                                self.texts.application_scope_suffix,
+                            ),
+                        ));
+                    }
+                    self.applications.group.add(&row.row);
+                    self.app_rows.borrow_mut().insert(rule.id.clone(), row);
+                }
+            }
+        }
+    }
+
+    fn filter(&self) {
+        let profile = self.profile.borrow();
+        let query = self.rules.search.text();
+        let mut visible = 0;
+        for rule in &profile.rules {
+            if let Some(row) = self.rule_rows.borrow().get(&rule.id) {
+                let matches = rule_matches_query(rule, &profile.lanes, &query);
+                row.row.set_visible(matches);
+                if matches {
+                    visible += 1;
+                }
+            }
+        }
+        self.rules
+            .set_empty(self.rule_rows.borrow().is_empty(), visible == 0);
+        let query = self.applications.search.text().to_lowercase();
+        let mut visible = 0;
+        for rule in &profile.rules {
+            if let Some(row) = self.app_rows.borrow().get(&rule.id) {
+                let name = match &rule.source {
+                    RuleSource::Application(selector) => {
+                        application_display_name(selector, &self.catalog.borrow())
+                    }
+                    _ => String::new(),
+                };
+                let matches = name.to_lowercase().contains(query.trim())
+                    || action_text(&rule.action, &profile.lanes, self.texts)
+                        .to_lowercase()
+                        .contains(query.trim());
+                row.row.set_visible(matches);
+                if matches {
+                    visible += 1;
+                }
+            }
+        }
+        self.applications
+            .set_empty(self.app_rows.borrow().is_empty(), visible == 0);
+    }
+
+    fn render(self: &Rc<Self>) {
+        let profile = self.profile.borrow().clone();
+        let rebuild = self.rendered.borrow().as_ref() != Some(&profile);
+        let view = rebuild.then(|| {
+            (
+                self.rules.remember_view(),
+                self.applications.remember_view(),
             )
-            .build();
-        container.append(&expander);
+        });
+        if rebuild {
+            self.rebuild_rows(&profile);
+            *self.rendered.borrow_mut() = Some(profile.clone());
+        }
+        let session = self.controller.session();
+        let state = dashboard_state(&profile, &session);
+        let (title, detail) = status_copy(&session, self.texts);
+        self.shell.status_row.set_title(title);
+        self.shell.status_row.set_subtitle(detail);
+        self.shell.primary.set_label(match state.primary_action {
+            PrimaryAction::OpenConnections => self.texts.ux.add_connection,
+            PrimaryAction::OpenRuleDialog => self.texts.add_rule,
+            PrimaryAction::ReviewDefinitions => self.texts.ux.review_definitions,
+            PrimaryAction::RefreshStatus => self.texts.ux.refresh,
+            PrimaryAction::EnableRouting => self.texts.enable_routing,
+            PrimaryAction::DisableRouting => self.texts.disable_routing,
+        });
+        self.shell
+            .primary
+            .set_sensitive(state.primary_action_enabled);
+        let editable = session.config_writable() && session.snapshot_known() && !session.is_busy();
+        self.preferences
+            .set_sensitive(session.config_writable() && !session.is_busy());
+        self.rules.add.set_sensitive(editable);
+        self.rules.group.set_sensitive(editable);
+        self.applications.add.set_sensitive(editable);
+        for rule in &profile.rules {
+            if let Some(row) = self.app_rows.borrow().get(&rule.id) {
+                row.enabled.set_sensitive(editable);
+                row.menu.set_sensitive(editable);
+                let supported = match &rule.source {
+                    RuleSource::Application(selector) => self
+                        .catalog
+                        .borrow()
+                        .find(selector)
+                        .is_none_or(|choice| choice.unsupported_reason.is_none()),
+                    _ => false,
+                };
+                let eligible = supported && session.application_actions_enabled(&profile, rule);
+                if let Some(adopt) =
+                    crate::ui::form::menu_action(&row.menu, self.texts.ux.adopt_confirm)
+                {
+                    adopt.set_sensitive(eligible);
+                }
+                row.launch.set_sensitive(eligible);
+                row.launch
+                    .set_tooltip_text((!eligible).then_some(self.texts.ux.app_needs_apply));
+                let lane_healthy = match &rule.action {
+                    RuleAction::Route(id) => session
+                        .confirmed_status()
+                        .and_then(|s| s.health.lanes.get(id))
+                        .is_some_and(|health| *health == HealthState::Healthy),
+                    _ => false,
+                };
+                row.launch.set_label(if lane_healthy {
+                    self.texts.ux.launch
+                } else {
+                    self.texts.ux.launch_neutral
+                });
+                row.row.set_sensitive(!session.is_busy());
+            }
+        }
+        self.quick_application.set_visible(
+            !profile.lanes.is_empty()
+                && !profile
+                    .rules
+                    .iter()
+                    .any(|rule| matches!(rule.source, RuleSource::Application(_))),
+        );
+        self.quick_application.set_sensitive(editable);
+        self.overview.update(&profile, &session);
+        self.connections.update(editable);
+        drop(session);
+        self.filter();
+        if let Some((rules, apps)) = view {
+            self.rules.restore_view(&rules);
+            self.applications.restore_view(&apps);
+        }
+        let completed = self.controller.last_completed_id();
+        if completed.is_some() && *self.last_notice.borrow() != completed {
+            *self.last_notice.borrow_mut() = completed;
+            let session = self.controller.session();
+            let message = match session.last_result() {
+                Some(DaemonResult::ApplicationLaunched(result)) => {
+                    Some(format!("{} · PID {}", self.texts.ux.starting, result.pid))
+                }
+                Some(DaemonResult::ApplicationProcessesAdopted(result)) => Some(format!(
+                    "{}: {} · {}: {}",
+                    self.texts.ux.adopting,
+                    result.adopted_count,
+                    self.texts.ux.disabled,
+                    result.skipped_count
+                )),
+                _ => None,
+            };
+            if let Some(message) = message {
+                self.toast.add_toast(&adw::Toast::new(&message));
+            }
+        }
+        self.ask_recovery();
+    }
+
+    fn ask_recovery(self: &Rc<Self>) {
+        if !self.controller.recovery_available() || self.recovery_dialog_open.replace(true) {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            self.recovery_dialog_open.set(false);
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        let cancel = Rc::downgrade(self);
+        confirm_destructive_action_with_label(
+            &window,
+            self.texts,
+            self.texts.orphan_recovery_heading,
+            self.texts.orphan_recovery_body,
+            self.texts.recover_and_retry,
+            Rc::new(move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.controller.confirm_recovery();
+                    ui.recovery_dialog_open.set(false);
+                }
+            }),
+            Rc::new(move || {
+                if let Some(ui) = cancel.upgrade() {
+                    ui.controller.cancel_recovery();
+                    ui.recovery_dialog_open.set(false);
+                }
+            }),
+        );
+    }
+
+    fn receive(self: &Rc<Self>, message: DaemonToUi) {
+        let snapshot = matches!(message, DaemonToUi::Snapshot { .. });
+        self.controller.receive(message);
+        if snapshot && self.controller.session().snapshot_known() {
+            let session = self.controller.session();
+            let canonical = session.daemon_profiles().to_vec();
+            let replace_selected = session.save_state() == SaveState::Clean && !session.is_busy();
+            drop(session);
+            reconcile_profiles(
+                &mut self.document.borrow_mut(),
+                &mut self.profile.borrow_mut(),
+                canonical,
+                replace_selected,
+            );
+        }
+        self.render();
+    }
+
+    fn open_settings(self: &Rc<Self>) {
+        if let Some(dialog) = self.settings.borrow().as_ref() {
+            dialog.present();
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        let language = self.document.borrow().language;
+        let dialog = build_general_settings_dialog(
+            &window,
+            self.texts,
+            language,
+            Rc::new(move |language| {
+                if let Some(ui) = weak.upgrade() {
+                    let mut document = ui.document.borrow().clone();
+                    document.language = language;
+                    if ui.controller.save(
+                        document.clone(),
+                        ui.profile.borrow().clone(),
+                        AfterSave::QuitApplication,
+                    ) {
+                        *ui.document.borrow_mut() = document;
+                    }
+                }
+            }),
+        );
+        *self.settings.borrow_mut() = Some(dialog.clone());
+        dialog.present();
     }
 }
 
-fn empty_default_profile() -> Profile {
-    Profile {
-        id: ProfileId::from("default"),
-        name: "Default".to_owned(),
-        enabled: false,
-        lanes: Vec::new(),
-        rules: Vec::new(),
-    }
+pub fn build_window(
+    app: &adw::Application,
+    sender: Sender<UiToDaemon>,
+    receiver: Receiver<DaemonToUi>,
+) -> adw::ApplicationWindow {
+    build_window_with_repository(app, sender, receiver, ConfigRepository::user_default())
 }
 
-#[allow(dead_code)]
-fn refreshed_interface_selection(previous_name: Option<&str>, names: &[String]) -> Option<usize> {
-    let previous_name = previous_name?;
-    names.iter().position(|name| name == previous_name)
+fn build_window_with_repository(
+    app: &adw::Application,
+    sender: Sender<UiToDaemon>,
+    receiver: Receiver<DaemonToUi>,
+    repository: ConfigRepository,
+) -> adw::ApplicationWindow {
+    let (mut document, load_error) = match repository.load() {
+        Ok(document) => (document, None),
+        Err(error) => (ConfigV2::default(), Some(error.to_string())),
+    };
+    if document.profiles.is_empty() {
+        document.profiles.push(empty_default_profile());
+    }
+    let language = document.language;
+    let texts = language.texts();
+    let profile = Rc::new(RefCell::new(document.profiles[0].clone()));
+    let mut session = UiSession::new(profile.borrow().clone(), load_error.is_none());
+    if let Some(error) = &load_error {
+        session.configuration_failed(error.clone());
+    }
+    let controller = UiController::new(
+        session,
+        sender,
+        load_error
+            .is_none()
+            .then(|| PersistenceWorker::spawn(repository)),
+    );
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("RouteLane")
+        .default_width(900)
+        .default_height(720)
+        .build();
+    gtk::Window::set_default_icon_name(APP_ICON_NAME);
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&adw::WindowTitle::new("RouteLane", "")));
+    let preferences = gtk::Button::builder()
+        .icon_name("preferences-system-symbolic")
+        .tooltip_text(texts.settings_title)
+        .build();
+    preferences.set_widget_name("preferences");
+    preferences.update_property(&[gtk::accessible::Property::Label(texts.settings_title)]);
+    header.pack_end(&preferences);
+    let shell = Shell::new(texts);
+    let overview = Overview::new(texts);
+    let rules = ListPage::new(texts, Section::Rules);
+    let applications = ListPage::new(texts, Section::Applications);
+    let weak_slot = Rc::new(RefCell::new(Weak::<WindowUi>::new()));
+    let save_slot = weak_slot.clone();
+    let connections = ConnectionsPage::new(
+        &window,
+        texts,
+        profile.clone(),
+        Rc::new(move |candidate| {
+            save_slot
+                .borrow()
+                .upgrade()
+                .is_some_and(|ui| ui.save_profile(candidate, None))
+        }),
+    );
+    shell.add_page(Section::Overview, &overview.root);
+    shell.add_page(Section::Rules, &rules.root);
+    shell.add_page(Section::Applications, &applications.root);
+    shell.add_page(Section::Connections, &connections.list.root);
+    let quick_application = gtk::Button::with_label(texts.add_application);
+    quick_application.set_halign(gtk::Align::Start);
+    overview.root.prepend(&quick_application);
+    let toast = adw::ToastOverlay::new();
+    toast.set_child(Some(&shell.root));
+    toast.set_vexpand(true);
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    body.append(&header);
+    body.append(&toast);
+    window.set_content(Some(&body));
+    let ui = Rc::new(WindowUi {
+        window: window.downgrade(),
+        texts,
+        document: Rc::new(RefCell::new(document)),
+        profile,
+        controller: controller.clone(),
+        shell,
+        overview,
+        rules,
+        applications,
+        connections,
+        catalog: RefCell::new(DesktopCatalog::default()),
+        rendered: RefCell::new(None),
+        rule_rows: RefCell::new(BTreeMap::new()),
+        app_rows: RefCell::new(BTreeMap::new()),
+        settings: RefCell::new(None),
+        toast,
+        last_notice: RefCell::new(None),
+        recovery_dialog_open: Cell::new(false),
+        quick_application,
+        preferences,
+    });
+    *weak_slot.borrow_mut() = Rc::downgrade(&ui);
+    let weak = Rc::downgrade(&ui);
+    controller.connect_changed(Rc::new(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.render();
+        }
+    }));
+    let app_quit = app.clone();
+    controller.connect_quit(Rc::new(move || app_quit.quit()));
+    let weak = Rc::downgrade(&ui);
+    ui.shell.primary.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            let state = dashboard_state(&ui.profile.borrow(), &ui.controller.session());
+            if !state.primary_action_enabled {
+                return;
+            }
+            match state.primary_action {
+                PrimaryAction::OpenConnections => {
+                    ui.shell.select(Section::Connections);
+                    ui.connections.open_add();
+                }
+                PrimaryAction::OpenRuleDialog => {
+                    ui.shell.select(Section::Rules);
+                    ui.open_rule(None);
+                }
+                PrimaryAction::ReviewDefinitions => {
+                    ui.shell.select(
+                        if ui
+                            .profile
+                            .borrow()
+                            .rules
+                            .iter()
+                            .any(|rule| matches!(rule.source, RuleSource::Any))
+                        {
+                            Section::Rules
+                        } else {
+                            Section::Applications
+                        },
+                    );
+                }
+                PrimaryAction::RefreshStatus => ui.controller.refresh(),
+                PrimaryAction::EnableRouting => ui.apply(),
+                PrimaryAction::DisableRouting => {
+                    ui.controller.request(DaemonRequest::Deactivate, None);
+                }
+            }
+        }
+    });
+    for (button, section) in [
+        (ui.rules.add.clone(), Section::Rules),
+        (ui.applications.add.clone(), Section::Applications),
+        (ui.quick_application.clone(), Section::Applications),
+    ] {
+        let weak = Rc::downgrade(&ui);
+        button.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                if section == Section::Rules {
+                    ui.open_rule(None);
+                } else {
+                    ui.open_application(None);
+                }
+            }
+        });
+    }
+    let weak = Rc::downgrade(&ui);
+    ui.preferences.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.open_settings();
+        }
+    });
+    let weak = Rc::downgrade(&ui);
+    ui.overview.reapply.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.apply();
+        }
+    });
+    let weak = Rc::downgrade(&ui);
+    ui.overview.refresh.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.controller.refresh();
+        }
+    });
+    for search in [&ui.rules.search, &ui.applications.search] {
+        let weak = Rc::downgrade(&ui);
+        search.connect_search_changed(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.filter();
+            }
+        });
+    }
+    let search = gtk::gio::SimpleAction::new("search", None);
+    let weak = Rc::downgrade(&ui);
+    search.connect_activate(move |_, _| {
+        if let Some(ui) = weak.upgrade() {
+            match ui.shell.section() {
+                Section::Applications => {
+                    ui.applications.search.grab_focus();
+                }
+                _ => {
+                    ui.shell.select(Section::Rules);
+                    ui.rules.search.grab_focus();
+                }
+            }
+        }
+    });
+    window.add_action(&search);
+    app.set_accels_for_action("win.search", &["<Primary>f"]);
+    let add = gtk::gio::SimpleAction::new("new", None);
+    let weak = Rc::downgrade(&ui);
+    add.connect_activate(move |_, _| {
+        if let Some(ui) = weak.upgrade() {
+            if !ui.editable() {
+                return;
+            }
+            match ui.shell.section() {
+                Section::Connections => ui.connections.open_add(),
+                Section::Applications => ui.open_application(None),
+                _ => ui.open_rule(None),
+            }
+        }
+    });
+    window.add_action(&add);
+    app.set_accels_for_action("win.new", &["<Primary>n"]);
+    let weak = Rc::downgrade(&ui);
+    load_catalog(move |result| {
+        if let Some(ui) = weak.upgrade() {
+            match result {
+                Ok(catalog) => {
+                    *ui.catalog.borrow_mut() = catalog;
+                    ui.rendered.borrow_mut().take();
+                    ui.render();
+                }
+                Err(error) => log::warn!("desktop catalog: {error}"),
+            }
+        }
+    });
+    ui.render();
+    let live_ui = ui.clone();
+    let source = glib::MainContext::ref_thread_default().spawn_local(async move {
+        while let Ok(message) = receiver.recv().await {
+            live_ui.receive(message);
+        }
+    });
+    let source = Rc::new(RefCell::new(Some(source)));
+    window.connect_destroy(move |_| {
+        if let Some(source) = source.borrow_mut().take() {
+            source.remove();
+        }
+    });
+    let (tray_sender, tray_receiver) =
+        glib::MainContext::channel::<TrayCommand>(glib::PRIORITY_DEFAULT);
+    let tray_available = spawn_tray(tray_sender, Arc::new(Mutex::new(language)));
+    let weak_window = window.downgrade();
+    let app_quit = app.clone();
+    tray_receiver.attach(None, move |command| {
+        match command {
+            TrayCommand::ShowWindow => {
+                if let Some(window) = weak_window.upgrade() {
+                    window.present();
+                }
+            }
+            TrayCommand::Quit => app_quit.quit(),
+        };
+        glib::Continue(true)
+    });
+    window.connect_close_request(move |window| {
+        if tray_available.load(Ordering::Relaxed) {
+            window.hide();
+            glib::signal::Inhibit(true)
+        } else {
+            glib::signal::Inhibit(false)
+        }
+    });
+    window.present();
+    window
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        accept_connection_epoch, accept_daemon_event_revision, accept_daemon_status_revision,
-        configuration_error_view, daemon_unavailable_view, dashboard_copy,
-        health_after_apply_request, health_sections, health_view, list_child_order,
-        ordered_list_child_kinds, reconcile_profiles, refreshed_interface_selection,
-        retry_after_recovery, rule_dialog_restores_target_focus, rule_dialog_submission,
-        status_is_active, switch_state_after_persistence_failure, ListChildKind,
-        RuleDialogSubmission,
-    };
-    use crate::ui::experience::{AuthorizationPresentation, DashboardState, PrimaryAction};
-    use crate::ui::i18n::LanguageTexts;
-    use routelane::config::ConfigV2;
-    use routelane::domain::{
-        HealthState, LaneId, ProfileId, Rule, RuleAction, RuleId, RuleSource, RuleTarget,
-    };
-    use routelane::health::{
-        Diagnostic, DiagnosticCode, DiagnosticSubject, HealthReport, LaneHealth, Severity,
-        SuggestedAction,
-    };
-    use routelane::ipc::{DaemonRequest, DaemonStatus};
+    use super::*;
+    use routelane::health::HealthReport;
+    use routelane::ipc::DaemonStatus;
 
-    #[test]
-    fn list_action_is_ordered_before_empty_or_populated_dynamic_rows() {
-        assert!(
-            list_child_order(ListChildKind::FixedAction)
-                < list_child_order(ListChildKind::DynamicRow)
-        );
+    fn find_named(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+        if widget.widget_name().as_str() == name {
+            return Some(widget.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = find_named(&current, name) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+    fn find_button(widget: &gtk::Widget, label: &str) -> Option<gtk::Button> {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            if button.label().as_deref() == Some(label) {
+                return Some(button.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = find_button(&current, label) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+    fn drain() {
+        let context = glib::MainContext::default();
+        for _ in 0..100 {
+            if !context.pending() {
+                break;
+            }
+            context.iteration(false);
+        }
     }
 
-    #[test]
-    fn rebuilding_a_list_keeps_exactly_one_action_before_dynamic_rows() {
-        assert_eq!(
-            ordered_list_child_kinds(0),
-            vec![ListChildKind::FixedAction]
-        );
-        assert_eq!(
-            ordered_list_child_kinds(2),
-            vec![
-                ListChildKind::FixedAction,
-                ListChildKind::DynamicRow,
-                ListChildKind::DynamicRow,
+    fn wait_for(mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GTK callback timed out"
+            );
+            drain();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drain();
+    }
+    fn transient(parent: &impl IsA<gtk::Window>) -> gtk::Window {
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.is_visible() && w.transient_for().as_ref() == Some(parent.as_ref()))
+            .expect("visible modal")
+    }
+    fn escape(window: &gtk::Window) {
+        let controllers = window.observe_controllers();
+        let key = (0..controllers.n_items())
+            .filter_map(|i| {
+                controllers
+                    .item(i)
+                    .and_then(|c| c.downcast::<gtk::EventControllerKey>().ok())
+            })
+            .next()
+            .unwrap();
+        assert!(key.emit_by_name::<bool>(
+            "key-pressed",
+            &[
+                &gtk::gdk::Key::Escape,
+                &0u32,
+                &gtk::gdk::ModifierType::empty()
             ]
-        );
-    }
-
-    #[test]
-    fn successful_recovery_consumes_the_pending_profile_for_one_retry() {
-        let profile = super::empty_default_profile();
-        let mut pending = Some(profile.clone());
-
-        assert_eq!(
-            retry_after_recovery(&mut pending, false),
-            Some(DaemonRequest::ApplyProfile({
-                let mut enabled = profile;
-                enabled.enabled = true;
-                enabled
-            }))
-        );
-        assert!(pending.is_none());
-        assert!(retry_after_recovery(&mut pending, true).is_none());
-    }
-
-    #[test]
-    fn clears_selection_when_previous_interface_disappears() {
-        let names = ["wlan0".to_owned(), "tun0".to_owned()];
-        assert_eq!(refreshed_interface_selection(Some("old-vpn"), &names), None);
-    }
-
-    #[test]
-    fn rule_dialog_requires_a_nonempty_target() {
-        assert_eq!(rule_dialog_submission("   "), RuleDialogSubmission::Invalid);
-    }
-
-    #[test]
-    fn invalid_rule_target_restores_focus_to_the_target_field() {
-        assert!(rule_dialog_restores_target_focus(
-            &RuleDialogSubmission::Invalid
         ));
+        drain();
     }
 
     #[test]
-    fn rule_dialog_accepts_a_domain_target() {
-        assert_eq!(
-            rule_dialog_submission("Example.COM"),
-            RuleDialogSubmission::Valid(RuleTarget::Domain("example.com".to_owned()))
+    #[ignore = "requires display; run bash scripts/run-gtk-smoke.sh"]
+    fn gtk_smoke_window_survives_profile_refresh_and_add_dialogs() {
+        adw::init().unwrap();
+        crate::ui::shell::tests::assert_four_sections();
+        let temp = tempfile::TempDir::new().unwrap();
+        let app = adw::Application::builder()
+            .application_id("io.github.routelane.SmokeTest")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let (sender, requests) = async_channel::unbounded();
+        let (events, receiver) = async_channel::unbounded();
+        let window = build_window_with_repository(
+            &app,
+            sender,
+            receiver,
+            ConfigRepository::new(temp.path().join("config.json")),
         );
-    }
-
-    #[test]
-    fn next_rule_priority_defaults_to_one_hundred_for_an_empty_profile() {
-        assert_eq!(
-            super::next_rule_priority(&super::empty_default_profile()),
-            100
+        let canceled = Rc::new(Cell::new(0));
+        let confirmed = Rc::new(Cell::new(0));
+        let c = canceled.clone();
+        let ok = confirmed.clone();
+        let texts = routelane::config::Language::Tr.texts();
+        confirm_destructive_action_with_label(
+            &window,
+            texts,
+            "Confirmation test",
+            "Cancel must be safe",
+            texts.confirm,
+            Rc::new(move || ok.set(ok.get() + 1)),
+            Rc::new(move || c.set(c.get() + 1)),
         );
-    }
-
-    #[test]
-    fn next_rule_priority_is_ten_above_the_current_highest() {
-        let mut profile = super::empty_default_profile();
-        profile.rules.push(Rule {
-            id: RuleId::from("a"),
+        drain();
+        let confirmation = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Confirmation test"))
+            .unwrap();
+        assert_eq!(
+            confirmation
+                .default_widget()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap()
+                .label()
+                .as_deref(),
+            Some(texts.cancel)
+        );
+        confirmation.close();
+        drain();
+        assert_eq!(
+            canceled.get(),
+            1,
+            "window close must cancel recovery rather than leave it pending"
+        );
+        assert_eq!(confirmed.get(), 0);
+        assert!(find_named(window.upcast_ref(), "routing-primary").is_some());
+        assert_eq!(window.default_width(), 900);
+        assert_eq!(window.default_height(), 720);
+        events
+            .try_send(DaemonToUi::ConnectionEstablished { epoch: 1 })
+            .unwrap();
+        events
+            .try_send(DaemonToUi::Snapshot {
+                epoch: 1,
+                status: DaemonStatus {
+                    generation: 0,
+                    event_sequence: 0,
+                    health: HealthReport::inactive(),
+                    desired_profile_id: None,
+                    applied_profile_id: None,
+                    last_error: None,
+                },
+                profiles: vec![],
+            })
+            .unwrap();
+        drain();
+        for (section, label) in [
+            ("rules", "Kural ekle"),
+            ("applications", "Uygulama ekle"),
+            ("connections", "Bağlantı Ekle"),
+        ] {
+            let nav = find_named(window.upcast_ref(), section)
+                .unwrap()
+                .downcast::<gtk::ToggleButton>()
+                .unwrap();
+            nav.emit_clicked();
+            drain();
+            let stack = find_named(window.upcast_ref(), "sections")
+                .unwrap()
+                .downcast::<gtk::Stack>()
+                .unwrap();
+            let button = find_button(&stack.visible_child().unwrap(), label).unwrap();
+            assert_eq!(
+                button.parent().unwrap().first_child().unwrap(),
+                button.clone().upcast::<gtk::Widget>(),
+                "add remains above the list"
+            );
+            assert!(button.is_sensitive());
+            button.emit_clicked();
+            drain();
+            let dialogs = gtk::Window::list_toplevels()
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+                .filter(|dialog| {
+                    dialog.is_visible()
+                        && dialog.transient_for().as_ref() == Some(window.upcast_ref())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(dialogs.len(), 1);
+            assert!(dialogs[0].is_modal());
+            if section == "rules" {
+                let target = find_named(dialogs[0].upcast_ref(), "rule-target")
+                    .unwrap()
+                    .downcast::<gtk::Entry>()
+                    .unwrap();
+                target.set_text("https://invalid.example/path");
+                target
+                    .delegate()
+                    .unwrap()
+                    .emit_by_name::<()>("activate", &[]);
+                let feedback = find_named(dialogs[0].upcast_ref(), "form-feedback").unwrap();
+                wait_for(|| feedback.is_visible());
+                let focus = gtk::prelude::GtkWindowExt::focus(&dialogs[0]).unwrap();
+                assert!(
+                    focus == target.clone().upcast::<gtk::Widget>() || focus.is_ancestor(&target),
+                    "invalid target receives focus"
+                );
+                assert!(requests.try_recv().is_err());
+            } else if section == "connections" {
+                find_named(dialogs[0].upcast_ref(), "connection-name")
+                    .unwrap()
+                    .downcast::<gtk::Entry>()
+                    .unwrap()
+                    .set_text("Draft only");
+                drain();
+                assert!(
+                    !temp.path().join("config.json").exists(),
+                    "editing fields cannot autosave"
+                );
+            }
+            for dialog in dialogs {
+                escape(&dialog);
+            }
+            drain();
+        }
+        assert!(
+            requests.try_recv().is_err(),
+            "navigation and canceled forms must not mutate routing"
+        );
+        crate::ui::application_editor::tests::assert_picker_behavior(&window, texts);
+        let accepted = Rc::new(RefCell::new(Vec::new()));
+        let output = accepted.clone();
+        open_rule_editor(
+            &window,
+            texts,
+            Rc::new(RefCell::new(empty_default_profile())),
+            None,
+            Rc::new(move |rule| {
+                output.borrow_mut().push(rule);
+                true
+            }),
+        );
+        drain();
+        let rule_dialog = transient(&window);
+        find_named(rule_dialog.upcast_ref(), "rule-action")
+            .unwrap()
+            .downcast::<gtk::DropDown>()
+            .unwrap()
+            .set_selected(2);
+        let entry = find_named(rule_dialog.upcast_ref(), "rule-target")
+            .unwrap()
+            .downcast::<gtk::Entry>()
+            .unwrap();
+        entry.set_text("Claude.AI");
+        entry
+            .delegate()
+            .unwrap()
+            .emit_by_name::<()>("activate", &[]);
+        wait_for(|| !accepted.borrow().is_empty());
+        assert_eq!(
+            accepted.borrow()[0].target,
+            routelane::domain::RuleTarget::Domain("claude.ai".into())
+        );
+        assert_eq!(accepted.borrow()[0].action, RuleAction::Block);
+        assert!(!rule_dialog.is_visible());
+        assert!(requests.try_recv().is_err());
+        let sample = Rule {
+            id: "plain-label".into(),
             enabled: true,
-            priority: 40,
+            priority: 10,
             source: RuleSource::Any,
-            target: RuleTarget::Domain("a.example".to_owned()),
-            action: RuleAction::Direct,
-        });
-        profile.rules.push(Rule {
-            id: RuleId::from("b"),
-            enabled: true,
-            priority: 15,
-            source: RuleSource::Any,
-            target: RuleTarget::Domain("b.example".to_owned()),
-            action: RuleAction::Direct,
-        });
-
-        assert_eq!(super::next_rule_priority(&profile), 50);
-    }
-
-    #[test]
-    fn apply_request_immediately_reports_applying_instead_of_stale_inactive() {
-        assert_eq!(health_after_apply_request().aggregate, "Applying");
-    }
-
-    #[test]
-    fn applying_dashboard_copy_uses_progress_feedback() {
-        let copy = dashboard_copy(
-            routelane::config::Language::En.texts(),
-            DashboardState {
-                setup_step: None,
-                primary_action: PrimaryAction::DisableRouting,
-                primary_action_enabled: false,
-                authorization: AuthorizationPresentation::Waiting,
-            },
-            HealthState::Applying,
-        );
-
-        assert_eq!(copy.icon_name, "process-working-symbolic");
-        assert!(copy.shows_progress);
-        assert_eq!(copy.action, "Retry authorization");
-    }
-
-    #[test]
-    fn preserves_selection_when_previous_interface_still_exists() {
-        let names = ["wlan0".to_owned(), "tun0".to_owned()];
-        assert_eq!(refreshed_interface_selection(Some("tun0"), &names), Some(1));
-    }
-
-    #[test]
-    fn presents_aggregate_lane_diagnostic_action_and_technical_detail() {
-        let lane_id = LaneId::from("work");
-        let lanes = LaneHealth::from([(lane_id.clone(), HealthState::Degraded)]);
-        let report = HealthReport::from_parts(
-            HealthState::Degraded,
-            lanes,
-            vec![Diagnostic::new(
-                DiagnosticCode::LaneInterfaceMissing,
-                "VPN interface is missing",
-                "interface tun0 was not present in the live topology",
-                Severity::Warning,
-                DiagnosticSubject::Lane(lane_id),
-                Some(SuggestedAction::new("Connect the VPN and apply again")),
-            )],
-        );
-        let view = health_view(&report, Some(42));
-        assert_eq!(view.aggregate, "Degraded");
-        assert_eq!(view.apply_generation.as_deref(), Some("42"));
-        assert_eq!(view.lanes, vec![("work".to_owned(), "Degraded".to_owned())]);
-        assert_eq!(view.diagnostics[0].summary, "VPN interface is missing");
-        assert_eq!(
-            view.diagnostics[0].action.as_deref(),
-            Some("Connect the VPN and apply again")
+            target: routelane::domain::RuleTarget::Any,
+            action: RuleAction::Block,
+        };
+        let row = create_compact_rule_row(
+            &sample,
+            "Browser <Work> & Home",
+            "VPN & fallback",
+            texts,
+            Rc::new(|_, _| {}),
+            vec![],
         );
         assert_eq!(
-            view.diagnostics[0].technical_detail,
-            "interface tun0 was not present in the live topology"
+            row.row.title().as_str(),
+            "Browser &lt;Work&gt; &amp; Home",
+            "untrusted display names are escaped for the GTK 1.1 markup API"
         );
-    }
-
-    #[test]
-    fn reports_daemon_unavailable_after_activation_failure() {
-        let view = daemon_unavailable_view("systemd user activation failed");
-        assert_eq!(view.aggregate, "DaemonUnavailable");
-        assert_eq!(
-            view.diagnostics[0].technical_detail,
-            "systemd user activation failed"
-        );
-    }
-
-    #[test]
-    fn configuration_failure_is_visible_and_not_presented_as_an_empty_config() {
-        let view = configuration_error_view(
-            "configuration is not owned by the current user",
-            routelane::config::Language::En.texts(),
-        );
-        assert_eq!(view.aggregate, "ConfigurationError");
-        assert!(view.diagnostics[0].technical_detail.contains("not owned"));
-    }
-
-    #[test]
-    fn failed_health_does_not_hide_a_previously_applied_profile() {
+        let mut populated = empty_default_profile();
+        for index in 0..40 {
+            populated.rules.push(Rule {
+                id: format!("rule-{index}").as_str().into(),
+                enabled: true,
+                priority: index * 10,
+                source: RuleSource::Any,
+                target: routelane::domain::RuleTarget::Domain(format!("host{index}.example")),
+                action: RuleAction::Block,
+            });
+        }
         let status = DaemonStatus {
-            generation: 7,
-            event_sequence: 3,
-            health: HealthReport::from_parts(HealthState::Failed, Default::default(), vec![]),
-            desired_profile_id: Some(ProfileId::from("new")),
-            applied_profile_id: Some(ProfileId::from("old")),
+            generation: 0,
+            event_sequence: 0,
+            health: HealthReport::inactive(),
+            desired_profile_id: None,
+            applied_profile_id: None,
             last_error: None,
         };
-
-        assert!(status_is_active(&status));
-    }
-
-    #[test]
-    fn daemon_revision_guard_rejects_stale_duplicate_and_out_of_order_updates() {
-        let last_generation = std::cell::Cell::new(None);
-        let last_sequence = std::cell::Cell::new(None);
-        let mut view = ("Healthy", true, None::<&str>);
-
-        assert!(accept_daemon_status_revision(
-            &last_generation,
-            &last_sequence,
-            2,
-            5
-        ));
-        if accept_daemon_event_revision(&last_generation, &last_sequence, 2, 5) {
-            view = ("Failed", false, Some("duplicate"));
-        }
-        if accept_daemon_event_revision(&last_generation, &last_sequence, 1, 6) {
-            view = ("Failed", false, Some("stale error"));
-        }
-        assert_eq!(view, ("Healthy", true, None));
-        assert_eq!(last_generation.get(), Some(2));
-        assert_eq!(last_sequence.get(), Some(5));
-
-        if accept_daemon_event_revision(&last_generation, &last_sequence, 2, 6) {
-            view = ("Degraded", true, Some("same generation update"));
-        }
-        assert_eq!(view.0, "Degraded");
-        assert!(!accept_daemon_event_revision(
-            &last_generation,
-            &last_sequence,
-            2,
-            6
-        ));
-        assert!(accept_daemon_event_revision(
-            &last_generation,
-            &last_sequence,
-            3,
-            7
-        ));
-        assert!(!accept_daemon_status_revision(
-            &last_generation,
-            &last_sequence,
-            3,
-            6
-        ));
-        assert_eq!(last_generation.get(), Some(3));
-        assert_eq!(last_sequence.get(), Some(7));
-    }
-
-    #[test]
-    fn only_a_new_connection_epoch_resets_daemon_revision_guards() {
-        let last_epoch = std::cell::Cell::new(None);
-        let last_generation = std::cell::Cell::new(Some(5));
-        let last_sequence = std::cell::Cell::new(Some(21));
-
-        assert!(accept_connection_epoch(
-            &last_epoch,
-            &last_generation,
-            &last_sequence,
-            1,
-        ));
-        assert_eq!(last_generation.get(), None);
-        assert_eq!(last_sequence.get(), None);
-        assert!(accept_daemon_status_revision(
-            &last_generation,
-            &last_sequence,
-            5,
-            20,
-        ));
-        assert!(accept_daemon_event_revision(
-            &last_generation,
-            &last_sequence,
-            5,
-            21,
-        ));
-
-        assert!(!accept_connection_epoch(
-            &last_epoch,
-            &last_generation,
-            &last_sequence,
-            1,
-        ));
-        assert!(!accept_connection_epoch(
-            &last_epoch,
-            &last_generation,
-            &last_sequence,
-            0,
-        ));
-        assert_eq!(last_generation.get(), Some(5));
-        assert_eq!(last_sequence.get(), Some(21));
-
-        assert!(accept_connection_epoch(
-            &last_epoch,
-            &last_generation,
-            &last_sequence,
-            2,
-        ));
-        assert_eq!(last_generation.get(), None);
-        assert_eq!(last_sequence.get(), None);
-        assert!(accept_daemon_status_revision(
-            &last_generation,
-            &last_sequence,
-            0,
-            0,
-        ));
-
-        assert!(accept_connection_epoch(
-            &last_epoch,
-            &last_generation,
-            &last_sequence,
-            3,
-        ));
-        assert!(accept_daemon_status_revision(
-            &last_generation,
-            &last_sequence,
-            0,
-            0,
-        ));
-    }
-
-    #[test]
-    fn configuration_error_remains_visible_after_daemon_status() {
-        let daemon = health_view(&HealthReport::inactive(), Some(9));
-        let (config, daemon) = health_sections(
-            Some("invalid JSON"),
-            daemon,
-            routelane::config::Language::En.texts(),
-        );
-
-        assert_eq!(config.unwrap().aggregate, "ConfigurationError");
-        assert_eq!(daemon.aggregate, "Inactive");
-    }
-
-    #[test]
-    fn configuration_validation_summary_is_localized() {
-        let view = configuration_error_view("ayrıntı", routelane::config::Language::Tr.texts());
-
+        events
+            .try_send(DaemonToUi::Snapshot {
+                epoch: 1,
+                status: status.clone(),
+                profiles: vec![populated.clone()],
+            })
+            .unwrap();
+        drain();
+        find_named(window.upcast_ref(), "rules")
+            .unwrap()
+            .downcast::<gtk::ToggleButton>()
+            .unwrap()
+            .emit_clicked();
+        drain();
+        let first = find_named(window.upcast_ref(), "rule-rule-0").unwrap();
+        let switch = find_named(&first, "rule-enable").unwrap();
+        switch.grab_focus();
+        drain();
+        let root = first
+            .ancestor(adw::PreferencesGroup::static_type())
+            .unwrap()
+            .parent()
+            .unwrap();
+        let query = find_named(window.upcast_ref(), "rules-search")
+            .unwrap()
+            .downcast::<gtk::SearchEntry>()
+            .unwrap();
+        query.set_text("host");
+        query.emit_by_name::<()>("search-changed", &[]);
+        let scroll = root
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .unwrap()
+            .downcast::<gtk::ScrolledWindow>()
+            .unwrap();
+        wait_for(|| scroll.vadjustment().upper() > scroll.vadjustment().page_size());
+        scroll.vadjustment().set_value(120.0);
+        let page_state = crate::ui::list_page::ListViewState::capture(&root);
+        assert_eq!(page_state.focused_rule, Some("rule-0".into()));
+        events
+            .try_send(DaemonToUi::Snapshot {
+                epoch: 1,
+                status: status.clone(),
+                profiles: vec![populated.clone()],
+            })
+            .unwrap();
+        drain();
         assert_eq!(
-            view.diagnostics[0].summary,
-            "RouteLane yapılandırması yüklenemedi"
+            find_named(window.upcast_ref(), "rule-rule-0").unwrap(),
+            first,
+            "health refresh must preserve row identity"
         );
+        assert_eq!(query.text().as_str(), "host");
+        assert_eq!(scroll.vadjustment().value(), page_state.scroll);
+        let add = find_button(&root, texts.add_rule).unwrap();
+        query.set_text("host39");
+        query.emit_by_name::<()>("search-changed", &[]);
+        drain();
+        assert!(!first.is_visible());
         assert_eq!(
-            view.diagnostics[0].action.as_deref(),
-            Some("Düzenlemeden önce dosya sahipliğini, izinleri veya JSON içeriğini düzeltin")
+            root.first_child().unwrap(),
+            add.clone().upcast::<gtk::Widget>()
         );
-    }
+        query.set_text("host");
+        query.emit_by_name::<()>("search-changed", &[]);
+        switch.grab_focus();
+        drain();
+        populated.rules.remove(0);
+        events
+            .try_send(DaemonToUi::Snapshot {
+                epoch: 1,
+                status,
+                profiles: vec![populated],
+            })
+            .unwrap();
+        drain();
+        let focused = gtk::prelude::GtkWindowExt::focus(&window).unwrap();
+        assert!(
+            focused.ancestor(adw::ActionRow::static_type()).is_some(),
+            "deleted row must focus a surviving neighbor"
+        );
+        assert_eq!(query.text().as_str(), "host");
+        gtk::prelude::WidgetExt::activate_action(&window, "win.search", None).unwrap();
+        drain();
+        let focus = gtk::prelude::GtkWindowExt::focus(&window).unwrap();
+        assert!(focus == query.clone().upcast::<gtk::Widget>() || focus.is_ancestor(&query));
+        gtk::prelude::WidgetExt::activate_action(&window, "win.new", None).unwrap();
+        drain();
+        escape(&transient(&window));
+        assert!(requests.try_recv().is_err());
 
-    #[test]
-    fn canonical_profile_survives_a_later_language_save() {
-        let old = super::empty_default_profile();
-        let mut canonical = old.clone();
-        canonical.name = "Daemon canonical".to_owned();
-        let mut document = ConfigV2 {
-            profiles: vec![old.clone()],
-            ..Default::default()
+        find_named(window.upcast_ref(), "preferences")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap()
+            .emit_clicked();
+        drain();
+        let preferences = transient(&window);
+        let language = find_named(preferences.upcast_ref(), "language-choice")
+            .unwrap()
+            .downcast::<adw::ComboRow>()
+            .unwrap();
+        language.set_selected(1);
+        drain();
+        assert_eq!(
+            language.selected(),
+            0,
+            "the choice remains unchanged until confirmation"
+        );
+        escape(&transient(&preferences));
+        preferences.close();
+        drain();
+        assert!(
+            !temp.path().join("config.json").exists(),
+            "language cancellation must not persist"
+        );
+        assert!(requests.try_recv().is_err());
+
+        let mut app_profile = empty_default_profile();
+        app_profile.lanes.push(routelane::domain::Lane {
+            id: "vpn".into(),
+            name: "VPN".into(),
+            interface: "tun0".into(),
+            fallback_lane: None,
+            failure_policy: routelane::domain::LaneFailurePolicy::Block,
+        });
+        app_profile.rules.push(Rule {
+            id: "browser".into(),
+            enabled: true,
+            priority: 10,
+            source: RuleSource::Application(routelane::domain::ApplicationSelector {
+                desktop_id: None,
+                executable_path: "/usr/bin/browser".into(),
+                include_children: true,
+                launch: None,
+            }),
+            target: routelane::domain::RuleTarget::Any,
+            action: RuleAction::Route("vpn".into()),
+        });
+        events
+            .try_send(DaemonToUi::Snapshot {
+                epoch: 1,
+                status: DaemonStatus {
+                    generation: 0,
+                    event_sequence: 0,
+                    health: HealthReport::inactive(),
+                    desired_profile_id: None,
+                    applied_profile_id: None,
+                    last_error: None,
+                },
+                profiles: vec![app_profile.clone()],
+            })
+            .unwrap();
+        drain();
+        find_named(window.upcast_ref(), "applications")
+            .unwrap()
+            .downcast::<gtk::ToggleButton>()
+            .unwrap()
+            .emit_clicked();
+        drain();
+        let row = find_named(window.upcast_ref(), "rule-browser").unwrap();
+        let launch = find_named(&row, "rule-launch")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        let menu = find_named(&row, "rule-menu")
+            .unwrap()
+            .downcast::<gtk::MenuButton>()
+            .unwrap();
+        assert!(!launch.is_sensitive());
+        assert!(!crate::ui::form::menu_action(&menu, texts.ux.adopt_confirm)
+            .unwrap()
+            .is_sensitive());
+        let primary = find_named(window.upcast_ref(), "routing-primary")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        primary.emit_clicked();
+        primary.emit_clicked();
+        wait_for(|| !requests.is_empty());
+        let apply = match requests.try_recv().unwrap() {
+            UiToDaemon::Request(r) => r,
+            _ => panic!("apply expected"),
         };
-        let mut selected = old;
-
-        reconcile_profiles(&mut document, &mut selected, vec![canonical.clone()]);
-        document.language = routelane::config::Language::En;
-
-        assert_eq!(selected, canonical);
-        assert_eq!(document.profiles[0], canonical);
-    }
-
-    #[test]
-    fn profile_reconciliation_prefers_matching_id_then_deterministic_lowest_id() {
-        let mut selected = super::empty_default_profile();
-        selected.id = ProfileId::from("selected");
-        let mut matching = selected.clone();
-        matching.name = "Matching".to_owned();
-        let mut alpha = selected.clone();
-        alpha.id = ProfileId::from("alpha");
-        alpha.name = "Alpha".to_owned();
-        let mut document = ConfigV2::default();
-
-        reconcile_profiles(
-            &mut document,
-            &mut selected,
-            vec![alpha.clone(), matching.clone()],
+        assert!(matches!(apply.request, DaemonRequest::ApplyProfile(_)));
+        assert!(
+            requests.try_recv().is_err(),
+            "double activation submits once"
         );
-        assert_eq!(selected, matching);
-
-        selected.id = ProfileId::from("missing");
-        document.profiles.push(selected.clone());
-        reconcile_profiles(&mut document, &mut selected, vec![matching, alpha.clone()]);
-        assert_eq!(selected.id, ProfileId::from("missing"));
-        assert!(document
-            .profiles
-            .iter()
-            .any(|profile| profile.id == ProfileId::from("missing")));
-
-        let unchanged = selected.clone();
-        reconcile_profiles(&mut document, &mut selected, vec![]);
-        assert_eq!(selected, unchanged);
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: routelane::ipc::DaemonResponse::success(
+                    apply.request_id,
+                    DaemonResult::Applied(routelane::ipc::ApplyProfileResult {
+                        generation: 1,
+                        plan_hash: routelane::backend::KernelPlan {
+                            generation: 1,
+                            profile_id: app_profile.id.clone(),
+                            lanes: vec![],
+                            rules: vec![],
+                        }
+                        .content_hash(),
+                    }),
+                ),
+            })
+            .unwrap();
+        drain();
+        while requests.try_recv().is_ok() {}
+        events
+            .try_send(DaemonToUi::Snapshot {
+                epoch: 1,
+                status: DaemonStatus {
+                    generation: 1,
+                    event_sequence: 1,
+                    health: HealthReport::inactive(),
+                    desired_profile_id: Some(app_profile.id.clone()),
+                    applied_profile_id: Some(app_profile.id.clone()),
+                    last_error: None,
+                },
+                profiles: vec![app_profile],
+            })
+            .unwrap();
+        drain();
+        assert!(launch.is_sensitive());
+        assert_eq!(
+            launch.label().as_deref(),
+            Some(texts.ux.launch_neutral),
+            "unavailable lane must not claim verified interface use"
+        );
+        assert!(
+            crate::ui::form::menu_action(&menu, texts.ux.adopt_confirm)
+                .unwrap()
+                .is_sensitive(),
+            "menu eligibility must refresh without recreating the row"
+        );
+        crate::ui::form::menu_action(&menu, texts.ux.adopt_confirm)
+            .unwrap()
+            .emit_clicked();
+        drain();
+        escape(&transient(&window));
+        assert!(requests.try_recv().is_err(), "cancel adoption is read-only");
+        launch.emit_clicked();
+        launch.emit_clicked();
+        drain();
+        assert!(matches!(
+            requests.try_recv().unwrap(),
+            UiToDaemon::Request(crate::models::UiRequest {
+                request: DaemonRequest::LaunchApplication { .. },
+                ..
+            })
+        ));
+        assert!(requests.try_recv().is_err(), "double launch submits once");
+        let settings = gtk::Settings::default().unwrap();
+        let original_font = settings.gtk_font_name();
+        settings.set_gtk_font_name(Some("Sans 22"));
+        for language in [
+            routelane::config::Language::Tr,
+            routelane::config::Language::En,
+        ] {
+            let shell = Shell::new(language.texts());
+            let overview = Overview::new(language.texts());
+            let mut long_profile = empty_default_profile();
+            long_profile.lanes.push(routelane::domain::Lane {
+                id: "long".into(),
+                name: "VeryLongConnectionNameWithoutWhitespace".repeat(3),
+                interface: "tun0".into(),
+                fallback_lane: None,
+                failure_policy: routelane::domain::LaneFailurePolicy::Block,
+            });
+            overview.update(&long_profile, &UiSession::new(long_profile.clone(), true));
+            shell.add_page(Section::Overview, &overview.root);
+            let list = ListPage::new(language.texts(), Section::Applications);
+            let long_title = "VeryLongBrowserApplicationNameWithoutWhitespace".repeat(3);
+            let row = create_compact_application_row(
+                &sample,
+                (&long_title, "application-x-executable-symbolic"),
+                &long_profile.lanes[0].name,
+                language.texts(),
+                Rc::new(|_, _| {}),
+                Rc::new(|| {}),
+                vec![],
+            );
+            list.group.add(&row.row);
+            shell.add_page(Section::Applications, &list.root);
+            shell.select(Section::Applications);
+            shell.status_row.set_title(language.texts().routing_active);
+            shell.primary.set_label(language.texts().disable_routing);
+            assert!(
+                shell.root.measure(gtk::Orientation::Horizontal, -1).0 <= 536,
+                "200% text must not force a wide window"
+            );
+            let preview = adw::Window::builder()
+                .default_width(560)
+                .default_height(600)
+                .content(&shell.root)
+                .build();
+            preview.present();
+            wait_for(|| shell.root.width() > 0);
+            assert!(
+                shell.root.height() <= 600,
+                "compact layout must fit vertically: {}",
+                shell.root.height()
+            );
+            assert!(shell.root.width() <= 560);
+            assert!(shell.primary.is_mapped());
+            shell.select(Section::Overview);
+            drain();
+            assert!(shell.root.width() <= 560 && shell.root.height() <= 600);
+            preview.set_default_size(900, 720);
+            drain();
+            preview.destroy();
+        }
+        settings.set_gtk_font_name(original_font.as_deref());
+        window.destroy();
+        drain();
     }
 
     #[test]
     fn partial_daemon_profile_snapshot_merges_without_deleting_local_profiles() {
-        let mut alpha = super::empty_default_profile();
-        alpha.id = ProfileId::from("alpha");
-        alpha.name = "Alpha local".to_owned();
-        let mut beta = super::empty_default_profile();
-        beta.id = ProfileId::from("beta");
-        beta.name = "Beta local".to_owned();
-        let mut canonical_beta = beta.clone();
-        canonical_beta.name = "Beta daemon".to_owned();
-        let mut remote_new = super::empty_default_profile();
-        remote_new.id = ProfileId::from("charlie");
-        remote_new.name = "Charlie daemon".to_owned();
-        let mut document = ConfigV2 {
-            profiles: vec![alpha.clone(), beta],
-            ..Default::default()
-        };
-        let mut selected = alpha.clone();
-
-        reconcile_profiles(
-            &mut document,
-            &mut selected,
-            vec![remote_new.clone(), canonical_beta.clone()],
-        );
-
-        assert_eq!(selected, alpha);
-        assert_eq!(
-            document
-                .profiles
-                .iter()
-                .map(|profile| (profile.id.clone(), profile.name.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                (ProfileId::from("alpha"), "Alpha local".to_owned()),
-                (ProfileId::from("beta"), "Beta daemon".to_owned()),
-                (ProfileId::from("charlie"), "Charlie daemon".to_owned()),
-            ]
-        );
+        let mut document = ConfigV2::default();
+        let mut selected = empty_default_profile();
+        document.profiles.push(selected.clone());
+        let mut other = selected.clone();
+        other.id = "other".into();
+        document.profiles.push(other);
+        let mut replacement = selected.clone();
+        replacement.name = "Canonical".into();
+        reconcile_profiles(&mut document, &mut selected, vec![replacement], true);
+        assert_eq!(selected.name, "Canonical");
+        assert_eq!(document.profiles.len(), 2);
     }
 
     #[test]
-    fn failed_persistence_restores_switch_from_last_daemon_status() {
-        assert!(!switch_state_after_persistence_failure(None));
-        assert!(switch_state_after_persistence_failure(Some(
-            &ProfileId::from("applied")
-        )));
+    fn snapshot_preserves_local_failed_apply_draft() {
+        let mut selected = empty_default_profile();
+        selected.name = "Local edit".into();
+        let mut document = ConfigV2 {
+            profiles: vec![selected.clone()],
+            ..Default::default()
+        };
+        reconcile_profiles(
+            &mut document,
+            &mut selected,
+            vec![empty_default_profile()],
+            false,
+        );
+        assert_eq!(selected.name, "Local edit");
+        assert_eq!(document.profiles[0].name, "Local edit");
+    }
+
+    #[test]
+    fn canonical_profile_survives_a_later_language_save() {
+        let mut selected = empty_default_profile();
+        let mut document = ConfigV2::default();
+        let mut canonical = selected.clone();
+        canonical.name = "Canonical".into();
+        reconcile_profiles(&mut document, &mut selected, vec![canonical], true);
+        document.language = routelane::config::Language::En;
+        assert_eq!(document.profiles[0].name, "Canonical");
+        assert_eq!(selected.id.as_str(), "default");
     }
 }

@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use gtk4::{self as gtk, prelude::*};
@@ -8,7 +7,7 @@ use routelane::domain::{
     RuleAction,
 };
 
-use crate::ui::confirm::confirm_destructive_action;
+use crate::ui::confirm::confirm_destructive_action_with_label;
 use crate::ui::i18n::Texts;
 use routelane::config::Language;
 
@@ -67,7 +66,7 @@ impl From<DomainError> for LaneEditError {
     }
 }
 
-fn lane_edit_error_text(error: LaneEditError, texts: Texts) -> &'static str {
+pub fn lane_edit_error_text(error: LaneEditError, texts: Texts) -> &'static str {
     match error {
         LaneEditError::EmptyName => texts.lane_name_empty,
         LaneEditError::DuplicateName => texts.lane_name_duplicate,
@@ -93,76 +92,15 @@ fn confirm_language_restart(
     texts: Texts,
     on_confirm: Rc<dyn Fn()>,
 ) {
-    let confirmation = adw::Window::builder()
-        .title(texts.language_restart_title)
-        .transient_for(parent)
-        .modal(true)
-        .default_width(420)
-        .build();
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(16)
-        .margin_top(24)
-        .margin_bottom(24)
-        .margin_start(24)
-        .margin_end(24)
-        .build();
-    let body = gtk::Label::builder()
-        .label(texts.language_restart_body)
-        .wrap(true)
-        .xalign(0.0)
-        .build();
-    let buttons = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .build();
-    let cancel = gtk::Button::with_label(texts.cancel);
-    let confirm = gtk::Button::with_label(texts.confirm);
-    confirm.add_css_class("suggested-action");
-    buttons.append(&cancel);
-    buttons.append(&confirm);
-    content.append(&body);
-    content.append(&buttons);
-    confirmation.set_content(Some(&content));
-    confirmation.set_default_widget(Some(&cancel));
-
-    cancel.connect_clicked({
-        let confirmation = confirmation.clone();
-        move |_| confirmation.close()
-    });
-    confirm.connect_clicked({
-        let confirmation = confirmation.clone();
-        move |_| {
-            on_confirm();
-            confirmation.close();
-        }
-    });
-
-    confirmation.present();
-    cancel.grab_focus();
-}
-
-fn set_lane_interface(profile: &mut Profile, lane_id: &LaneId, interface: &str) -> bool {
-    if let Some(lane) = profile.lanes.iter_mut().find(|lane| &lane.id == lane_id) {
-        lane.interface = InterfaceSelector::from(interface);
-        true
-    } else {
-        false
-    }
-}
-
-fn set_lane_failure_policy(
-    profile: &mut Profile,
-    lane_id: &LaneId,
-    failure_policy: LaneFailurePolicy,
-) -> bool {
-    if let Some(lane) = profile.lanes.iter_mut().find(|lane| &lane.id == lane_id) {
-        lane.failure_policy = failure_policy;
-        true
-    } else {
-        false
-    }
+    confirm_destructive_action_with_label(
+        parent,
+        texts,
+        texts.language_restart_title,
+        texts.language_restart_body,
+        texts.confirm,
+        on_confirm,
+        Rc::new(|| {}),
+    );
 }
 
 pub fn routed_rule_count(profile: &Profile, lane_id: &LaneId) -> usize {
@@ -180,11 +118,9 @@ pub fn delete_lane(profile: &mut Profile, lane_id: &LaneId) {
         .retain(|rule| !matches!(&rule.action, RuleAction::Route(target) if target == lane_id));
 }
 
-pub fn build_settings_dialog(
+pub fn build_general_settings_dialog(
     parent: &adw::ApplicationWindow,
     texts: Texts,
-    profile: Rc<RefCell<Profile>>,
-    on_change: Rc<dyn Fn()>,
     initial_language: Language,
     on_language: Rc<dyn Fn(Language)>,
 ) -> adw::PreferencesWindow {
@@ -192,112 +128,8 @@ pub fn build_settings_dialog(
         .title(texts.settings_title)
         .transient_for(parent)
         .modal(true)
-        .hide_on_close(true)
         .build();
     let page = adw::PreferencesPage::new();
-    let group = adw::PreferencesGroup::builder()
-        .title(texts.lanes_title)
-        .description(texts.lanes_description)
-        .build();
-    let interfaces = system_interfaces();
-
-    for lane in profile.borrow().lanes.clone() {
-        add_lane_editor(
-            &dialog,
-            &group,
-            &lane,
-            &interfaces,
-            profile.clone(),
-            on_change.clone(),
-            texts,
-        );
-    }
-
-    let add = adw::ActionRow::builder().title(texts.add_lane).build();
-    let name = gtk::Entry::builder()
-        .placeholder_text(texts.lane_name)
-        .tooltip_text(texts.lane_name)
-        .width_chars(12)
-        .build();
-    let interface_names = interfaces.iter().map(String::as_str).collect::<Vec<_>>();
-    let interface_model = gtk::StringList::new(&interface_names);
-    let interface = gtk::DropDown::builder()
-        .model(&interface_model)
-        .tooltip_text(texts.select_interface)
-        .build();
-    let policies = gtk::StringList::new(&[
-        texts.failure_block,
-        texts.failure_direct,
-        texts.failure_inactive,
-    ]);
-    let policy = gtk::DropDown::builder()
-        .model(&policies)
-        .tooltip_text(texts.lane_summary_failure_policy)
-        .build();
-    let button = gtk::Button::builder()
-        .icon_name("list-add-symbolic")
-        .tooltip_text(texts.add_lane)
-        .build();
-    add.add_suffix(&name);
-    add.add_suffix(&interface);
-    add.add_suffix(&policy);
-    add.add_suffix(&button);
-    group.add(&add);
-
-    {
-        let button = button.clone();
-        name.connect_activate(move |_| button.emit_clicked());
-    }
-
-    {
-        let dialog = dialog.clone();
-        let group = group.clone();
-        let profile = profile.clone();
-        let interfaces = interfaces.clone();
-        let add_row = add.clone();
-        button.connect_clicked(move |_| {
-            let Some(interface_name) = interfaces.get(interface.selected() as usize) else {
-                add_row.set_subtitle(texts.select_interface);
-                return;
-            };
-            let failure_policy = policy_from_index(policy.selected());
-            let lane_result = {
-                let mut profile = profile.borrow_mut();
-                add_lane(
-                    &mut profile,
-                    name.text().as_str(),
-                    interface_name,
-                    failure_policy,
-                )
-                .map(|id| profile.lanes.iter().find(|lane| lane.id == id).cloned())
-            };
-            match lane_result {
-                Ok(Some(lane)) => {
-                    add_row.set_subtitle("");
-                    name.remove_css_class("error");
-                    add_lane_editor(
-                        &dialog,
-                        &group,
-                        &lane,
-                        &interfaces,
-                        profile.clone(),
-                        on_change.clone(),
-                        texts,
-                    );
-                    name.set_text("");
-                    on_change();
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    add_row.set_subtitle(lane_edit_error_text(error, texts));
-                    name.add_css_class("error");
-                    name.set_text("");
-                }
-            }
-        });
-    }
-
-    page.add(&group);
     let language_group = adw::PreferencesGroup::builder()
         .title(texts.language_title)
         .description(texts.language_description)
@@ -306,18 +138,22 @@ pub fn build_settings_dialog(
         .title(texts.language_row_title)
         .subtitle(texts.language_row_subtitle)
         .build();
+    language.set_widget_name("language-choice");
     language.set_model(Some(&gtk::StringList::new(&["Türkçe", "English"])));
     language.set_selected(initial_language.index());
     let confirmed_language = Rc::new(std::cell::Cell::new(initial_language));
     let reverting_language = Rc::new(std::cell::Cell::new(false));
     language.connect_selected_notify({
-        let dialog = dialog.clone();
+        let dialog = dialog.downgrade();
         let confirmed_language = confirmed_language.clone();
         let reverting_language = reverting_language.clone();
         move |combo| {
             if reverting_language.get() {
                 return;
             }
+            let Some(dialog) = dialog.upgrade() else {
+                return;
+            };
             let current = confirmed_language.get();
             let selected = Language::from_index(combo.selected());
             if !language_change_requires_restart(current, selected) {
@@ -345,209 +181,6 @@ pub fn build_settings_dialog(
     page.add(&language_group);
     dialog.add(&page);
     dialog
-}
-
-fn add_lane_editor(
-    parent: &adw::PreferencesWindow,
-    group: &adw::PreferencesGroup,
-    lane: &Lane,
-    interfaces: &[String],
-    profile: Rc<RefCell<Profile>>,
-    on_change: Rc<dyn Fn()>,
-    texts: Texts,
-) {
-    let row = adw::ActionRow::new();
-    row.set_title(&lane.name);
-
-    let name = gtk::Entry::builder()
-        .text(&lane.name)
-        .width_chars(12)
-        .tooltip_text(texts.lane_name)
-        .build();
-    let interface_names = interfaces.iter().map(String::as_str).collect::<Vec<_>>();
-    let interface_model = gtk::StringList::new(&interface_names);
-    let interface = gtk::DropDown::builder()
-        .model(&interface_model)
-        .tooltip_text(texts.select_interface)
-        .build();
-    if let Some(index) = interfaces
-        .iter()
-        .position(|candidate| candidate == lane.interface.as_str())
-    {
-        interface.set_selected(index as u32);
-    }
-    let policies = gtk::StringList::new(&[
-        texts.failure_block,
-        texts.failure_direct,
-        texts.failure_inactive,
-    ]);
-    let policy = gtk::DropDown::builder()
-        .model(&policies)
-        .tooltip_text(texts.lane_summary_failure_policy)
-        .build();
-    policy.set_selected(policy_index(&lane.failure_policy));
-    let delete = gtk::Button::builder()
-        .icon_name("list-remove-symbolic")
-        .tooltip_text(texts.delete_lane)
-        .build();
-    delete.add_css_class("flat");
-    row.add_suffix(&name);
-    row.add_suffix(&interface);
-    row.add_suffix(&policy);
-    row.add_suffix(&delete);
-    group.add(&row);
-
-    {
-        let lane_id = lane.id.clone();
-        let profile = profile.clone();
-        let on_change = on_change.clone();
-        let row = row.clone();
-        let resetting = Rc::new(std::cell::Cell::new(false));
-        name.connect_changed(move |entry| {
-            if resetting.get() {
-                return;
-            }
-            let result = {
-                let mut profile = profile.borrow_mut();
-                rename_lane(&mut profile, &lane_id, entry.text().as_str()).map(|()| {
-                    profile
-                        .lanes
-                        .iter()
-                        .find(|lane| lane.id == lane_id)
-                        .map(|lane| lane.name.clone())
-                        .unwrap_or_default()
-                })
-            };
-            match result {
-                Ok(canonical) => {
-                    row.set_subtitle("");
-                    entry.remove_css_class("error");
-                    if entry.text().as_str() != canonical {
-                        resetting.set(true);
-                        entry.set_text(&canonical);
-                        resetting.set(false);
-                    }
-                    on_change();
-                }
-                Err(error) => {
-                    let canonical = profile
-                        .borrow()
-                        .lanes
-                        .iter()
-                        .find(|lane| lane.id == lane_id)
-                        .map(|lane| lane.name.clone())
-                        .unwrap_or_default();
-                    row.set_subtitle(lane_edit_error_text(error, texts));
-                    entry.add_css_class("error");
-                    resetting.set(true);
-                    entry.set_text(&canonical);
-                    resetting.set(false);
-                }
-            }
-        });
-    }
-    {
-        let lane_id = lane.id.clone();
-        let profile = profile.clone();
-        let interfaces = interfaces.to_vec();
-        let on_change = on_change.clone();
-        interface.connect_selected_notify(move |dropdown| {
-            let Some(selected) = interfaces.get(dropdown.selected() as usize) else {
-                return;
-            };
-            let changed = {
-                let mut profile = profile.borrow_mut();
-                set_lane_interface(&mut profile, &lane_id, selected)
-            };
-            if changed {
-                on_change();
-            }
-        });
-    }
-    {
-        let lane_id = lane.id.clone();
-        let profile = profile.clone();
-        let on_change = on_change.clone();
-        policy.connect_selected_notify(move |dropdown| {
-            let changed = {
-                let mut profile = profile.borrow_mut();
-                set_lane_failure_policy(
-                    &mut profile,
-                    &lane_id,
-                    policy_from_index(dropdown.selected()),
-                )
-            };
-            if changed {
-                on_change();
-            }
-        });
-    }
-    {
-        let lane_id = lane.id.clone();
-        let profile = profile.clone();
-        let group = group.clone();
-        let parent = parent.clone();
-        delete.connect_clicked(move |_| {
-            let affected = routed_rule_count(&profile.borrow(), &lane_id);
-            let body = if affected > 0 {
-                format!(
-                    "{}{}{}{}",
-                    texts.confirm_delete_lane_body,
-                    texts.confirm_delete_lane_rules_prefix,
-                    affected,
-                    texts.confirm_delete_lane_rules_suffix
-                )
-            } else {
-                texts.confirm_delete_lane_body.to_owned()
-            };
-            let lane_id = lane_id.clone();
-            let profile = profile.clone();
-            let group = group.clone();
-            let row = row.clone();
-            let on_change = on_change.clone();
-            confirm_destructive_action(
-                &parent,
-                texts,
-                texts.confirm_delete_lane_heading,
-                &body,
-                Rc::new(move || {
-                    {
-                        let mut profile = profile.borrow_mut();
-                        delete_lane(&mut profile, &lane_id);
-                    }
-                    group.remove(&row);
-                    on_change();
-                }),
-            );
-        });
-    }
-}
-
-fn policy_from_index(index: u32) -> LaneFailurePolicy {
-    match index {
-        0 => LaneFailurePolicy::Block,
-        1 => LaneFailurePolicy::Direct,
-        _ => LaneFailurePolicy::Inactive,
-    }
-}
-
-fn policy_index(policy: &LaneFailurePolicy) -> u32 {
-    match policy {
-        LaneFailurePolicy::Block => 0,
-        LaneFailurePolicy::Direct => 1,
-        LaneFailurePolicy::Inactive => 2,
-    }
-}
-
-fn system_interfaces() -> Vec<String> {
-    let mut interfaces = std::fs::read_dir("/sys/class/net")
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect::<Vec<_>>();
-    interfaces.sort();
-    interfaces
 }
 
 #[cfg(test)]

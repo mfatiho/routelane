@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
@@ -69,20 +69,54 @@ pub fn confirm_destructive_action_with_label(
     dialog.set_content(Some(&content));
     dialog.set_default_widget(Some(&cancel));
 
-    cancel.connect_clicked({
-        let dialog = dialog.clone();
+    let resolved = Rc::new(Cell::new(false));
+    let previous = gtk::prelude::GtkWindowExt::focus(parent).map(|widget| widget.downgrade());
+    dialog.connect_close_request({
+        let resolved = resolved.clone();
         move |_| {
-            on_cancel();
-            dialog.close();
+            if !resolved.replace(true) {
+                on_cancel();
+            }
+            if let Some(widget) = previous.as_ref().and_then(|widget| widget.upgrade()) {
+                if widget.is_sensitive() {
+                    widget.grab_focus();
+                }
+            }
+            glib::signal::Inhibit(false)
+        }
+    });
+    cancel.connect_clicked({
+        let dialog = dialog.downgrade();
+        move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
         }
     });
     delete.connect_clicked({
-        let dialog = dialog.clone();
+        let dialog = dialog.downgrade();
         move |_| {
-            on_confirm();
-            dialog.close();
+            if !resolved.replace(true) {
+                on_confirm();
+            }
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
         }
     });
+    let keys = gtk::EventControllerKey::new();
+    let close = dialog.downgrade();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            if let Some(dialog) = close.upgrade() {
+                dialog.close();
+            }
+            glib::signal::Inhibit(true)
+        } else {
+            glib::signal::Inhibit(false)
+        }
+    });
+    dialog.add_controller(&keys);
 
     dialog.present();
     cancel.grab_focus();
