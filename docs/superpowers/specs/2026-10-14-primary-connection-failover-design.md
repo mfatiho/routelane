@@ -1,8 +1,9 @@
 # Ana bağlantı ve otomatik yardımcı hat geçişi
 
 Tarih: 14 Ekim 2026.
-Durum: Konuşmada netleştirilen gereksinimlerin yazılı tasarımı; kullanıcı incelemesi bekleniyor.
-Bu belge ürün kodunu veya canlı ağ ayarlarını değiştirmez. Uygulama planı henüz yazılmadı.
+Durum: Kullanıcının “devam et” yanıtıyla tasarım onaylandı; uygulama planı kullanıcı incelemesi bekliyor.
+Bu belge ürün kodunu veya canlı ağ ayarlarını değiştirmez.
+Plan: `docs/superpowers/plans/2026-10-14-primary-connection-failover.md`.
 
 ## 1. Amaç ve onaylanan davranış
 
