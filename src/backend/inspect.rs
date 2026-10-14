@@ -148,6 +148,28 @@ impl KernelSnapshot {
         family: IpFamily,
         gateway: Option<IpAddr>,
     ) -> bool {
+        if self.topology.is_observed() {
+            let Some(interface) = self.topology.interface(interface) else {
+                return false;
+            };
+            if !interface.ready(family) {
+                return false;
+            }
+            let matches = match (family, gateway) {
+                (IpFamily::V4, Some(IpAddr::V4(ip))) => {
+                    interface.route_v4 == Some(RouteMode::Via(ip))
+                }
+                (IpFamily::V6, Some(IpAddr::V6(ip))) => {
+                    interface.route_v6 == Some(RouteMode::Via(ip))
+                }
+                (IpFamily::V4, None) => interface.route_v4 == Some(RouteMode::Device),
+                (IpFamily::V6, None) => interface.route_v6 == Some(RouteMode::Device),
+                _ => false,
+            };
+            if !matches {
+                return false;
+            }
+        }
         if self.routes.iter().any(|route| {
             route.family == family
                 && route.destination.as_deref() == Some("default")

@@ -10,8 +10,9 @@ use crate::domain::{
 
 use super::plan::{
     CompiledAction, CompiledRule, CompiledTarget, KernelPlan, LaneAvailability, LanePlan,
-    ResolutionSnapshot, TopologySnapshot, MARK_BASE, RULE_PRIORITY_BASE, TABLE_BASE,
+    ResolutionSnapshot, MARK_BASE, RULE_PRIORITY_BASE, TABLE_BASE,
 };
+use super::TopologySnapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {

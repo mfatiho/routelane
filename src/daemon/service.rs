@@ -1,23 +1,19 @@
-use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::application::{matching_processes, RunningProcess};
 use crate::backend::{
     compile_profile, AppliedKernelState, ApplyResponse, CleanupResponse, InspectResponse,
-    KernelPlan, OrphanRecoveryResponse, ResolutionSnapshot, RestoreResponse, RouteMode,
-    TopologySnapshot,
+    KernelPlan, OrphanRecoveryResponse, ResolutionSnapshot, RestoreResponse, TopologySnapshot,
 };
 use crate::dns::periodic::resolve_domain;
 use crate::domain::{
@@ -41,7 +37,6 @@ const MAX_CONFIG_BYTES: u64 = 1_048_576;
 const HELPER_BUS_NAME: &str = "io.github.routelane.Helper";
 const HELPER_OBJECT_PATH: &str = "/io/github/routelane/Helper";
 const HELPER_INTERFACE: &str = "io.github.routelane.Helper1";
-const IP_BINARY: &str = "/usr/sbin/ip";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonError {
@@ -969,83 +964,13 @@ pub struct SystemTopologyProvider;
 #[async_trait]
 impl TopologyProvider for SystemTopologyProvider {
     async fn snapshot(&self, _profile: &Profile) -> Result<TopologySnapshot, DaemonError> {
-        #[derive(Deserialize)]
-        struct Link {
-            ifname: String,
-        }
-        #[derive(Deserialize)]
-        struct Route<A> {
-            dst: Option<String>,
-            dev: Option<String>,
-            gateway: Option<A>,
-        }
-
-        let links: Vec<Link> = run_ip_json(&["-j", "link", "show"]).await?;
-        let routes_v4: Vec<Route<Ipv4Addr>> =
-            run_ip_json(&["-j", "-4", "route", "show", "table", "all"]).await?;
-        let routes_v6: Vec<Route<Ipv6Addr>> =
-            run_ip_json(&["-j", "-6", "route", "show", "table", "all"]).await?;
-        let mut interfaces = links
-            .into_iter()
-            .map(|link| (link.ifname, (None, None)))
-            .collect::<BTreeMap<_, _>>();
-        for route in routes_v4 {
-            if route.dst.as_deref() == Some("default") {
-                if let Some(interface) = route.dev {
-                    if let Some(entry) = interfaces.get_mut(&interface) {
-                        match route.gateway {
-                            Some(gateway) => entry.0 = Some(RouteMode::Via(gateway)),
-                            None => {
-                                entry.0.get_or_insert(RouteMode::Device);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for route in routes_v6 {
-            if route.dst.as_deref() == Some("default") {
-                if let Some(interface) = route.dev {
-                    if let Some(entry) = interfaces.get_mut(&interface) {
-                        match route.gateway {
-                            Some(gateway) => entry.1 = Some(RouteMode::Via(gateway)),
-                            None => {
-                                entry.1.get_or_insert(RouteMode::Device);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut snapshot = TopologySnapshot::empty();
-        for (interface, (route_v4, route_v6)) in interfaces {
-            snapshot.insert_routes(interface, route_v4, route_v6);
-        }
-        Ok(snapshot)
+        tokio::task::spawn_blocking(crate::backend::capture_system_topology)
+            .await
+            .map_err(|error| {
+                DaemonError::topology(format!("kernel topology worker failed: {error}"))
+            })?
+            .map_err(|error| DaemonError::topology(error.to_string()))
     }
-}
-
-async fn run_ip_json<T>(arguments: &[&str]) -> Result<T, DaemonError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let output = Command::new(IP_BINARY)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(|error| {
-            DaemonError::topology(format!("could not start typed ip command: {error}"))
-        })?;
-    if !output.status.success() {
-        return Err(DaemonError::topology(format!(
-            "typed ip command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|error| DaemonError::topology(format!("invalid ip JSON output: {error}")))
 }
 
 #[derive(Debug, Clone, Default)]
