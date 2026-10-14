@@ -646,6 +646,8 @@ fn plan(
         "10.10.1.1"
     };
     KernelPlan {
+        primary: Default::default(),
+        local_networks: vec![],
         generation,
         profile_id: ProfileId::from("root-integration"),
         lanes: vec![
@@ -680,6 +682,7 @@ fn plan(
             rule("direct-b", 40, "198.18.0.10/32", CompiledAction::Direct),
             rule("block-c", 50, "192.0.2.99/32", CompiledAction::Block),
             CompiledRule {
+                family: routelane::backend::IpFamily::V4,
                 id: RuleId::from("catch-all-direct"),
                 priority: 100,
                 target: CompiledTarget::Any,
@@ -691,6 +694,9 @@ fn plan(
 
 fn lane(id: &str, interface: &str, gateway: &str, offset: u32) -> LanePlan {
     LanePlan {
+        identity: None,
+        source_v4: vec![],
+        source_v6: vec![],
         id: LaneId::from(id),
         interface: interface.to_owned(),
         route_v4: Some(RouteMode::Via(gateway.parse().unwrap())),
@@ -705,6 +711,7 @@ fn lane(id: &str, interface: &str, gateway: &str, offset: u32) -> LanePlan {
 
 fn rule(id: &str, priority: u32, target: &str, action: CompiledAction) -> CompiledRule {
     CompiledRule {
+        family: routelane::backend::IpFamily::V4,
         id: RuleId::from(id),
         priority,
         target: CompiledTarget::Network(target.parse::<IpNet>().unwrap()),

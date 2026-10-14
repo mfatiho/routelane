@@ -121,6 +121,48 @@ pub fn build_policy_commands(plan: &KernelPlan) -> Vec<CommandSpec> {
     commands
 }
 
+/// Produced separately until exact ownership/journaling supports terminal routes.
+pub fn build_terminal_policy_commands(plan: &KernelPlan) -> Vec<CommandSpec> {
+    let mut routes = Vec::new();
+    let mut rules = Vec::new();
+    for lane in &plan.lanes {
+        for (family, present) in [
+            (IpFamily::V4, lane.route_v4.is_some()),
+            (IpFamily::V6, lane.route_v6.is_some()),
+        ] {
+            if present && lane.availability == LaneAvailability::Available {
+                continue;
+            }
+            routes.push(CommandSpec::ip(
+                family,
+                [
+                    "route".to_owned(),
+                    "replace".to_owned(),
+                    "unreachable".to_owned(),
+                    "default".to_owned(),
+                    "table".to_owned(),
+                    lane.table.to_string(),
+                ],
+            ));
+            rules.push(CommandSpec::ip(
+                family,
+                [
+                    "rule".to_owned(),
+                    "add".to_owned(),
+                    "fwmark".to_owned(),
+                    format!("{:#010x}", lane.mark),
+                    "lookup".to_owned(),
+                    lane.table.to_string(),
+                    "priority".to_owned(),
+                    lane.rule_priority.to_string(),
+                ],
+            ));
+        }
+    }
+    routes.extend(rules);
+    routes
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -138,6 +180,9 @@ mod tests {
         resources: (u32, u32, u32),
     ) -> LanePlan {
         LanePlan {
+            identity: None,
+            source_v4: vec![],
+            source_v6: vec![],
             id: LaneId::from(id),
             interface: interface.to_owned(),
             route_v4: gateways.0.map(RouteMode::Via),
@@ -152,6 +197,8 @@ mod tests {
 
     fn plan(lanes: Vec<LanePlan>) -> KernelPlan {
         KernelPlan {
+            primary: Default::default(),
+            local_networks: vec![],
             generation: 1,
             profile_id: ProfileId::from("default"),
             lanes,

@@ -1480,6 +1480,8 @@ mod tests {
                     DaemonResult::Applied(routelane::ipc::ApplyProfileResult {
                         generation: 1,
                         plan_hash: routelane::backend::KernelPlan {
+                            primary: Default::default(),
+                            local_networks: vec![],
                             generation: 1,
                             profile_id: app_profile.id.clone(),
                             lanes: vec![],

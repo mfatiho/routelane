@@ -85,9 +85,14 @@ fn reports_healthy_when_table_rules_routes_and_interfaces_match() {
 
 fn gatewayless_plan() -> KernelPlan {
     KernelPlan {
+        primary: Default::default(),
+        local_networks: vec![],
         generation: 9,
         profile_id: ProfileId::from("wireguard"),
         lanes: vec![LanePlan {
+            identity: None,
+            source_v4: vec![],
+            source_v6: vec![],
             id: LaneId::from("work"),
             interface: "wg0".to_owned(),
             route_v4: Some(RouteMode::Device),

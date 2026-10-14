@@ -846,9 +846,14 @@ mod tests {
 
     fn plan() -> KernelPlan {
         KernelPlan {
+            primary: Default::default(),
+            local_networks: vec![],
             generation: 1,
             profile_id: ProfileId::from("default"),
             lanes: vec![LanePlan {
+                identity: None,
+                source_v4: vec![],
+                source_v6: vec![],
                 id: LaneId::from("work"),
                 interface: "wg0".to_owned(),
                 route_v4: Some(RouteMode::Via("10.0.0.1".parse().unwrap())),

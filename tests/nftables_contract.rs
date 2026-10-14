@@ -9,9 +9,14 @@ use routelane::domain::{LaneFailurePolicy, LaneId, ProfileId, RuleId};
 
 fn fixture_kernel_plan_with_all_actions() -> KernelPlan {
     KernelPlan {
+        primary: Default::default(),
+        local_networks: vec![],
         generation: 1,
         profile_id: ProfileId::from("default"),
         lanes: vec![LanePlan {
+            identity: None,
+            source_v4: vec![],
+            source_v6: vec![],
             id: LaneId::from("privacy"),
             interface: "wg-privacy".into(),
             route_v4: Some(RouteMode::Via(Ipv4Addr::new(10, 0, 0, 1))),
@@ -24,18 +29,21 @@ fn fixture_kernel_plan_with_all_actions() -> KernelPlan {
         }],
         rules: vec![
             CompiledRule {
+                family: routelane::backend::IpFamily::V4,
                 id: RuleId::from("route"),
                 priority: 10,
                 target: CompiledTarget::Network("203.0.113.0/24".parse::<IpNet>().unwrap()),
                 action: CompiledAction::Mark(0x524c0002),
             },
             CompiledRule {
+                family: routelane::backend::IpFamily::V4,
                 id: RuleId::from("direct"),
                 priority: 20,
                 target: CompiledTarget::Network("198.51.100.7/32".parse::<IpNet>().unwrap()),
                 action: CompiledAction::Direct,
             },
             CompiledRule {
+                family: routelane::backend::IpFamily::V4,
                 id: RuleId::from("block"),
                 priority: 30,
                 target: CompiledTarget::Network("2001:db8:dead::/48".parse::<IpNet>().unwrap()),
@@ -90,12 +98,14 @@ fn routed_rule_returns_after_marking_so_first_matching_rule_wins() {
     let mut plan = fixture_kernel_plan_with_all_actions();
     plan.rules = vec![
         CompiledRule {
+            family: routelane::backend::IpFamily::V4,
             id: RuleId::from("specific-route"),
             priority: 10,
             target: CompiledTarget::Network("203.0.113.7/32".parse::<IpNet>().unwrap()),
             action: CompiledAction::Mark(0x524c0002),
         },
         CompiledRule {
+            family: routelane::backend::IpFamily::V4,
             id: RuleId::from("catch-all-direct"),
             priority: 100,
             target: CompiledTarget::Any,
@@ -126,6 +136,7 @@ fn renders_application_cgroup_before_destination_rules() {
     plan.rules.insert(
         0,
         CompiledRule {
+            family: routelane::backend::IpFamily::V4,
             id: RuleId::from("browser"),
             priority: 1,
             target: CompiledTarget::Cgroup("routelane.apps/browser".to_owned()),

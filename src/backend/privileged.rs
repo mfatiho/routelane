@@ -3274,6 +3274,9 @@ fn remove_plan_policy_rules(
     for (family, priority, table, mark) in rules {
         for _ in 0..3 {
             let lane = super::LanePlan {
+                identity: None,
+                source_v4: vec![],
+                source_v6: vec![],
                 id: LaneId::from("rollback"),
                 interface: "lo".to_owned(),
                 route_v4: None,
@@ -3290,6 +3293,9 @@ fn remove_plan_policy_rules(
             delete_one_rule_if_present(executor, family, &lane)?;
         }
         let lane = super::LanePlan {
+            identity: None,
+            source_v4: vec![],
+            source_v6: vec![],
             id: LaneId::from("rollback"),
             interface: "lo".to_owned(),
             route_v4: None,
@@ -3859,6 +3865,9 @@ mod tests {
 
     fn fixture_lane(id: &str, offset: u32) -> LanePlan {
         LanePlan {
+            identity: None,
+            source_v4: vec![],
+            source_v6: vec![],
             id: LaneId::from(id),
             interface: format!("wg{offset}"),
             route_v4: Some(RouteMode::Via(format!("10.0.{offset}.1").parse().unwrap())),
@@ -3873,10 +3882,13 @@ mod tests {
 
     fn fixture_valid_plan() -> KernelPlan {
         KernelPlan {
+            primary: Default::default(),
+            local_networks: vec![],
             generation: 1,
             profile_id: ProfileId::from("default"),
             lanes: vec![fixture_lane("privacy", 0)],
             rules: vec![CompiledRule {
+                family: crate::backend::IpFamily::V4,
                 id: RuleId::from("route-example"),
                 priority: 10,
                 target: CompiledTarget::Network("203.0.113.0/24".parse().unwrap()),
@@ -3921,6 +3933,7 @@ mod tests {
     #[test]
     fn privileged_nft_renderer_matches_application_cgroup_before_marking() {
         let rule = CompiledRule {
+            family: crate::backend::IpFamily::V4,
             id: RuleId::from("browser"),
             priority: 1,
             target: CompiledTarget::Cgroup("routelane.apps/browser".to_owned()),
@@ -4101,6 +4114,7 @@ mod tests {
         let mut too_many_rules = fixture_valid_plan();
         too_many_rules.rules = (0..10_001)
             .map(|offset| CompiledRule {
+                family: crate::backend::IpFamily::V4,
                 id: RuleId::from(format!("rule-{offset}").as_str()),
                 priority: offset,
                 target: CompiledTarget::Any,
