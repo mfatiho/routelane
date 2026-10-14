@@ -4,6 +4,7 @@ mod nftables;
 mod plan;
 mod planner;
 mod policy_route;
+mod primary;
 mod privileged;
 mod topology;
 mod transaction;
@@ -24,6 +25,7 @@ pub use plan::{
 };
 pub use planner::{compile_profile, Capability, PlanError};
 pub use policy_route::{build_policy_commands, CommandSpec, IpFamily, Program};
+pub use primary::{FamilyExit, FamilyPair, PrimaryDecision, PrimarySelector};
 pub use privileged::{
     validate_privileged_plan, ApplyResponse, AuthorizationError, Authorizer, CleanupResponse,
     InspectResponse, OrphanRecoveryResponse, PrivilegedBackend, PrivilegedError, PrivilegedService,
