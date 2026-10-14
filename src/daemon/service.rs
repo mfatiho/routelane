@@ -281,9 +281,18 @@ where
         rule_id: RuleId,
     ) -> Result<ApplicationLaunchResult, DaemonError> {
         let selector = self.application_selector(&profile_id, &rule_id).await?;
+        let program = selector
+            .launch
+            .as_ref()
+            .map_or(selector.executable_path.as_path(), |launch| {
+                launch.executable.as_path()
+            });
         let cgroup = self.helper.prepare_application_cgroup(&rule_id).await?;
         let control = cgroup.join("cgroup.procs");
-        let mut command = Command::new(&selector.executable_path);
+        let mut command = Command::new(program);
+        if let Some(launch) = &selector.launch {
+            command.args(&launch.arguments);
+        }
         unsafe {
             command.pre_exec(move || {
                 let mut file = OpenOptions::new().write(true).open(&control)?;

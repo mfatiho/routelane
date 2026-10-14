@@ -496,6 +496,7 @@ fn application_source_compiles_to_a_lane_cgroup_mark() {
         desktop_id: Some("org.example.App".to_owned()),
         executable_path: "/usr/bin/example".into(),
         include_children: true,
+        launch: None,
     };
     let profile = profile(
         vec![lane("vinn", "tun0")],

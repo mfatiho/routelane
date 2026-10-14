@@ -2,7 +2,8 @@
 
 Tarih: 13 Ekim 2026.
 Durum: Yaklaşım ve yazılı tasarım kullanıcı tarafından onaylandı.
-Uygulama planı incelemeye hazır; ürün kodunda bu tasarım için henüz değişiklik yapılmadı.
+Onaylanan plan uygulandı. Doğrulama kapsamı ve kalan release kontrolleri
+`docs/ui-ux-verification.md` belgesinde kayıtlıdır.
 
 ## 1. Amaç ve kapsam
 

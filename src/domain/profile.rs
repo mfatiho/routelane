@@ -259,6 +259,7 @@ mod tests {
                 desktop_id: Some("org.example.Browser".to_owned()),
                 executable_path: PathBuf::from("/usr/bin/browser"),
                 include_children: true,
+                launch: None,
             }),
             target,
             action,

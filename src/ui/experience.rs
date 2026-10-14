@@ -1,56 +1,4 @@
-use crate::ui::i18n::Texts;
-use routelane::domain::{HealthState, Profile};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StatusPresentation {
-    pub title: &'static str,
-    pub detail: &'static str,
-    pub icon_name: &'static str,
-}
-
-pub fn status_presentation(
-    health: HealthState,
-    authorization: AuthorizationPresentation,
-    texts: Texts,
-) -> StatusPresentation {
-    if matches!(authorization, AuthorizationPresentation::Denied)
-        || matches!(health, HealthState::NeedsAuthorization)
-    {
-        return StatusPresentation {
-            title: texts.authorization_denied,
-            detail: texts.retry_authorization,
-            icon_name: "dialog-password-symbolic",
-        };
-    }
-    match health {
-        HealthState::Inactive => StatusPresentation {
-            title: texts.inactive,
-            detail: texts.routing_inactive,
-            icon_name: "media-playback-stop-symbolic",
-        },
-        HealthState::Applying => StatusPresentation {
-            title: texts.status_applying,
-            detail: texts.authorization_waiting,
-            icon_name: "process-working-symbolic",
-        },
-        HealthState::Healthy => StatusPresentation {
-            title: texts.status_healthy,
-            detail: texts.routing_active,
-            icon_name: "emblem-ok-symbolic",
-        },
-        HealthState::Degraded => StatusPresentation {
-            title: texts.status_degraded,
-            detail: texts.technical_details,
-            icon_name: "dialog-warning-symbolic",
-        },
-        HealthState::Failed => StatusPresentation {
-            title: texts.status_failed,
-            detail: texts.technical_details,
-            icon_name: "dialog-error-symbolic",
-        },
-        HealthState::NeedsAuthorization => unreachable!(),
-    }
-}
+use routelane::domain::Profile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupStep {
@@ -60,17 +8,12 @@ pub enum SetupStep {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimaryAction {
-    OpenPreferences,
+    OpenConnections,
+    RefreshStatus,
     OpenRuleDialog,
+    ReviewDefinitions,
     EnableRouting,
     DisableRouting,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthorizationPresentation {
-    Idle,
-    Waiting,
-    Denied,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,32 +23,10 @@ pub enum ActivationAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryAction {
-    Ignore,
-    AskForConfirmation,
-}
-
-pub fn orphan_recovery_action(error_code: &str, retry_used: bool) -> RecoveryAction {
-    if error_code == "DAEMON_ORPHANED_RESOURCES" && !retry_used {
-        RecoveryAction::AskForConfirmation
-    } else {
-        RecoveryAction::Ignore
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DashboardState {
     pub setup_step: Option<SetupStep>,
     pub primary_action: PrimaryAction,
     pub primary_action_enabled: bool,
-    pub authorization: AuthorizationPresentation,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AuthorizationOutcome {
-    pub authorization: AuthorizationPresentation,
-    pub primary_action_enabled: bool,
-    pub routing_active: bool,
 }
 
 pub fn activation_action(has_existing_window: bool) -> ActivationAction {
@@ -118,59 +39,136 @@ pub fn activation_action(has_existing_window: bool) -> ActivationAction {
 
 pub fn dashboard_state(
     profile: &Profile,
-    health: HealthState,
-    mutation_pending: bool,
+    session: &crate::ui::session::UiSession,
 ) -> DashboardState {
-    let setup_step = if profile.lanes.is_empty() {
-        Some(SetupStep::AddLane)
-    } else if profile.rules.is_empty() {
-        Some(SetupStep::AddRule)
-    } else {
+    use routelane::domain::{RuleAction, RuleTarget};
+    let active = session
+        .confirmed_status()
+        .is_some_and(|status| status.applied_profile_id.is_some());
+    let ready = profile.rules.iter().any(|rule| {
+        rule.enabled
+            && !matches!(
+                rule.target,
+                RuleTarget::WildcardDomain(_) | RuleTarget::ServicePack(_)
+            )
+            && match &rule.action {
+                RuleAction::Route(id) => profile.lanes.iter().any(|lane| &lane.id == id),
+                _ => true,
+            }
+    });
+    let setup = if active || ready {
         None
+    } else if profile.lanes.is_empty() && profile.rules.is_empty() {
+        Some(SetupStep::AddLane)
+    } else {
+        Some(SetupStep::AddRule)
     };
-    let primary_action = match setup_step {
-        Some(SetupStep::AddLane) => PrimaryAction::OpenPreferences,
-        Some(SetupStep::AddRule) => PrimaryAction::OpenRuleDialog,
-        None if matches!(
-            health,
-            HealthState::Applying
-                | HealthState::Healthy
-                | HealthState::Degraded
-                | HealthState::Failed
-        ) =>
-        {
-            PrimaryAction::DisableRouting
+    let action = if !session.snapshot_known() {
+        PrimaryAction::RefreshStatus
+    } else if active {
+        PrimaryAction::DisableRouting
+    } else {
+        match setup {
+            Some(SetupStep::AddLane) => PrimaryAction::OpenConnections,
+            Some(SetupStep::AddRule) if !profile.rules.is_empty() => {
+                PrimaryAction::ReviewDefinitions
+            }
+            Some(SetupStep::AddRule) => PrimaryAction::OpenRuleDialog,
+            None => PrimaryAction::EnableRouting,
         }
-        None => PrimaryAction::EnableRouting,
     };
-
     DashboardState {
-        setup_step,
-        primary_action,
-        primary_action_enabled: !mutation_pending,
-        authorization: if mutation_pending {
-            AuthorizationPresentation::Waiting
-        } else {
-            AuthorizationPresentation::Idle
-        },
+        setup_step: setup,
+        primary_action: action,
+        primary_action_enabled: !session.is_busy()
+            && (matches!(
+                action,
+                PrimaryAction::DisableRouting | PrimaryAction::RefreshStatus
+            ) || session.config_writable()),
     }
 }
 
-pub fn authorization_after_error(
-    routing_active: bool,
-    authorization_denied: bool,
-) -> AuthorizationOutcome {
-    AuthorizationOutcome {
-        authorization: if authorization_denied {
-            AuthorizationPresentation::Denied
-        } else {
-            AuthorizationPresentation::Idle
-        },
-        primary_action_enabled: true,
-        routing_active,
-    }
-}
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::models::DaemonToUi;
+    use crate::ui::session::UiSession;
+    use routelane::domain::{Rule, RuleAction, RuleSource, RuleTarget};
+    use routelane::health::HealthReport;
+    use routelane::ipc::DaemonStatus;
 
-pub fn authorization_after_applied() -> AuthorizationPresentation {
-    AuthorizationPresentation::Idle
+    fn profile() -> Profile {
+        Profile {
+            id: "work".into(),
+            name: "Work".into(),
+            enabled: false,
+            lanes: vec![],
+            rules: vec![],
+        }
+    }
+    fn session(profile: &Profile, active: bool, writable: bool) -> UiSession {
+        let mut s = UiSession::new(profile.clone(), writable);
+        s.handle_daemon(DaemonToUi::ConnectionEstablished { epoch: 1 });
+        s.handle_daemon(DaemonToUi::Snapshot {
+            epoch: 1,
+            status: DaemonStatus {
+                generation: 7,
+                event_sequence: 1,
+                health: HealthReport::inactive(),
+                desired_profile_id: None,
+                applied_profile_id: active.then(|| profile.id.clone()),
+                last_error: None,
+            },
+            profiles: vec![],
+        });
+        s
+    }
+
+    #[test]
+    fn direct_and_block_rules_need_no_fake_lane() {
+        for action in [RuleAction::Direct, RuleAction::Block] {
+            let mut p = profile();
+            p.rules.push(Rule {
+                id: "rule".into(),
+                enabled: true,
+                priority: 10,
+                source: RuleSource::Any,
+                target: RuleTarget::Any,
+                action,
+            });
+            assert_eq!(
+                dashboard_state(&p, &session(&p, false, true)).primary_action,
+                PrimaryAction::EnableRouting
+            );
+        }
+    }
+    #[test]
+    fn active_plan_keeps_cleanup_visible_despite_missing_setup_and_readonly_config() {
+        let p = profile();
+        let state = dashboard_state(&p, &session(&p, true, false));
+        assert_eq!(state.primary_action, PrimaryAction::DisableRouting);
+        assert!(state.primary_action_enabled);
+    }
+    #[test]
+    fn disabled_and_unsupported_rules_do_not_satisfy_setup() {
+        let mut p = profile();
+        p.rules.push(Rule {
+            id: "rule".into(),
+            enabled: false,
+            priority: 10,
+            source: RuleSource::Any,
+            target: RuleTarget::Any,
+            action: RuleAction::Direct,
+        });
+        assert_ne!(
+            dashboard_state(&p, &session(&p, false, true)).primary_action,
+            PrimaryAction::EnableRouting
+        );
+        p.rules[0].enabled = true;
+        p.rules[0].target = RuleTarget::WildcardDomain("*.example.com".into());
+        assert_ne!(
+            dashboard_state(&p, &session(&p, false, true)).primary_action,
+            PrimaryAction::EnableRouting
+        );
+    }
 }

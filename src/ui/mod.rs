@@ -1,162 +1,28 @@
+pub mod application_editor;
 pub mod application_row;
 pub mod confirm;
+pub mod connections;
+pub mod controller;
+pub mod desktop_catalog;
 pub mod experience;
+pub mod form;
 pub mod i18n;
+pub mod list_page;
+pub mod overview;
+pub mod rule_editor;
 pub mod rule_row;
+pub mod session;
 pub mod settings;
+pub mod shell;
 pub mod tray;
 pub mod window;
 
 #[cfg(test)]
-mod experience_contract_tests {
-    use super::experience::{
-        activation_action, authorization_after_applied, authorization_after_error, dashboard_state,
-        orphan_recovery_action, status_presentation, ActivationAction, AuthorizationPresentation,
-        PrimaryAction, RecoveryAction, SetupStep,
-    };
-    use crate::ui::i18n::LanguageTexts;
-    use routelane::config::Language;
-    use routelane::domain::{
-        HealthState, InterfaceSelector, Lane, LaneFailurePolicy, LaneId, Profile, ProfileId, Rule,
-        RuleAction, RuleId, RuleSource, RuleTarget,
-    };
-
-    fn profile() -> Profile {
-        Profile {
-            id: ProfileId::from("default"),
-            name: "Default".to_owned(),
-            enabled: false,
-            lanes: vec![],
-            rules: vec![],
-        }
-    }
-
-    fn profile_with_lane() -> Profile {
-        let mut profile = profile();
-        profile.lanes.push(Lane {
-            id: LaneId::from("vpn"),
-            name: "VPN".to_owned(),
-            interface: InterfaceSelector::from("tun0"),
-            fallback_lane: None,
-            failure_policy: LaneFailurePolicy::Block,
-        });
-        profile
-    }
-
-    fn profile_with_lane_and_rule() -> Profile {
-        let mut profile = profile_with_lane();
-        profile.rules.push(Rule {
-            id: RuleId::from("vpn-only"),
-            enabled: true,
-            priority: 100,
-            source: RuleSource::Any,
-            target: RuleTarget::Domain("example.com".to_owned()),
-            action: RuleAction::Route(LaneId::from("vpn")),
-        });
-        profile
-    }
-
-    #[test]
-    fn dashboard_guides_the_first_missing_setup_step() {
-        assert_eq!(
-            dashboard_state(&profile(), HealthState::Inactive, false).setup_step,
-            Some(SetupStep::AddLane)
-        );
-        assert_eq!(
-            dashboard_state(&profile_with_lane(), HealthState::Inactive, false).setup_step,
-            Some(SetupStep::AddRule)
-        );
-        assert_eq!(
-            dashboard_state(&profile_with_lane_and_rule(), HealthState::Inactive, false)
-                .primary_action,
-            PrimaryAction::EnableRouting
-        );
-    }
-
-    #[test]
-    fn pending_mutation_waits_for_authorization_without_a_repeat_action() {
-        let state = dashboard_state(&profile_with_lane_and_rule(), HealthState::Inactive, true);
-
-        assert_eq!(state.authorization, AuthorizationPresentation::Waiting);
-        assert!(!state.primary_action_enabled);
-    }
-
+mod tests {
     #[test]
     fn activation_reuses_an_existing_window() {
+        use super::experience::{activation_action, ActivationAction};
         assert_eq!(activation_action(true), ActivationAction::PresentExisting);
         assert_eq!(activation_action(false), ActivationAction::CreateWindow);
-    }
-
-    #[test]
-    fn every_language_has_actionable_setup_and_authorization_copy() {
-        for texts in [Language::Tr.texts(), Language::En.texts()] {
-            assert!(!texts.enable_routing.is_empty());
-            assert!(!texts.add_first_lane.is_empty());
-            assert!(!texts.authorization_waiting.is_empty());
-            assert!(!texts.authorization_denied.is_empty());
-            assert!(!texts.orphan_recovery_heading.is_empty());
-            assert!(!texts.orphan_recovery_body.is_empty());
-            assert!(!texts.recover_and_retry.is_empty());
-            assert!(!texts.orphan_recovery_progress.is_empty());
-            assert!(!texts.orphan_recovery_failed.is_empty());
-        }
-    }
-
-    #[test]
-    fn authorization_denial_reenables_control_without_changing_confirmed_state() {
-        let state = authorization_after_error(true, true);
-
-        assert_eq!(state.authorization, AuthorizationPresentation::Denied);
-        assert!(state.primary_action_enabled);
-        assert!(state.routing_active);
-    }
-
-    #[test]
-    fn accepted_apply_clears_authorization_waiting_state() {
-        assert_eq!(
-            authorization_after_applied(),
-            AuthorizationPresentation::Idle
-        );
-    }
-
-    #[test]
-    fn only_orphaned_resource_error_requests_recovery_confirmation() {
-        assert_eq!(
-            orphan_recovery_action("DAEMON_ORPHANED_RESOURCES", false),
-            RecoveryAction::AskForConfirmation
-        );
-        assert_eq!(
-            orphan_recovery_action("DAEMON_RECONCILIATION_FAILED", false),
-            RecoveryAction::Ignore
-        );
-    }
-
-    #[test]
-    fn automatic_retry_cannot_start_a_second_recovery_cycle() {
-        assert_eq!(
-            orphan_recovery_action("DAEMON_ORPHANED_RESOURCES", true),
-            RecoveryAction::Ignore
-        );
-    }
-
-    #[test]
-    fn status_presentation_replaces_raw_health_states_with_actionable_copy() {
-        for health in [
-            HealthState::Inactive,
-            HealthState::Applying,
-            HealthState::NeedsAuthorization,
-            HealthState::Healthy,
-            HealthState::Degraded,
-            HealthState::Failed,
-        ] {
-            let presentation = status_presentation(
-                health,
-                AuthorizationPresentation::Idle,
-                Language::Tr.texts(),
-            );
-            assert!(!presentation.title.is_empty());
-            assert!(!presentation.detail.is_empty());
-            assert!(!presentation.icon_name.is_empty());
-        }
     }
 }

@@ -8,5 +8,6 @@ pub use profile::{
     Lane, LaneFailurePolicy, LaneId, Profile, ProfileId,
 };
 pub use rule::{
-    ApplicationSelector, Rule, RuleAction, RuleId, RuleSource, RuleTarget, ServicePackId,
+    ApplicationLaunch, ApplicationSelector, Rule, RuleAction, RuleId, RuleSource, RuleTarget,
+    ServicePackId,
 };

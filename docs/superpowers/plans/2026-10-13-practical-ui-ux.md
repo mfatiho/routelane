@@ -19,7 +19,8 @@ async-channel, Tokio; existing Broadway/private D-Bus GTK smoke harness.
 Plan review is required before implementation. No independent reviewer agent
 is authorized; perform inline reviews and report this limit honestly.
 
-**Status:** Complete and self-reviewed; awaiting user review before execution.
+**Status:** User-approved plan implemented inline on main. See
+`docs/ui-ux-verification.md` for evidence, execution rulings and release limitations.
 
 ## Global Constraints
 

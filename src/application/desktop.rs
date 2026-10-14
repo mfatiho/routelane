@@ -1,3 +1,4 @@
+use crate::domain::ApplicationLaunch;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
@@ -9,6 +10,7 @@ pub struct DesktopApp {
     pub desktop_id: String,
     pub display_name: String,
     pub executable_path: PathBuf,
+    pub launch: ApplicationLaunch,
 }
 
 impl DesktopApp {
@@ -20,6 +22,10 @@ impl DesktopApp {
         Self {
             desktop_id: desktop_id.into(),
             display_name: display_name.into(),
+            launch: ApplicationLaunch {
+                executable: executable_path.clone(),
+                arguments: vec![],
+            },
             executable_path,
         }
     }
@@ -147,10 +153,32 @@ fn parse_desktop_entry(path: &Path, content: &str, search_path: &[PathBuf]) -> O
         return None;
     }
     let display_name = values.get("Name")?.trim();
-    let executable_path =
-        resolve_executable(executable_from_exec(values.get("Exec")?)?, search_path)?;
+    let command = glib::shell_parse_argv(values.get("Exec")?).ok()?;
+    let launcher = resolve_executable(command.first()?.to_str()?, search_path)?;
+    let arguments = command
+        .iter()
+        .skip(1)
+        .filter_map(|argument| {
+            let argument = argument.to_str()?;
+            match argument {
+                "%u" | "%U" | "%f" | "%F" | "%i" => None,
+                "%c" => Some(display_name.to_owned()),
+                "%k" => Some(path.to_string_lossy().into_owned()),
+                _ => Some(argument.replace("%%", "%")),
+            }
+        })
+        .collect::<Vec<_>>();
+    let executable_path = fs::canonicalize(&launcher).ok()?;
     let desktop_id = path.file_stem()?.to_str()?.to_owned();
-    (!display_name.is_empty()).then(|| DesktopApp::new(desktop_id, display_name, executable_path))
+    (!display_name.is_empty()).then(|| DesktopApp {
+        desktop_id,
+        display_name: display_name.to_owned(),
+        executable_path,
+        launch: ApplicationLaunch {
+            executable: launcher,
+            arguments,
+        },
+    })
 }
 
 fn desktop_entry_values(content: &str) -> BTreeMap<&str, &str> {
@@ -172,19 +200,10 @@ fn desktop_entry_values(content: &str) -> BTreeMap<&str, &str> {
     values
 }
 
-fn executable_from_exec(exec: &str) -> Option<&str> {
-    let executable = exec.split_whitespace().next()?;
-    (!executable.is_empty()
-        && !executable
-            .bytes()
-            .any(|byte| matches!(byte, b'\'' | b'"' | b'`' | b'$' | b';' | b'|' | b'&')))
-    .then_some(executable)
-}
-
 fn resolve_executable(executable: &str, search_path: &[PathBuf]) -> Option<PathBuf> {
     let path = Path::new(executable);
     if path.is_absolute() {
-        return fs::canonicalize(path).ok();
+        return path.is_file().then(|| path.to_path_buf());
     }
     if path.components().count() != 1 {
         return None;
@@ -192,20 +211,40 @@ fn resolve_executable(executable: &str, search_path: &[PathBuf]) -> Option<PathB
     search_path
         .iter()
         .map(|directory| directory.join(path))
-        .find_map(|candidate| fs::canonicalize(candidate).ok())
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         desktop_application_paths, discover_from_paths, discover_from_paths_with_search_path,
-        DesktopApp,
     };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn discovery_preserves_launcher_alias_and_quoted_arguments() {
+        let directory = temporary_desktop_directory();
+        let executable = directory.join("browser-bin");
+        fs::write(&executable, "").unwrap();
+        let launcher = directory.join("browser-link");
+        std::os::unix::fs::symlink(&executable, &launcher).unwrap();
+        fs::write(directory.join("browser.desktop"), format!(
+            "[Desktop Entry]\nType=Application\nName=Browser\nExec=\"{}\" --profile \"Work Profile\" %U\n", launcher.display()
+        )).unwrap();
+        let apps = discover_from_paths(std::slice::from_ref(&directory)).unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].launch.executable, launcher);
+        assert_eq!(apps[0].launch.arguments, ["--profile", "Work Profile"]);
+        assert_eq!(
+            apps[0].executable_path,
+            fs::canonicalize(executable).unwrap()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn desktop_paths_include_every_xdg_data_directory() {
@@ -247,10 +286,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            discover_from_paths(std::slice::from_ref(&directory)).unwrap(),
-            vec![DesktopApp::new("browser", "Browser", executable,)]
-        );
+        let apps = discover_from_paths(std::slice::from_ref(&directory)).unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].desktop_id, "browser");
+        assert_eq!(apps[0].display_name, "Browser");
+        assert_eq!(apps[0].executable_path, executable);
+        assert_eq!(apps[0].launch.executable, launcher);
 
         fs::remove_dir_all(directory).unwrap();
     }
