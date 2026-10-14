@@ -103,52 +103,6 @@ pub enum CompiledAction {
 pub struct PlanHash([u8; 32]);
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct TopologySnapshot {
-    interfaces: BTreeMap<String, InterfaceTopology>,
-}
-
-impl TopologySnapshot {
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(
-        &mut self,
-        interface: impl Into<String>,
-        gateway_v4: Option<Ipv4Addr>,
-        gateway_v6: Option<Ipv6Addr>,
-    ) {
-        self.interfaces.insert(
-            interface.into(),
-            InterfaceTopology {
-                route_v4: gateway_v4.map(RouteMode::Via),
-                route_v6: gateway_v6.map(RouteMode::Via),
-            },
-        );
-    }
-
-    pub fn insert_routes(
-        &mut self,
-        interface: impl Into<String>,
-        route_v4: Option<RouteMode<Ipv4Addr>>,
-        route_v6: Option<RouteMode<Ipv6Addr>>,
-    ) {
-        self.interfaces
-            .insert(interface.into(), InterfaceTopology { route_v4, route_v6 });
-    }
-
-    pub(crate) fn interface(&self, interface: &str) -> Option<&InterfaceTopology> {
-        self.interfaces.get(interface)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct InterfaceTopology {
-    pub route_v4: Option<RouteMode<Ipv4Addr>>,
-    pub route_v6: Option<RouteMode<Ipv6Addr>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ResolutionSnapshot {
     rules: BTreeMap<RuleId, Vec<IpNet>>,
 }

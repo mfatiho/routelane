@@ -5,6 +5,7 @@ mod plan;
 mod planner;
 mod policy_route;
 mod privileged;
+mod topology;
 mod transaction;
 
 pub use cgroup::{
@@ -18,8 +19,8 @@ pub use inspect::{
 pub use nftables::{render_ruleset, NftRenderError, TableMode};
 pub use plan::{
     CompiledAction, CompiledRule, CompiledTarget, KernelPlan, LaneAvailability, LanePlan, PlanHash,
-    ResolutionSnapshot, RouteMode, TopologySnapshot, MARK_BASE, MARK_MAX, RULE_PRIORITY_BASE,
-    RULE_PRIORITY_MAX, TABLE_BASE, TABLE_MAX,
+    ResolutionSnapshot, RouteMode, MARK_BASE, MARK_MAX, RULE_PRIORITY_BASE, RULE_PRIORITY_MAX,
+    TABLE_BASE, TABLE_MAX,
 };
 pub use planner::{compile_profile, Capability, PlanError};
 pub use policy_route::{build_policy_commands, CommandSpec, IpFamily, Program};
@@ -31,6 +32,10 @@ pub use privileged::{
 };
 #[cfg(feature = "root-integration")]
 pub use privileged::{CommandPrivilegedBackend, FileAppliedStateStore, ProcessCommandExecutor};
+pub use topology::{
+    capture_system_topology, parse_topology, InterfaceIdentity, InterfaceTopology, TopologyError,
+    TopologyInput, TopologySnapshot,
+};
 pub use transaction::{
     apply_plan, AppliedKernelState, ApplyError, ApplyStage, KernelRunner, MutationFailure,
     RunnerError,

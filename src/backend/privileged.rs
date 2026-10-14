@@ -110,6 +110,26 @@ pub trait CommandExecutor: Send {
 #[derive(Debug, Default)]
 pub struct ProcessCommandExecutor;
 
+pub(crate) fn run_topology_query(
+    query: super::topology::TopologyQuery,
+) -> Result<Vec<u8>, RunnerError> {
+    let output = execute_invocation_with_timeout(
+        &CommandInvocation {
+            program: IP_BINARY,
+            args: query.arguments().to_vec(),
+            stdin: None,
+        },
+        COMMAND_TIMEOUT,
+    )?;
+    if !output.success {
+        return Err(RunnerError::new(format!(
+            "read kernel topology: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(output.stdout)
+}
+
 impl CommandExecutor for ProcessCommandExecutor {
     fn execute(&mut self, spec: &CommandSpec) -> Result<CommandOutput, RunnerError> {
         let invocation = command_invocation(spec)?;
