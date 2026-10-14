@@ -312,6 +312,7 @@ type TestService = DaemonService<FakeTopology, FakeResolution, FakeHelper, Memor
 
 fn fixture_profile() -> Profile {
     Profile {
+        routing: Default::default(),
         id: ProfileId::from("default"),
         name: "Default".to_owned(),
         enabled: true,
