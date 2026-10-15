@@ -186,3 +186,38 @@ Task 6 öncesi helper ile terminal route kontrolünde başarısız oldu. Journal
 kaybolursa makbuz da kaybolur; orphan recovery önceki değeri kanıtlayamadığı
 için ayara dokunmaz. Bu kanıtlar TCP/UDP/IPv6 trafik, failback, Polkit veya
 Debian/Fedora kapılarını kapatmaz.
+
+## Task 7 kernel kapısı (15 Ekim 2026)
+
+Aynı onaylı VM’de, run-owned namespace’lerde gerçek helper ile
+`tests/root/primary_failover.rs` senaryoları standart ve strict-RPF
+modlarında geçti (tam root süiti 16/16). Uç noktalar gördükleri kaynak adresi
+geri yazar; her TCP/UDP iddiası seçilen uplink’i ve yanıtın orijinal sokete
+dönüşünü birlikte kanıtlar:
+
+- OS default B iken birincil A (OS default olmayan uplink) ve kural lane’i C:
+  TCP ve UDP kaynakları sırasıyla 10.10.1.2 ve 10.10.3.2.
+- Yedek C üzerinde açılan uzun TCP oturumu, A geri gelip yeni nesil
+  uygulandıktan sonra C üzerinden devam etti; yeni TCP/UDP akışları A’dan çıktı.
+- Onaylı IPv6 lane’i yokken IPv6, OS default B’den kaçmadı (gateway B ingress
+  sayacı değişmedi); cleanup OS IPv6 yönlendirmesini geri getirdi. IPv6-only
+  lane B ile IPv6 B’den 2001:db8:2::2 kaynağıyla, IPv4 A’dan çıktı.
+- Loose ve strict RPF’te doğru lane yanıtları kabul edildi; strict modda
+  yanlış yoldan gelen kaynak düşürüldü, loose modda kabul edildi (RouteLane
+  rp_filter değerini hiç yazmaz; loose modda yanlış-yol reddi RouteLane’in
+  vaadi değildir).
+- DHCP yayın/yanıt, bağlı LAN üzerindeki DNS/TCP ve 127.0.0.53 stub’ı aktif
+  yönlendirme sırasında çalıştı; yabancı nft tablosu, ip rule, tablo 100,
+  main route’lar ve global tunable’lar cleanup sonrası birebir aynı kaldı.
+- Adres kaybı, owned tablodan default silinmesi ve tüm uplink’lerin kapanması
+  sırasında hedef paketleri diğer gateway’lere ulaşmadı. Kernel, nft’nin
+  OUTPUT’ta mark atadığı yerel paketi terminal route’a düşünce yeniden
+  yönlendirme hatasıyla sessizce düşürür; uygulama ENETUNREACH değil zaman
+  aşımı görür.
+
+Aynı senaryolar schema-1 mark-only semantiğiyle (birincil kavramı yok, kaynak
+düzeltmesi yok) 5/6 başarısız oldu: birincil/yedek hedefler OS default’tan
+gidip “Network is unreachable” aldı, IPv6 OS default’tan kaçtı, adres kaybında
+paket gateway B’ye ulaştı. Yerel kontroller senaryosu bir regresyon korumasıdır
+ve eski semantikte de geçer. Bu kanıtlar otomatik runtime (Task 8), Polkit ve
+Debian/Fedora kapılarını kapatmaz.
