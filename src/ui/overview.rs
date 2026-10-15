@@ -83,12 +83,63 @@ pub fn status_copy(session: &UiSession, texts: Texts) -> (&'static str, &'static
     )
 }
 
+/// Saved preference and verified effective exits, kept visibly separate.
+fn primary_lines(
+    profile: &Profile,
+    status: Option<&routelane::ipc::DaemonStatus>,
+    texts: Texts,
+) -> String {
+    use routelane::backend::{FamilyExit, RuntimePhase};
+    use routelane::domain::PrimarySelection;
+    let overview = crate::ui::primary::primary_overview(profile, status);
+    let lane_name = |id: &routelane::domain::LaneId| {
+        profile
+            .lanes
+            .iter()
+            .find(|lane| &lane.id == id)
+            .map_or_else(|| id.as_str().to_owned(), |lane| lane.name.clone())
+    };
+    let preferred = match &overview.preferred {
+        PrimarySelection::FollowSystemDefault => texts.primary.system_default.to_owned(),
+        PrimarySelection::Lane(id) => lane_name(id),
+    };
+    let mut lines = vec![format!("{}: {preferred}", texts.primary.preferred)];
+    match &overview.effective {
+        None => lines.push(texts.primary.not_active.to_owned()),
+        Some((v4, v6)) => {
+            for (label, exit) in [
+                (texts.primary.effective_v4, v4),
+                (texts.primary.effective_v6, v6),
+            ] {
+                let exit = match exit {
+                    FamilyExit::Lane(id) => lane_name(id),
+                    FamilyExit::Blocked => texts.primary.blocked.to_owned(),
+                };
+                lines.push(format!("{label}: {exit}"));
+            }
+        }
+    }
+    if overview.backup_in_use {
+        lines.push(texts.primary.backup_in_use.to_owned());
+    }
+    match overview.phase {
+        RuntimePhase::NeedsReauthorization => {
+            lines.push(texts.primary.needs_reauthorization.to_owned())
+        }
+        RuntimePhase::Degraded => lines.push(texts.status_degraded.to_owned()),
+        _ => {}
+    }
+    lines.push(texts.primary.local_evidence.to_owned());
+    lines.join("\n")
+}
+
 #[derive(Clone)]
 pub struct Overview {
     pub root: gtk::Box,
     pub reapply: gtk::Button,
     pub refresh: gtk::Button,
     summary: gtk::Label,
+    primary: gtk::Label,
     lanes: gtk::Box,
     health: gtk::Label,
     error: gtk::Label,
@@ -110,6 +161,12 @@ impl Overview {
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .build();
         summary.add_css_class("heading");
+        let primary = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .selectable(true)
+            .build();
         let lanes = gtk::Box::new(gtk::Orientation::Vertical, 6);
         let health = gtk::Label::builder()
             .xalign(0.0)
@@ -153,6 +210,7 @@ impl Overview {
         help.add_css_class("dim-label");
         for widget in [
             summary.upcast_ref::<gtk::Widget>(),
+            primary.upcast_ref(),
             lanes.upcast_ref(),
             health.upcast_ref(),
             error.upcast_ref(),
@@ -168,6 +226,7 @@ impl Overview {
             reapply,
             refresh,
             summary,
+            primary,
             lanes,
             health,
             error,
@@ -183,6 +242,14 @@ impl Overview {
         self.summary.set_label(&format!(
             "{lanes} {} · {rules} {} · {apps} {}",
             texts.ux.connections, texts.ux.rules, texts.ux.applications
+        ));
+        self.primary.set_label(&primary_lines(
+            profile,
+            session
+                .snapshot_known()
+                .then(|| session.confirmed_status())
+                .flatten(),
+            texts,
         ));
         while let Some(child) = self.lanes.first_child() {
             self.lanes.remove(&child);

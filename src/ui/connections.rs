@@ -1,18 +1,24 @@
 use crate::ui::{
-    confirm::confirm_destructive_action,
+    confirm::{confirm_destructive_action, confirm_destructive_action_with_label},
     form::Form,
     i18n::Texts,
     list_page::ListPage,
+    primary::{
+        proposed_backups, validate_primary_draft, PrimaryChange, PrimaryDraft, PrimaryEffect,
+    },
     settings::{add_lane, delete_lane, lane_edit_error_text, rename_lane, routed_rule_count},
     shell::Section,
 };
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
 use routelane::domain::{
-    canonical_lane_name, validate_profile, Lane, LaneFailurePolicy, LaneId, Profile, RuleAction,
-    RuleSource,
+    canonical_lane_name, validate_profile, Lane, LaneFailurePolicy, LaneId, PrimarySelection,
+    Profile, RoutingPolicy, RuleAction, RuleSource,
 };
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 #[derive(Debug, Clone)]
 pub struct LaneDraft {
@@ -28,6 +34,8 @@ pub enum LaneEditError {
     MissingInterface,
     NotFound,
     FallbackInUse,
+    /// The routing policy names this lane as primary or backup.
+    RoutingInUse,
 }
 
 pub fn validate_lane_draft(
@@ -73,6 +81,11 @@ pub fn delete_candidate(profile: &Profile, lane_id: &LaneId) -> Result<Profile, 
         .any(|lane| lane.fallback_lane.as_ref() == Some(lane_id))
     {
         return Err(LaneEditError::FallbackInUse);
+    }
+    // The primary/backup policy must be revised explicitly first; a dangling
+    // reference is never pruned or redirected silently.
+    if crate::ui::primary::routing_references(profile, lane_id) {
+        return Err(LaneEditError::RoutingInUse);
     }
     let mut candidate = profile.clone();
     delete_lane(&mut candidate, lane_id);
@@ -277,6 +290,134 @@ pub fn open_connection_editor(
     initial_focus.grab_focus();
 }
 
+/// The OS IPv4 default interface, from the lowest-metric default in
+/// /proc/net/route (read-only, unprivileged).
+fn system_default_interface() -> Option<String> {
+    let table = std::fs::read_to_string("/proc/net/route").ok()?;
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            (fields.len() > 7 && fields[1] == "00000000" && fields[7] == "00000000").then(|| {
+                (
+                    fields[6].parse::<u32>().unwrap_or(u32::MAX),
+                    fields[0].to_owned(),
+                )
+            })
+        })
+        .min()
+        .map(|(_, interface)| interface)
+}
+
+/// What the primary controls were last rendered from.
+type PrimaryRenderKey = (RoutingPolicy, Vec<Lane>, Option<String>);
+/// The live profile and save path the backup controls write through.
+type PrimarySave = (Rc<RefCell<Profile>>, Rc<dyn Fn(Profile) -> bool>);
+
+/// Primary connection, ordered backups and automatic failover.
+struct PrimaryControls {
+    group: adw::PreferencesGroup,
+    combo: adw::ComboRow,
+    backups: adw::PreferencesGroup,
+    automatic: gtk::Switch,
+    backup_rows: RefCell<Vec<adw::ActionRow>>,
+    rendered: RefCell<Option<PrimaryRenderKey>>,
+    updating: Cell<bool>,
+    system_default: RefCell<Option<String>>,
+    change: RefCell<PrimaryChange>,
+    feedback: gtk::Label,
+}
+
+impl PrimaryControls {
+    fn new(texts: Texts) -> Self {
+        let group = adw::PreferencesGroup::builder()
+            .title(texts.primary.title)
+            .description(texts.primary.description)
+            .build();
+        let combo = adw::ComboRow::builder().title(texts.primary.row).build();
+        combo.set_widget_name("primary-selector");
+        let automatic = gtk::Switch::builder().valign(gtk::Align::Center).build();
+        automatic.set_widget_name("primary-automatic");
+        automatic.update_property(&[gtk::accessible::Property::Label(texts.primary.automatic)]);
+        let automatic_row = adw::ActionRow::builder()
+            .title(texts.primary.automatic)
+            .subtitle(texts.primary.automatic_subtitle)
+            .activatable_widget(&automatic)
+            .build();
+        automatic_row.add_suffix(&automatic);
+        group.add(&combo);
+        group.add(&automatic_row);
+        let backups = adw::PreferencesGroup::builder()
+            .title(texts.primary.backups)
+            .description(texts.primary.backups_description)
+            .build();
+        let feedback = gtk::Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .visible(false)
+            .build();
+        feedback.add_css_class("error");
+        Self {
+            group,
+            combo,
+            backups,
+            automatic,
+            backup_rows: RefCell::new(vec![]),
+            rendered: RefCell::new(None),
+            updating: Cell::new(false),
+            system_default: RefCell::new(None),
+            change: RefCell::new(PrimaryChange::default()),
+            feedback,
+        }
+    }
+
+    fn choice_label(&self, texts: Texts, choice: &PrimarySelection, profile: &Profile) -> String {
+        match choice {
+            PrimarySelection::FollowSystemDefault => format!(
+                "{} ({})",
+                texts.primary.system_default,
+                self.system_default
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| texts.primary.system_default_unknown.to_owned())
+            ),
+            PrimarySelection::Lane(id) => profile
+                .lanes
+                .iter()
+                .find(|lane| &lane.id == id)
+                .map_or_else(|| id.as_str().to_owned(), |lane| lane.name.clone()),
+        }
+    }
+
+    fn choices(profile: &Profile) -> Vec<PrimarySelection> {
+        std::iter::once(PrimarySelection::FollowSystemDefault)
+            .chain(
+                profile
+                    .lanes
+                    .iter()
+                    .map(|lane| PrimarySelection::Lane(lane.id.clone())),
+            )
+            .collect()
+    }
+
+    /// The lane the preference resolves to now (FollowSystemDefault maps the
+    /// OS default interface back to a configured lane, if any).
+    fn resolved_primary(&self, profile: &Profile, primary: &PrimarySelection) -> Option<LaneId> {
+        match primary {
+            PrimarySelection::Lane(id) => Some(id.clone()),
+            PrimarySelection::FollowSystemDefault => {
+                let default = self.system_default.borrow().clone()?;
+                profile
+                    .lanes
+                    .iter()
+                    .find(|lane| lane.interface.as_str() == default)
+                    .map(|lane| lane.id.clone())
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ConnectionsPage {
     pub list: ListPage,
@@ -286,6 +427,7 @@ pub struct ConnectionsPage {
     on_save: Rc<dyn Fn(Profile) -> bool>,
     rows: Rc<RefCell<Vec<adw::ActionRow>>>,
     rendered: Rc<RefCell<Option<Vec<Lane>>>>,
+    primary: Rc<PrimaryControls>,
 }
 
 impl ConnectionsPage {
@@ -303,7 +445,14 @@ impl ConnectionsPage {
             on_save,
             rows: Rc::new(RefCell::new(vec![])),
             rendered: Rc::new(RefCell::new(None)),
+            primary: Rc::new(PrimaryControls::new(texts)),
         };
+        // Below the connection list: Add stays the first control of the page.
+        page.list.root.append(&page.primary.group);
+        page.list.root.append(&page.primary.feedback);
+        page.list.root.append(&page.primary.backups);
+        page.connect_primary_controls();
+        page.refresh_system_default();
         let parent = page.parent.clone();
         let profile = page.profile.clone();
         let on_save = page.on_save.clone();
@@ -331,9 +480,133 @@ impl ConnectionsPage {
             self.on_save.clone(),
         );
     }
+    /// Reads the OS default interface off the main thread, then re-renders.
+    fn refresh_system_default(&self) {
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            sender.send_blocking(system_default_interface()).ok();
+        });
+        let controls = self.primary.clone();
+        let profile = self.profile.clone();
+        let texts = self.texts;
+        glib::MainContext::ref_thread_default().spawn_local(async move {
+            if let Ok(default) = receiver.recv().await {
+                *controls.system_default.borrow_mut() = default;
+                render_primary(&controls, texts, &profile.borrow());
+            }
+        });
+    }
+
+    fn connect_primary_controls(&self) {
+        let controls = self.primary.clone();
+        let profile = self.profile.clone();
+        let parent = self.parent.clone();
+        let on_save = self.on_save.clone();
+        let texts = self.texts;
+        self.primary.combo.connect_selected_notify(move |combo| {
+            if controls.updating.get() {
+                return;
+            }
+            let current = profile.borrow().clone();
+            let Some(choice) = PrimaryControls::choices(&current)
+                .get(combo.selected() as usize)
+                .cloned()
+            else {
+                return;
+            };
+            if choice == current.routing.primary {
+                return;
+            }
+            let resolved = controls.resolved_primary(&current, &choice);
+            let backups = if current.lanes.len() == 2 {
+                proposed_backups(&current, resolved.as_ref())
+            } else {
+                current
+                    .routing
+                    .backups
+                    .iter()
+                    .filter(|id| Some(*id) != resolved.as_ref())
+                    .cloned()
+                    .collect()
+            };
+            let name = controls.choice_label(texts, &choice, &current);
+            controls.change.borrow_mut().request(PrimaryDraft {
+                primary: choice,
+                backups,
+                ..PrimaryDraft::of(&current)
+            });
+            let Some(window) = parent.upgrade() else {
+                controls.change.borrow_mut().cancel();
+                return;
+            };
+            let confirm = {
+                let controls = controls.clone();
+                let profile = profile.clone();
+                let on_save = on_save.clone();
+                Rc::new(move || {
+                    let outcome = controls.change.borrow_mut().confirm(&profile.borrow());
+                    let saved = match outcome {
+                        Ok(effects) => effects.into_iter().all(|effect| {
+                            let PrimaryEffect::Save(candidate) = effect;
+                            on_save(candidate)
+                        }),
+                        Err(_) => false,
+                    };
+                    controls.feedback.set_label(texts.ux.request_failed);
+                    controls.feedback.set_visible(!saved);
+                    // A failed or stale save shows the stored preference again.
+                    controls.rendered.borrow_mut().take();
+                    render_primary(&controls, texts, &profile.borrow());
+                })
+            };
+            let cancel = {
+                let controls = controls.clone();
+                let profile = profile.clone();
+                Rc::new(move || {
+                    controls.change.borrow_mut().cancel();
+                    controls.rendered.borrow_mut().take();
+                    render_primary(&controls, texts, &profile.borrow());
+                })
+            };
+            confirm_destructive_action_with_label(
+                &window,
+                texts,
+                texts.primary.change_heading,
+                &texts.primary.change_body.replace("{}", &name),
+                texts.confirm,
+                confirm,
+                cancel,
+            );
+        });
+        let controls = self.primary.clone();
+        let profile = self.profile.clone();
+        let on_save = self.on_save.clone();
+        self.primary.automatic.connect_state_set(move |_, enabled| {
+            if controls.updating.get() {
+                return glib::signal::Inhibit(false);
+            }
+            let current = profile.borrow().clone();
+            let draft = PrimaryDraft {
+                automatic_failover: enabled,
+                ..PrimaryDraft::of(&current)
+            };
+            save_primary_draft(&controls, &current, &draft, on_save.as_ref());
+            glib::signal::Inhibit(false)
+        });
+    }
+
     pub fn update(&self, editing_enabled: bool) {
         self.list.add.set_sensitive(editing_enabled);
         self.list.group.set_sensitive(editing_enabled);
+        self.primary.group.set_sensitive(editing_enabled);
+        self.primary.backups.set_sensitive(editing_enabled);
+        render_primary_with(
+            &self.primary,
+            self.texts,
+            &self.profile.borrow(),
+            self.profile.clone(),
+            self.on_save.clone(),
+        );
         let profile = self.profile.borrow().clone();
         if self.rendered.borrow().as_ref() == Some(&profile.lanes) {
             return;
@@ -420,6 +693,7 @@ impl ConnectionsPage {
                                 }
                             }
                             Err(LaneEditError::FallbackInUse) => Some(texts.ux.fallback_in_use),
+                            Err(LaneEditError::RoutingInUse) => Some(texts.primary.routing_in_use),
                             Err(_) => Some(texts.lane_not_found),
                         };
                         feedback.set_label(message.unwrap_or(""));
@@ -433,6 +707,172 @@ impl ConnectionsPage {
             self.rows.borrow_mut().push(row);
         }
     }
+}
+
+fn save_primary_draft(
+    controls: &PrimaryControls,
+    current: &Profile,
+    draft: &PrimaryDraft,
+    on_save: &dyn Fn(Profile) -> bool,
+) {
+    let saved = validate_primary_draft(current, draft)
+        .ok()
+        .is_some_and(on_save);
+    controls.feedback.set_visible(!saved);
+}
+
+fn render_primary(controls: &Rc<PrimaryControls>, texts: Texts, profile: &Profile) {
+    render_primary_inner(controls, texts, profile, None);
+}
+
+fn render_primary_with(
+    controls: &Rc<PrimaryControls>,
+    texts: Texts,
+    profile: &Profile,
+    live: Rc<RefCell<Profile>>,
+    on_save: Rc<dyn Fn(Profile) -> bool>,
+) {
+    render_primary_inner(controls, texts, profile, Some((live, on_save)));
+}
+
+/// Rebuilds the controls only when the policy, lanes or OS default changed;
+/// programmatic selection never triggers the change dialog.
+fn render_primary_inner(
+    controls: &Rc<PrimaryControls>,
+    texts: Texts,
+    profile: &Profile,
+    save: Option<PrimarySave>,
+) {
+    let key = (
+        profile.routing.clone(),
+        profile.lanes.clone(),
+        controls.system_default.borrow().clone(),
+    );
+    if controls.rendered.borrow().as_ref() == Some(&key) {
+        return;
+    }
+    if controls.change.borrow().is_pending() {
+        return;
+    }
+    controls.updating.set(true);
+    let choices = PrimaryControls::choices(profile);
+    let labels = choices
+        .iter()
+        .map(|choice| controls.choice_label(texts, choice, profile))
+        .collect::<Vec<_>>();
+    let labels = labels.iter().map(String::as_str).collect::<Vec<_>>();
+    controls
+        .combo
+        .set_model(Some(&gtk::StringList::new(&labels)));
+    let selected = choices
+        .iter()
+        .position(|choice| *choice == profile.routing.primary)
+        .unwrap_or(0);
+    controls.combo.set_selected(selected as u32);
+    controls
+        .automatic
+        .set_active(profile.routing.automatic_failover);
+    for row in controls.backup_rows.borrow_mut().drain(..) {
+        controls.backups.remove(&row);
+    }
+    let explicit_primary = match &profile.routing.primary {
+        PrimarySelection::Lane(id) => Some(id.clone()),
+        PrimarySelection::FollowSystemDefault => None,
+    };
+    let mut ordered = profile.routing.backups.clone();
+    let others = profile
+        .lanes
+        .iter()
+        .map(|lane| lane.id.clone())
+        .filter(|id| !ordered.contains(id) && Some(id) != explicit_primary.as_ref())
+        .collect::<Vec<_>>();
+    ordered.extend(others);
+    controls.backups.set_visible(!ordered.is_empty());
+    for id in &ordered {
+        let Some(lane) = profile.lanes.iter().find(|lane| &lane.id == id) else {
+            continue;
+        };
+        let included = profile.routing.backups.contains(id);
+        let position = profile.routing.backups.iter().position(|other| other == id);
+        let check = gtk::CheckButton::builder()
+            .active(included)
+            .valign(gtk::Align::Center)
+            .build();
+        check.update_property(&[gtk::accessible::Property::Label(&lane.name)]);
+        let row = adw::ActionRow::builder()
+            .title(&glib::markup_escape_text(&lane.name))
+            .subtitle(lane.interface.as_str())
+            .activatable_widget(&check)
+            .build();
+        row.add_prefix(&check);
+        let up = gtk::Button::builder()
+            .icon_name("go-up-symbolic")
+            .tooltip_text(texts.primary.move_up)
+            .valign(gtk::Align::Center)
+            .sensitive(position.is_some_and(|index| index > 0))
+            .build();
+        let down = gtk::Button::builder()
+            .icon_name("go-down-symbolic")
+            .tooltip_text(texts.primary.move_down)
+            .valign(gtk::Align::Center)
+            .sensitive(position.is_some_and(|index| index + 1 < profile.routing.backups.len()))
+            .build();
+        for (button, label) in [
+            (&up, texts.primary.move_up),
+            (&down, texts.primary.move_down),
+        ] {
+            button.update_property(&[
+                gtk::accessible::Property::Label(label),
+                gtk::accessible::Property::Description(&lane.name),
+            ]);
+        }
+        row.add_suffix(&up);
+        row.add_suffix(&down);
+        if let Some((live, on_save)) = save.clone() {
+            let change = |offset: Option<isize>, toggle: bool| {
+                let controls = controls.clone();
+                let live = live.clone();
+                let on_save = on_save.clone();
+                let id = id.clone();
+                move || {
+                    if controls.updating.get() {
+                        return;
+                    }
+                    let current = live.borrow().clone();
+                    let mut backups = current.routing.backups.clone();
+                    let index = backups.iter().position(|other| other == &id);
+                    match (toggle, index, offset) {
+                        (true, Some(index), _) => {
+                            backups.remove(index);
+                        }
+                        (true, None, _) => backups.push(id.clone()),
+                        (false, Some(index), Some(offset)) => {
+                            let target = index as isize + offset;
+                            if target >= 0 && (target as usize) < backups.len() {
+                                backups.swap(index, target as usize);
+                            }
+                        }
+                        _ => return,
+                    }
+                    let draft = PrimaryDraft {
+                        backups,
+                        ..PrimaryDraft::of(&current)
+                    };
+                    save_primary_draft(&controls, &current, &draft, on_save.as_ref());
+                }
+            };
+            let toggled = change(None, true);
+            check.connect_toggled(move |_| toggled());
+            let raise = change(Some(-1), false);
+            up.connect_clicked(move |_| raise());
+            let lower = change(Some(1), false);
+            down.connect_clicked(move |_| lower());
+        }
+        controls.backups.add(&row);
+        controls.backup_rows.borrow_mut().push(row);
+    }
+    *controls.rendered.borrow_mut() = Some(key);
+    controls.updating.set(false);
 }
 
 #[cfg(test)]
