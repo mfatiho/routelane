@@ -10,6 +10,8 @@ User=root
 Group=root
 RuntimeDirectory=routelane
 RuntimeDirectoryMode=0700
+# Keep the ownership journal while a live kernel plan survives a helper restart.
+RuntimeDirectoryPreserve=yes
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -18,6 +20,8 @@ ProtectSystem=strict
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+# Only the dedicated application subtree is writable; the rest stays read-only.
+ReadWritePaths=-/sys/fs/cgroup/routelane.apps
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 # Mark-aware reverse-path filtering: the helper writes only a selected lane
 # interface's src_valid_mark below this path (never all/default); every other

@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        if command -v systemd-tmpfiles >/dev/null 2>&1; then
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/routelane.conf
+        fi
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload
+            systemctl try-restart routelane-helper.service
+            for run_dir in /run/user/*; do
+                [ -d "$run_dir" ] || continue
+                uid="${run_dir##*/}"
+                user="$(getent passwd "$uid" | cut -d: -f1)" || continue
+                [ -n "$user" ] || continue
+                runuser -u "$user" -- env XDG_RUNTIME_DIR="$run_dir" \
+                    systemctl --user daemon-reload >/dev/null 2>&1 || true
+                runuser -u "$user" -- env XDG_RUNTIME_DIR="$run_dir" \
+                    systemctl --user try-restart routelane-daemon.service >/dev/null 2>&1 || true
+            done
+        fi
+        ;;
+esac
+exit 0
