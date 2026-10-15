@@ -1809,7 +1809,7 @@ fn expected_nft_document(
                             "right": MARK_MAX,
                         }
                     },
-                    {"reject": {}},
+                    {"reject": {"type": "icmpx", "expr": "port-unreachable"}},
                 ],
             }
         }));
@@ -1897,7 +1897,14 @@ fn nft_rule_object(rule: &super::CompiledRule) -> serde_json::Value {
         }
         CompiledAction::Block => {
             expressions.push(serde_json::json!({"counter": null}));
-            expressions.push(serde_json::json!({"reject": {}}));
+            let reject_type = match &rule.target {
+                CompiledTarget::Network(network) if network.addr().is_ipv4() => "icmp",
+                CompiledTarget::Network(_) => "icmpv6",
+                _ => "icmpx",
+            };
+            expressions.push(serde_json::json!({
+                "reject": {"type": reject_type, "expr": "port-unreachable"}
+            }));
         }
     }
     serde_json::json!({
@@ -3979,6 +3986,59 @@ mod tests {
         assert_eq!(
             nft_document_fingerprint(&expected).unwrap(),
             nft_document_fingerprint(&live).unwrap()
+        );
+    }
+
+    #[test]
+    fn reject_uses_explicit_kernel_canonical_type_and_code() {
+        // nft 1.0.9 round-trip: an unspecified reject gains a family-specific
+        // type/code. Omitting it makes an otherwise correct commit look foreign.
+        for (network, family, reject_type) in [
+            ("192.0.2.99/32", IpFamily::V4, "icmp"),
+            ("2001:db8:dead::/48", IpFamily::V6, "icmpv6"),
+        ] {
+            let rule = CompiledRule {
+                family,
+                id: RuleId::from("block"),
+                priority: 1,
+                target: CompiledTarget::Network(network.parse().unwrap()),
+                action: CompiledAction::Block,
+            };
+            let generated = nft_rule_object(&rule);
+            let reject = generated["rule"]["expr"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap();
+            assert_eq!(
+                reject,
+                &serde_json::json!({"reject": {
+                    "type": reject_type, "expr": "port-unreachable"
+                }})
+            );
+            let mut changed = generated.clone();
+            changed["rule"]["expr"]
+                .as_array_mut()
+                .unwrap()
+                .last_mut()
+                .unwrap()["reject"]["expr"] = serde_json::json!("admin-prohibited");
+            assert_ne!(
+                nft_document_fingerprint(&generated).unwrap(),
+                nft_document_fingerprint(&changed).unwrap(),
+                "different reject policies must not become the same ownership proof"
+            );
+        }
+        let guarded = super::expected_nft_document(None, Some(&fixture_valid_plan()), true);
+        let guard_reject = guarded["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|object| object.get("rule"))
+            .find(|rule| rule["chain"] == "guard")
+            .unwrap();
+        assert_eq!(
+            guard_reject["expr"].as_array().unwrap().last().unwrap(),
+            &serde_json::json!({"reject": {"type": "icmpx", "expr": "port-unreachable"}})
         );
     }
 
