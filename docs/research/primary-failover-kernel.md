@@ -1,6 +1,7 @@
 # Ana hat geçişi: kernel araştırma notu
 
-Tarih: 14 Ekim 2026. Kapsam: uygulama planı; çalışan sistemde deney yapılmadı.
+Tarih: 14–15 Ekim 2026. Kapsam: uygulama planı ve izole test VM’si;
+ana makinenin yönlendirme durumunda değişiklik yapılmadı.
 
 ## Doğrulanan kaynak bilgileri
 
@@ -51,3 +52,35 @@ Bu yaklaşımın yerel TCP/UDP, IPv6, dönüş trafiği ve mevcut yardımcı hat
 oturumlarını koruduğu ancak gerçek kernel testleriyle söylenebilir. Başarısız
 testte özellik yayınlanmaz; test atlanması başarı sayılmaz. TUN/proxy,
 tarayıcıya müdahale veya global NAT alternatifine kendiliğinden geçilmez.
+
+## İzole Multipass ortamı ve ilk bulgular
+
+Kullanıcı onayıyla `routelane-test-u2404-20261014` oluşturuldu: 2 vCPU,
+2 GiB bellek, 12 GiB disk; Ubuntu 24.04.5, kernel `6.8.0-142-generic`,
+nftables `1.0.9`. Mevcut dört VM değiştirilmedi; kişisel dizin veya repo
+mount edilmedi. VM içinde `sudo unshare --net ip -j link show` başarılı.
+Bu, ortam hazırlık kanıtıdır; ürün/failover/Polkit kabul sonucu değildir.
+
+Multipass özel cloud image için cloud-init ve SSH gerektirir;
+Ubuntu VM’de başarı Debian/Fedora kabul testlerinin yerine geçmez.
+[Canonical Multipass Image belgesi](https://canonical.com/multipass/docs/latest/explanation/image/).
+
+Mevcut feature-gated gerçek-helper harness’i VM’de çalıştırıldı. İlk
+uygulama kernel/journal eşleştirmesinde başarısız oldu. Aynı VM’nin geçici
+network namespace’inde eski text fixture yüklenip `nft -j list table`
+ile geri okunduğunda boş `reject` ifadesinin kernel tarafından IPv4 için
+`{"type":"icmp","expr":"port-unreachable"}`, IPv6 için
+`{"type":"icmpv6","expr":"port-unreachable"}` olarak genişletildiği
+görüldü. Helper’ın beklenen JSON’unda tür/kod açık yazıldı; farklı reject
+kodlarının aynı ownership fingerprint’ine dönüşmediği ayrıca test edildi.
+Counter değerleri dışında semantik silen bir normalizasyon eklenmedi.
+[JSON REJECT biçimi](https://manpages.debian.org/bookworm/libnftables1/libnftables-json.5.en.html#REJECT),
+[yerel üretim ve regression testi](../../src/backend/privileged.rs).
+
+Düzeltmeden sonraki root koşusu commit eşleştirmesini geçti, ancak
+ilk `203.0.113.10` paket probunda yanıt alamadı: **5 geçti, 1 başarısız**.
+Bu, mark-only yönlendirmenin gerçek kaynak/dönüş yolunu henüz
+sağlamadığını gösteren RED kanıtıdır; scoped NAT/flow-affinity başarısı
+olarak raporlanamaz. Stdio harness’i gerçek backend’i çalıştırır ama
+Polkit’i test etmez; system-bus/Polkit kabul kapısı ayrı kalır.
+[Gerçek helper namespace testi](../../tests/root/namespace_routing.rs).
