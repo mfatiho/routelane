@@ -235,6 +235,7 @@ impl PrivilegedHelperClient for FakeHelper {
             routelane_table_present: plan.is_some() || orphaned,
             snapshot,
             diagnostics: vec![],
+            runtime: Default::default(),
         };
         let gate = self.next_inspect_gate.lock().unwrap().take();
         if let Some(gate) = gate {

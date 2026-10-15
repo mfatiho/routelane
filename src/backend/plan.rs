@@ -116,6 +116,12 @@ pub enum CompiledAction {
 #[serde(transparent)]
 pub struct PlanHash([u8; 32]);
 
+impl PlanHash {
+    pub(crate) fn of_bytes(canonical: &[u8]) -> Self {
+        Self(*blake3::hash(canonical).as_bytes())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ResolutionSnapshot {
     rules: BTreeMap<RuleId, Vec<IpNet>>,

@@ -9,6 +9,7 @@ mod planner;
 mod policy_route;
 mod primary;
 mod privileged;
+mod runtime;
 mod topology;
 mod transaction;
 
@@ -44,6 +45,11 @@ pub use privileged::{
 };
 #[cfg(feature = "root-integration")]
 pub use privileged::{CommandPrivilegedBackend, FileAppliedStateStore, ProcessCommandExecutor};
+pub use runtime::{
+    policy_hash, restrict_to_grant, RuntimeActivation, RuntimeApplyResponse, RuntimeEnvironment,
+    RuntimeGrant, RuntimePhase, RuntimeRecord, RuntimeRestoreReceipt, RuntimeStatus,
+    SystemRuntimeEnvironment, MAX_ACTIVATION_JSON_BYTES, RUNTIME_PROTOCOL_VERSION,
+};
 pub use topology::{
     capture_system_topology, parse_topology, InterfaceIdentity, InterfaceTopology, TopologyError,
     TopologyInput, TopologySnapshot,
