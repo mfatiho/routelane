@@ -1129,6 +1129,7 @@ mod tests {
                     desired_profile_id: None,
                     applied_profile_id: None,
                     last_error: None,
+                    primary: Default::default(),
                 },
                 profiles: vec![],
             })
@@ -1283,6 +1284,7 @@ mod tests {
             desired_profile_id: None,
             applied_profile_id: None,
             last_error: None,
+            primary: Default::default(),
         };
         events
             .try_send(DaemonToUi::Snapshot {
@@ -1432,6 +1434,7 @@ mod tests {
                     desired_profile_id: None,
                     applied_profile_id: None,
                     last_error: None,
+                    primary: Default::default(),
                 },
                 profiles: vec![app_profile.clone()],
             })
@@ -1505,6 +1508,7 @@ mod tests {
                     desired_profile_id: Some(app_profile.id.clone()),
                     applied_profile_id: Some(app_profile.id.clone()),
                     last_error: None,
+                    primary: Default::default(),
                 },
                 profiles: vec![app_profile],
             })

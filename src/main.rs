@@ -344,7 +344,8 @@ fn close_subscription(subscription: &mut Option<EventSubscription>) {
 fn daemon_event_sequence(event: &routelane::ipc::DaemonEvent) -> u64 {
     match event {
         routelane::ipc::DaemonEvent::StateChanged { sequence, .. }
-        | routelane::ipc::DaemonEvent::OperationFailed { sequence, .. } => *sequence,
+        | routelane::ipc::DaemonEvent::OperationFailed { sequence, .. }
+        | routelane::ipc::DaemonEvent::PrimaryChanged { sequence, .. } => *sequence,
     }
 }
 
@@ -520,6 +521,7 @@ mod tests {
                         desired_profile_id: None,
                         applied_profile_id: None,
                         last_error: None,
+                        primary: Default::default(),
                     }),
                     DaemonRequest::ListProfiles => DaemonResult::Profiles(vec![]),
                     other => panic!("refresh must not mutate: {other:?}"),
@@ -614,6 +616,7 @@ mod tests {
                         desired_profile_id: None,
                         applied_profile_id: None,
                         last_error: None,
+                        primary: Default::default(),
                     }),
                     DaemonRequest::ListProfiles => DaemonResult::Profiles(vec![Profile {
                         routing: Default::default(),
@@ -754,10 +757,7 @@ mod tests {
 
         let sequences = events
             .iter()
-            .map(|event| match event {
-                DaemonEvent::StateChanged { sequence, .. }
-                | DaemonEvent::OperationFailed { sequence, .. } => *sequence,
-            })
+            .map(super::daemon_event_sequence)
             .collect::<Vec<_>>();
         assert_eq!(sequences, vec![6, 7]);
         assert!(matches!(
@@ -796,6 +796,7 @@ mod tests {
                             desired_profile_id: None,
                             applied_profile_id: None,
                             last_error: None,
+                            primary: Default::default(),
                         }),
                     ),
                     DaemonRequest::ListProfiles => DaemonResponse::failure(

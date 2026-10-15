@@ -12,8 +12,9 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::application::{matching_processes, RunningProcess};
 use crate::backend::{
-    compile_profile, AppliedKernelState, ApplyResponse, CleanupResponse, InspectResponse,
-    KernelPlan, OrphanRecoveryResponse, ResolutionSnapshot, RestoreResponse, TopologySnapshot,
+    policy_hash, AppliedKernelState, ApplyResponse, CleanupResponse, InspectResponse, KernelPlan,
+    OrphanRecoveryResponse, PlanHash, ResolutionSnapshot, RestoreResponse, RuntimeActivation,
+    RuntimeApplyResponse, RuntimePhase, RuntimeStatus, TopologySnapshot, RUNTIME_PROTOCOL_VERSION,
 };
 use crate::dns::periodic::resolve_domain;
 use crate::domain::{
@@ -37,6 +38,7 @@ const MAX_CONFIG_BYTES: u64 = 1_048_576;
 const HELPER_BUS_NAME: &str = "io.github.routelane.Helper";
 const HELPER_OBJECT_PATH: &str = "/io/github/routelane/Helper";
 const HELPER_INTERFACE: &str = "io.github.routelane.Helper1";
+const HELPER2_INTERFACE: &str = "io.github.routelane.Helper2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonError {
@@ -54,6 +56,13 @@ impl DaemonError {
 
     pub fn helper(message: impl Into<String>) -> Self {
         Self::new("DAEMON_HELPER_FAILED", message)
+    }
+
+    pub fn protocol_mismatch() -> Self {
+        Self::new(
+            "DAEMON_HELPER_PROTOCOL_MISMATCH",
+            "the installed routelane-helper does not provide runtime protocol 2; install matching RouteLane daemon and helper versions",
+        )
     }
 
     pub fn authorization(message: impl Into<String>) -> Self {
@@ -82,10 +91,6 @@ impl DaemonError {
 
     fn config(message: impl Into<String>) -> Self {
         Self::new("DAEMON_CONFIG_FAILED", message)
-    }
-
-    fn planner(message: impl Into<String>) -> Self {
-        Self::new("DAEMON_PLAN_FAILED", message)
     }
 }
 
@@ -137,6 +142,17 @@ pub trait PrivilegedHelperClient: Send + Sync {
         Err(DaemonError::helper(
             "application cgroup operations are unavailable",
         ))
+    }
+    /// Arms helper-owned runtime authority (Helper2). A helper without it is
+    /// an older, incompatible peer.
+    async fn activate_runtime(
+        &self,
+        _activation: &RuntimeActivation,
+    ) -> Result<RuntimeApplyResponse, DaemonError> {
+        Err(DaemonError::protocol_mismatch())
+    }
+    async fn restore_runtime(&self, _receipt: &str) -> Result<RuntimeStatus, DaemonError> {
+        Err(DaemonError::protocol_mismatch())
     }
 }
 
@@ -366,26 +382,17 @@ where
             self.record_failure(error.clone()).await;
             return Err(error);
         }
+        // Saved desired configuration is distinct from what becomes active.
         if let Err(error) = self.config.save(Some(&profile)) {
             self.record_failure(error.clone()).await;
             return Err(error);
         }
 
-        let (candidate_generation, previous_plan) = {
+        let expected_generation = {
             let mut state = self.state.lock().await;
             state.desired = Some(profile.clone());
             state.health = HealthReport::applying();
-            (
-                state.generation + 1,
-                state.applied.as_ref().map(|applied| applied.plan().clone()),
-            )
-        };
-        let topology = match self.topology.snapshot(&profile).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.record_failure(error.clone()).await;
-                return Err(error);
-            }
+            state.generation
         };
         let resolutions = match self.resolutions.snapshot(&profile).await {
             Ok(snapshot) => snapshot,
@@ -394,42 +401,56 @@ where
                 return Err(error);
             }
         };
-        let plan = match compile_profile(&profile, &topology, &resolutions, candidate_generation) {
-            Ok(plan) => plan,
-            Err(error) => {
-                let error = DaemonError::planner(format!("{error:?}"));
-                self.record_failure(error.clone()).await;
-                return Err(error);
-            }
+        let activation = RuntimeActivation {
+            protocol_version: RUNTIME_PROTOCOL_VERSION,
+            profile: profile.clone(),
+            resolutions: resolutions.clone(),
+            expected_generation,
         };
-        let response = match self.helper.apply(&plan).await {
+        // The helper captures topology, compiles and owns the plan and its
+        // generation; the daemon never sends a preview compiled from older
+        // evidence.
+        let response = match self.helper.activate_runtime(&activation).await {
             Ok(response) => response,
             Err(error) => {
                 self.record_failure(error.clone()).await;
                 return Err(error);
             }
         };
-        if response.generation != plan.generation || response.plan_hash != plan.content_hash() {
+        let expected_policy = policy_hash(&profile, &resolutions);
+        let plan = response.plan;
+        let matches_request = response
+            .status
+            .grant
+            .as_ref()
+            .is_some_and(|grant| grant.policy_hash == expected_policy)
+            && plan.profile_id == profile.id
+            && plan.generation > expected_generation
+            && response.status.generation == plan.generation;
+        if !matches_request {
             let error = DaemonError::new(
                 "DAEMON_HELPER_RESPONSE_MISMATCH",
-                "privileged helper response did not match the requested generation and plan hash",
+                "privileged helper armed a runtime that does not match the requested profile",
             );
-            self.restore_failed_candidate(&plan, previous_plan.as_ref())
+            self.restore_runtime_receipt(&response.rollback_receipt)
                 .await?;
             self.record_rolled_back_failure(error.clone()).await;
             return Err(error);
         }
 
-        let health = match self.inspect_plan_health(Some(&profile), &plan).await {
-            Ok(report) if kernel_resources_match_plan(&report) => report,
-            Ok(report) => {
+        let verified = match self
+            .inspect_runtime(Some(&profile), &plan, &expected_policy)
+            .await
+        {
+            Ok(verified) if kernel_resources_match_plan(&verified.health) => verified,
+            Ok(verified) => {
                 let error = DaemonError::new(
                     "DAEMON_HEALTH_VERIFICATION_FAILED",
                     "live kernel state did not match the applied plan",
                 );
-                self.restore_failed_candidate(&plan, previous_plan.as_ref())
+                self.restore_runtime_receipt(&response.rollback_receipt)
                     .await?;
-                self.record_verification_failure(error.clone(), report)
+                self.record_verification_failure(error.clone(), verified.health)
                     .await;
                 return Err(error);
             }
@@ -442,7 +463,7 @@ where
                         format!("could not inspect live kernel health: {}", error.message()),
                     )
                 };
-                self.restore_failed_candidate(&plan, previous_plan.as_ref())
+                self.restore_runtime_receipt(&response.rollback_receipt)
                     .await?;
                 self.record_rolled_back_failure(error.clone()).await;
                 return Err(error);
@@ -455,19 +476,170 @@ where
         };
         {
             let mut state = self.state.lock().await;
-            state.applied = Some(AppliedKernelState::from_plan(&plan));
+            state.applied = Some(AppliedKernelState::from_plan(&verified.plan));
             state.applied_profile = Some(profile);
-            state.generation = plan.generation;
-            state.health = health.clone();
+            state.generation = verified.plan.generation;
+            state.health = verified.health.clone();
+            state.primary = verified.runtime.clone();
             state.last_error = None;
             let sequence = advance_event_sequence(&mut state);
             let _ = self.events.send(DaemonEvent::StateChanged {
                 sequence,
-                generation: plan.generation,
-                health,
+                generation: verified.plan.generation,
+                health: verified.health,
             });
         }
         Ok(result)
+    }
+
+    /// Inspects and pairs the helper's state with a plan it just reported.
+    /// A newer generation of the same grant (an automatic refresh in between)
+    /// is accepted and verified instead of being treated as a mismatch.
+    async fn inspect_runtime(
+        &self,
+        profile: Option<&Profile>,
+        plan: &KernelPlan,
+        expected_policy: &PlanHash,
+    ) -> Result<VerifiedRuntime, DaemonError> {
+        let inspected = self.helper.inspect().await?;
+        let same_grant = inspected
+            .runtime
+            .grant
+            .as_ref()
+            .is_some_and(|grant| grant.policy_hash == *expected_policy);
+        let live = inspected.applied_plan.clone().filter(|live| {
+            Some(live.generation) == inspected.generation
+                && Some(live.content_hash()) == inspected.plan_hash
+                && inspected.runtime.generation == live.generation
+                && (live == plan || (same_grant && live.generation > plan.generation))
+        });
+        let Some(live) = live else {
+            return Err(DaemonError::new(
+                "DAEMON_HELPER_RESPONSE_MISMATCH",
+                "helper inspection does not pair with the reported runtime generation",
+            ));
+        };
+        let snapshot = match profile {
+            Some(profile) => {
+                let topology = self.topology.snapshot(profile).await?;
+                inspected.snapshot.with_topology(&topology)
+            }
+            None => inspected.snapshot,
+        };
+        Ok(VerifiedRuntime {
+            health: evaluate_health(Some(&live), &snapshot),
+            plan: live,
+            runtime: inspected.runtime,
+        })
+    }
+
+    async fn restore_runtime_receipt(&self, receipt: &str) -> Result<(), DaemonError> {
+        if let Err(error) = self.helper.restore_runtime(receipt).await {
+            // A newer helper commit makes the receipt ineligible; it is never
+            // overwritten from here.
+            let error = DaemonError::new(
+                "DAEMON_KERNEL_ROLLBACK_FAILED",
+                format!("failed to restore the previous runtime: {error}"),
+            );
+            self.record_kernel_restore_failure(error.clone()).await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// A helper `RuntimeChanged` announcement (or a resync after the helper
+    /// restarted). Stale generations are ignored; the status is re-read and
+    /// paired with Inspect before it is published.
+    pub async fn on_runtime_changed(&self, announced: RuntimeStatus) {
+        self.follow_runtime(Some(announced)).await;
+    }
+
+    /// Re-reads the helper after it (re)appeared on the bus or at startup.
+    pub async fn resync_runtime(&self) {
+        self.follow_runtime(None).await;
+    }
+
+    async fn follow_runtime(&self, announced: Option<RuntimeStatus>) {
+        let _mutation = self.mutation.lock().await;
+        let (profile, current_generation) = {
+            let state = self.state.lock().await;
+            (state.applied_profile.clone(), state.generation)
+        };
+        if announced
+            .as_ref()
+            .is_some_and(|status| status.generation < current_generation)
+        {
+            return;
+        }
+        let announced_policy = announced
+            .as_ref()
+            .map(|status| status.grant.as_ref().map(|grant| grant.policy_hash));
+        let inspected = match self.helper.inspect().await {
+            Ok(inspected) => inspected,
+            Err(error) => {
+                self.record_failure(DaemonError::new(
+                    "DAEMON_HEALTH_INSPECTION_FAILED",
+                    format!("could not inspect helper after a runtime change: {error}"),
+                ))
+                .await;
+                return;
+            }
+        };
+        let paired = inspected.applied_plan.clone().filter(|live| {
+            Some(live.generation) == inspected.generation
+                && Some(live.content_hash()) == inspected.plan_hash
+                && inspected.runtime.generation == live.generation
+                && announced_policy.is_none_or(|policy| {
+                    inspected
+                        .runtime
+                        .grant
+                        .as_ref()
+                        .map(|grant| grant.policy_hash)
+                        == policy
+                })
+        });
+        let mut state = self.state.lock().await;
+        if inspected.runtime.generation < state.generation {
+            return;
+        }
+        let health = match &paired {
+            Some(plan) => {
+                let snapshot = match &profile {
+                    Some(profile) => match self.topology.snapshot(profile).await {
+                        Ok(topology) => inspected.snapshot.with_topology(&topology),
+                        Err(_) => inspected.snapshot.clone(),
+                    },
+                    None => inspected.snapshot.clone(),
+                };
+                let mut health = evaluate_health(Some(plan), &snapshot);
+                if inspected.runtime.phase != RuntimePhase::Armed
+                    && health.state == HealthState::Healthy
+                {
+                    health = HealthReport::from_parts(
+                        HealthState::Degraded,
+                        health.lanes,
+                        health.diagnostics,
+                    );
+                }
+                state.applied = Some(AppliedKernelState::from_plan(plan));
+                state.generation = plan.generation;
+                health
+            }
+            None if inspected.applied_plan.is_none() && inspected.runtime.grant.is_none() => {
+                state.applied = None;
+                state.applied_profile = None;
+                HealthReport::inactive()
+            }
+            None => HealthReport::from_parts(HealthState::Degraded, Default::default(), vec![]),
+        };
+        state.health = health;
+        state.primary = inspected.runtime;
+        let sequence = advance_event_sequence(&mut state);
+        let _ = self.events.send(DaemonEvent::PrimaryChanged {
+            sequence,
+            generation: state.generation,
+            primary: state.primary.clone(),
+        });
     }
 
     pub async fn set_rule_enabled(
@@ -511,6 +683,7 @@ where
             state.applied = None;
             state.applied_profile = None;
             state.health = HealthReport::inactive();
+            state.primary = RuntimeStatus::default();
             state.last_error = None;
             let generation = state.generation;
             let sequence = advance_event_sequence(&mut state);
@@ -616,35 +789,6 @@ where
         }
     }
 
-    async fn restore_failed_candidate(
-        &self,
-        failed_candidate: &KernelPlan,
-        previous: Option<&KernelPlan>,
-    ) -> Result<(), DaemonError> {
-        let restored = match self.helper.restore(failed_candidate, previous).await {
-            Ok(restored) => restored,
-            Err(error) => {
-                let error = DaemonError::new(
-                    "DAEMON_KERNEL_ROLLBACK_FAILED",
-                    format!("failed to restore kernel state after health check: {error}"),
-                );
-                self.record_kernel_restore_failure(error.clone()).await;
-                return Err(error);
-            }
-        };
-        if restored.generation != previous.map(|plan| plan.generation)
-            || restored.plan_hash != previous.map(KernelPlan::content_hash)
-        {
-            let error = DaemonError::new(
-                "DAEMON_KERNEL_ROLLBACK_FAILED",
-                "privileged helper restore response did not match the previous plan",
-            );
-            self.record_kernel_restore_failure(error.clone()).await;
-            return Err(error);
-        }
-        Ok(())
-    }
-
     async fn record_kernel_restore_failure(&self, error: DaemonError) {
         let ipc_error = IpcError::from(error);
         {
@@ -714,8 +858,18 @@ where
         &self,
         profile: Option<&Profile>,
         plan: &KernelPlan,
-    ) -> Result<HealthReport, DaemonError> {
+    ) -> Result<(HealthReport, RuntimeStatus), DaemonError> {
         let inspected = self.helper.inspect().await?;
+        let mut runtime = inspected.runtime;
+        // A runtime is reported Armed only for the exact plan the daemon verified.
+        let unpaired = inspected.generation != Some(plan.generation)
+            || inspected.plan_hash != Some(plan.content_hash())
+            || runtime.generation != plan.generation;
+        if unpaired && runtime.phase == RuntimePhase::Armed {
+            runtime.phase = RuntimePhase::Degraded;
+            runtime.last_error =
+                Some("helper state does not pair with the verified applied plan".to_owned());
+        }
         let snapshot = match profile {
             Some(profile) => {
                 let topology = self.topology.snapshot(profile).await?;
@@ -723,7 +877,7 @@ where
             }
             None => inspected.snapshot,
         };
-        Ok(evaluate_health(Some(plan), &snapshot))
+        Ok((evaluate_health(Some(plan), &snapshot), runtime))
     }
 
     async fn current_status(&self) -> crate::ipc::DaemonStatus {
@@ -739,10 +893,25 @@ where
                 state.applied.as_ref().map(|applied| applied.plan().clone()),
             )
         };
+        let mut primary = base.primary.clone();
         let health = match plan.as_ref() {
             None => HealthReport::inactive(),
             Some(plan) => match self.inspect_plan_health(profile.as_ref(), plan).await {
-                Ok(report) => report,
+                Ok((report, runtime)) => {
+                    primary = runtime;
+                    if primary.phase != RuntimePhase::Armed
+                        && primary.grant.is_some()
+                        && report.state == HealthState::Healthy
+                    {
+                        HealthReport::from_parts(
+                            HealthState::Degraded,
+                            report.lanes,
+                            report.diagnostics,
+                        )
+                    } else {
+                        report
+                    }
+                }
                 Err(error) => {
                     let state = if error.code() == "DAEMON_NEEDS_AUTHORIZATION" {
                         HealthState::NeedsAuthorization
@@ -764,6 +933,7 @@ where
         };
         let mut status = base.status();
         status.health = health;
+        status.primary = primary;
         status
     }
 
@@ -858,6 +1028,7 @@ where
             state.applied_profile = None;
             state.generation = 0;
             state.health = HealthReport::inactive();
+            state.primary = inspected.runtime;
             state.last_error = None;
             return Ok(());
         };
@@ -888,6 +1059,8 @@ where
             state.applied_profile = applied_profile;
             state.generation = plan.generation;
             state.health = health.clone();
+            // Runtime authority comes only from the helper, never user config.
+            state.primary = inspected.runtime;
             state.last_error = None;
         }
         if kernel_resources_match_plan(&health) {
@@ -935,6 +1108,12 @@ where
         state.last_error = Some(IpcError::from(error.clone()));
         Err(error)
     }
+}
+
+struct VerifiedRuntime {
+    plan: KernelPlan,
+    health: HealthReport,
+    runtime: RuntimeStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -1023,10 +1202,94 @@ impl SystemPrivilegedHelperClient {
         .await
         .map_err(|error| DaemonError::helper(format!("create helper proxy: {error}")))
     }
+
+    async fn runtime_proxy(&self) -> Result<zbus::Proxy<'static>, DaemonError> {
+        zbus::Proxy::new(
+            &self.connection,
+            HELPER_BUS_NAME,
+            HELPER_OBJECT_PATH,
+            HELPER2_INTERFACE,
+        )
+        .await
+        .map_err(|error| DaemonError::helper(format!("create runtime helper proxy: {error}")))
+    }
+
+    /// Forwards helper `RuntimeChanged` announcements, and a resync whenever
+    /// the helper (re)appears on the bus. Subscription happens before the
+    /// caller takes its initial snapshot.
+    /// `None` asks for a resync from Inspect (helper owner changed).
+    pub async fn runtime_changes(
+        &self,
+    ) -> Result<tokio::sync::mpsc::Receiver<Option<RuntimeStatus>>, DaemonError> {
+        let proxy = self.runtime_proxy().await?;
+        let mut signals = proxy
+            .receive_signal("RuntimeChanged")
+            .await
+            .map_err(|error| DaemonError::helper(format!("subscribe to helper: {error}")))?;
+        let mut owners = proxy
+            .receive_owner_changed()
+            .await
+            .map_err(|error| DaemonError::helper(format!("watch helper owner: {error}")))?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            loop {
+                let change = tokio::select! {
+                    message = next_item(&mut signals) => {
+                        let Some(message) = message else { return };
+                        let decoded = message
+                            .body()
+                            .deserialize::<String>()
+                            .ok()
+                            .and_then(|json| serde_json::from_str::<RuntimeStatus>(&json).ok());
+                        match decoded {
+                            Some(status) => Some(status),
+                            None => continue,
+                        }
+                    }
+                    owner = next_item(&mut owners) => {
+                        if owner.is_none() { return }
+                        // Resync from Inspect; a missing helper is not "inactive".
+                        None
+                    }
+                };
+                if sender.send(change).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(receiver)
+    }
 }
 
 #[async_trait]
 impl PrivilegedHelperClient for SystemPrivilegedHelperClient {
+    async fn activate_runtime(
+        &self,
+        activation: &RuntimeActivation,
+    ) -> Result<RuntimeApplyResponse, DaemonError> {
+        let activation_json = serde_json::to_string(activation)
+            .map_err(|error| DaemonError::helper(format!("encode activation: {error}")))?;
+        let proxy = self.runtime_proxy().await?;
+        let response_json: String = proxy
+            .call("ActivateRuntime", &(activation_json.as_str(),))
+            .await
+            .map_err(|error| runtime_call_error("ActivateRuntime", error))?;
+        serde_json::from_str(&response_json).map_err(|error| {
+            DaemonError::helper(format!("decode ActivateRuntime response: {error}"))
+        })
+    }
+
+    async fn restore_runtime(&self, receipt: &str) -> Result<RuntimeStatus, DaemonError> {
+        let proxy = self.runtime_proxy().await?;
+        let response_json: String = proxy
+            .call("RestoreRuntime", &(receipt,))
+            .await
+            .map_err(|error| runtime_call_error("RestoreRuntime", error))?;
+        serde_json::from_str(&response_json).map_err(|error| {
+            DaemonError::helper(format!("decode RestoreRuntime response: {error}"))
+        })
+    }
+
     async fn apply(&self, plan: &KernelPlan) -> Result<ApplyResponse, DaemonError> {
         let plan_json = serde_json::to_string(plan)
             .map_err(|error| DaemonError::helper(format!("encode kernel plan: {error}")))?;
@@ -1124,6 +1387,39 @@ impl PrivilegedHelperClient for SystemPrivilegedHelperClient {
             .await
             .map_err(|error| helper_call_error("AdoptApplicationProcess", error))?;
         Ok(())
+    }
+}
+
+/// `StreamExt::next` without a new dependency (zbus re-exports the trait).
+async fn next_item<S>(stream: &mut S) -> Option<S::Item>
+where
+    S: zbus::export::futures_core::Stream + Unpin,
+{
+    std::future::poll_fn(|context| std::pin::Pin::new(&mut *stream).poll_next(context)).await
+}
+
+/// An older helper without Helper2 is an incompatible peer, not a transient
+/// failure: say what to do.
+fn runtime_call_error(operation: &str, error: zbus::Error) -> DaemonError {
+    let unknown = match &error {
+        zbus::Error::MethodError(name, _, _) => matches!(
+            name.as_str(),
+            "org.freedesktop.DBus.Error.UnknownMethod"
+                | "org.freedesktop.DBus.Error.UnknownInterface"
+                | "org.freedesktop.DBus.Error.UnknownObject"
+        ),
+        zbus::Error::FDO(error) => matches!(
+            error.as_ref(),
+            zbus::fdo::Error::UnknownMethod(_)
+                | zbus::fdo::Error::UnknownInterface(_)
+                | zbus::fdo::Error::UnknownObject(_)
+        ),
+        _ => false,
+    };
+    if unknown {
+        DaemonError::protocol_mismatch()
+    } else {
+        helper_call_error(operation, error)
     }
 }
 

@@ -6,8 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use routelane::backend::{
-    ApplyResponse, CleanupResponse, InspectResponse, KernelPlan, KernelSnapshot,
-    OrphanRecoveryResponse, ResolutionSnapshot, RestoreResponse, SnapshotInput, TopologySnapshot,
+    compile_profile, policy_hash, ApplyResponse, CleanupResponse, InspectResponse, KernelPlan,
+    KernelSnapshot, OrphanRecoveryResponse, ResolutionSnapshot, RestoreResponse, RuntimeActivation,
+    RuntimeApplyResponse, RuntimeGrant, RuntimePhase, RuntimeStatus, SnapshotInput,
+    TopologySnapshot,
 };
 use routelane::daemon::{
     AtomicJsonConfigRepository, ConfigRepository, DaemonError, DaemonService,
@@ -69,7 +71,12 @@ struct FakeHelper {
     next_inspect_gate: Arc<Mutex<Option<InspectGate>>>,
     orphaned: Arc<Mutex<bool>>,
     recovery_calls: Arc<Mutex<usize>>,
+    runtime: Arc<Mutex<RuntimeStatus>>,
+    runtime_previous: Arc<Mutex<Option<RuntimeRestorePoint>>>,
 }
+
+/// What the helper's restore receipt brings back: plan and runtime status.
+type RuntimeRestorePoint = (Option<KernelPlan>, RuntimeStatus);
 
 #[derive(Clone)]
 struct InspectGate {
@@ -145,6 +152,64 @@ impl FakeHelper {
 
 #[async_trait]
 impl PrivilegedHelperClient for FakeHelper {
+    /// Helper2 emulation over the Helper1 bookkeeping: the helper compiles
+    /// and owns the plan, and every injected behavior still applies.
+    async fn activate_runtime(
+        &self,
+        activation: &RuntimeActivation,
+    ) -> Result<RuntimeApplyResponse, DaemonError> {
+        let topology = FakeTopology.snapshot(&activation.profile).await?;
+        let plan = compile_profile(
+            &activation.profile,
+            &topology,
+            &activation.resolutions,
+            activation.expected_generation + 1,
+        )
+        .map_err(|error| DaemonError::helper(format!("{error:?}")))?;
+        let previous = (self.live_plan(), self.runtime.lock().unwrap().clone());
+        let applied = self.apply(&plan).await?;
+        *self.runtime_previous.lock().unwrap() = Some(previous);
+        let status = RuntimeStatus {
+            grant: Some(RuntimeGrant {
+                owner_uid: 1000,
+                boot_id: "boot".into(),
+                network_namespace: 1,
+                policy_hash: policy_hash(&activation.profile, &activation.resolutions),
+                interfaces: Default::default(),
+            }),
+            generation: applied.generation,
+            decision: Some(plan.primary.clone()),
+            phase: RuntimePhase::Armed,
+            last_error: None,
+            failback_in_ms: None,
+        };
+        *self.runtime.lock().unwrap() = RuntimeStatus {
+            generation: plan.generation,
+            ..status.clone()
+        };
+        Ok(RuntimeApplyResponse {
+            status,
+            plan,
+            rollback_receipt: format!("receipt-{}", activation.expected_generation),
+        })
+    }
+
+    async fn restore_runtime(&self, _receipt: &str) -> Result<RuntimeStatus, DaemonError> {
+        let failed = self
+            .live_plan()
+            .ok_or_else(|| DaemonError::helper("no live candidate to restore"))?;
+        let (previous, runtime) = self
+            .runtime_previous
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| DaemonError::helper("no runtime restore receipt"))?;
+        self.restore(&failed, previous.as_ref()).await?;
+        self.runtime_previous.lock().unwrap().take();
+        *self.runtime.lock().unwrap() = runtime.clone();
+        Ok(runtime)
+    }
+
     async fn apply(&self, plan: &KernelPlan) -> Result<ApplyResponse, DaemonError> {
         self.applied.lock().unwrap().push(plan.clone());
         let behavior = self.behavior.lock().unwrap().clone();
@@ -235,7 +300,7 @@ impl PrivilegedHelperClient for FakeHelper {
             routelane_table_present: plan.is_some() || orphaned,
             snapshot,
             diagnostics: vec![],
-            runtime: Default::default(),
+            runtime: self.runtime.lock().unwrap().clone(),
         };
         let gate = self.next_inspect_gate.lock().unwrap().take();
         if let Some(gate) = gate {
@@ -254,6 +319,7 @@ impl PrivilegedHelperClient for FakeHelper {
             }
             _ => {
                 let cleaned = self.live.lock().unwrap().take().is_some();
+                *self.runtime.lock().unwrap() = RuntimeStatus::default();
                 Ok(CleanupResponse {
                     cleaned,
                     diagnostics: vec![],

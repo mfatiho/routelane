@@ -1,4 +1,4 @@
-use crate::backend::AppliedKernelState;
+use crate::backend::{AppliedKernelState, RuntimeStatus};
 use crate::domain::Profile;
 use crate::health::HealthReport;
 use crate::ipc::{DaemonStatus, IpcError};
@@ -12,6 +12,7 @@ pub struct DaemonState {
     pub event_sequence: u64,
     pub health: HealthReport,
     pub last_error: Option<IpcError>,
+    pub primary: RuntimeStatus,
 }
 
 impl DaemonState {
@@ -24,6 +25,7 @@ impl DaemonState {
             event_sequence: 0,
             health: HealthReport::inactive(),
             last_error: None,
+            primary: RuntimeStatus::default(),
         }
     }
 
@@ -38,6 +40,7 @@ impl DaemonState {
                 .as_ref()
                 .map(|applied| applied.plan().profile_id.clone()),
             last_error: self.last_error.clone(),
+            primary: self.primary.clone(),
         }
     }
 }

@@ -417,6 +417,20 @@ impl UiSession {
                 return self.handle_response(response)
             }
             DaemonToUi::Event { epoch, event } if epoch == self.epoch => {
+                if let DaemonEvent::PrimaryChanged {
+                    generation,
+                    sequence,
+                    primary,
+                } = event
+                {
+                    if let Some(mut status) = self.status.clone() {
+                        status.generation = generation;
+                        status.event_sequence = sequence;
+                        status.primary = primary;
+                        self.accept_status(status);
+                    }
+                    return vec![UiEffect::RefreshSnapshot];
+                }
                 let (generation, sequence, health) = match event {
                     DaemonEvent::StateChanged {
                         generation,
@@ -429,6 +443,7 @@ impl UiSession {
                         health,
                         ..
                     } => (generation, sequence, health),
+                    DaemonEvent::PrimaryChanged { .. } => unreachable!("handled above"),
                 };
                 if let Some(mut status) = self.status.clone() {
                     status.generation = generation;
@@ -628,6 +643,7 @@ mod tests {
             desired_profile_id: Some("work".into()),
             applied_profile_id: active.then(|| "work".into()),
             last_error: None,
+            primary: Default::default(),
         }
     }
 

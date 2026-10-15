@@ -55,6 +55,7 @@ fn inactive_status() -> DaemonStatus {
         desired_profile_id: None,
         applied_profile_id: None,
         last_error: None,
+        primary: Default::default(),
     }
 }
 
@@ -66,6 +67,7 @@ fn applied_status() -> DaemonStatus {
         desired_profile_id: Some("work".into()),
         applied_profile_id: Some("work".into()),
         last_error: None,
+        primary: Default::default(),
     }
 }
 
@@ -167,7 +169,42 @@ async fn status_text_is_bounded_and_human_readable() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "state=Healthy generation=7 applied_profile=work\n"
+        "state=Healthy generation=7 applied_profile=work\nprimary phase=Inactive\n"
+    );
+}
+
+#[tokio::test]
+async fn status_text_reports_preferred_and_effective_exit_per_family() {
+    use routelane::backend::{
+        FamilyExit, FamilyPair, PrimaryDecision, RuntimePhase, RuntimeStatus,
+    };
+    let runtime = TempDir::new().unwrap();
+    let mut status = applied_status();
+    status.primary = RuntimeStatus {
+        generation: 7,
+        decision: Some(PrimaryDecision {
+            preferred: FamilyPair {
+                v4: Some("ethernet".into()),
+                v6: None,
+            },
+            effective: FamilyPair {
+                v4: FamilyExit::Lane("vinn".into()),
+                v6: FamilyExit::Blocked,
+            },
+        }),
+        phase: RuntimePhase::Armed,
+        ..RuntimeStatus::default()
+    };
+    serve_once(runtime.path(), |_| {}, Ok(DaemonResult::Status(status))).await;
+
+    let output = run_cli(runtime.path(), &["status"]).await;
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "state=Healthy generation=7 applied_profile=work\n\
+         primary phase=Armed ipv4=ethernet->vinn ipv6=-->blocked\n\
+         note=effective exits follow local link evidence; internet reachability is not verified\n"
     );
 }
 
