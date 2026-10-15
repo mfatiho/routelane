@@ -345,6 +345,7 @@ fn applied_fixture_plan(generation: u64) -> KernelPlan {
     KernelPlan {
         primary: Default::default(),
         local_networks: vec![],
+        local_addresses: vec![],
         generation,
         profile_id: ProfileId::from("default"),
         lanes: vec![],

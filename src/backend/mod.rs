@@ -1,5 +1,6 @@
 mod cgroup;
 mod inspect;
+mod nft_document;
 mod nftables;
 mod plan;
 mod planner;
@@ -17,6 +18,7 @@ pub use inspect::{
     KernelSnapshot, ResourceConflict, ResourceState, SnapshotCommands, SnapshotInput,
     SnapshotParseError, SnapshotSource,
 };
+pub use nft_document::render_nft_document;
 pub use nftables::{render_ruleset, NftRenderError, TableMode};
 pub use plan::{
     CompiledAction, CompiledRule, CompiledTarget, KernelPlan, LaneAvailability, LanePlan, PlanHash,

@@ -140,6 +140,7 @@ fn compile_profile_inner(
     Ok(KernelPlan {
         primary: primary.clone(),
         local_networks: topology.connected_networks(),
+        local_addresses: topology.assigned_addresses(),
         generation,
         profile_id: profile.id.clone(),
         lanes: lane_plans,

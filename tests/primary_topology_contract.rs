@@ -112,6 +112,23 @@ fn tentative_ipv6_is_not_ready() {
 }
 
 #[test]
+fn deprecated_valid_addresses_identify_local_flows_but_cannot_start_an_exit() {
+    let mut a = addresses();
+    a[0]["addr_info"][1]["deprecated"] = json!(true);
+    a[0]["addr_info"][1]["preferred_life_time"] = json!(0);
+    a[0]["addr_info"][1]["valid_life_time"] = json!(600);
+    a[1]["addr_info"][1]["flags"] = json!(["tentative"]);
+    let s = snapshot(links(), a, routes4(), routes6(), rules());
+    assert!(!s.interface("eth0").unwrap().ready(IpFamily::V6));
+    assert!(s
+        .assigned_addresses()
+        .contains(&"2001:db8:1::2".parse().unwrap()));
+    assert!(!s
+        .assigned_addresses()
+        .contains(&"2001:db8:2::2".parse().unwrap()));
+}
+
+#[test]
 fn same_name_new_ifindex_is_not_same_identity() {
     let before = snapshot(links(), addresses(), routes4(), routes6(), rules());
     let mut l = links();

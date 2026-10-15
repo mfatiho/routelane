@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -10,6 +11,7 @@ const APPLICATION_CGROUP_ROOT: &str = "/sys/fs/cgroup/routelane.apps";
 
 pub fn application_cgroup_rule_ids(rules: &[CompiledRule]) -> Result<Vec<RuleId>, CgroupError> {
     let mut ids = Vec::new();
+    let mut seen = BTreeSet::new();
     for rule in rules {
         let CompiledTarget::Cgroup(path) = &rule.target else {
             continue;
@@ -20,7 +22,9 @@ pub fn application_cgroup_rule_ids(rules: &[CompiledRule]) -> Result<Vec<RuleId>
         if id != rule.id.as_str() {
             return Err(CgroupError::InvalidRuleId);
         }
-        ids.push(rule.id.clone());
+        if seen.insert(rule.id.clone()) {
+            ids.push(rule.id.clone());
+        }
     }
     Ok(ids)
 }
@@ -313,13 +317,16 @@ mod tests {
 
     #[test]
     fn application_rule_ids_are_extracted_from_a_validated_kernel_plan() {
-        let rules = vec![crate::backend::CompiledRule {
+        let mut rules = vec![crate::backend::CompiledRule {
             family: crate::backend::IpFamily::V4,
             id: RuleId::from("browser"),
             priority: 1,
             target: crate::backend::CompiledTarget::Cgroup("routelane.apps/browser".to_owned()),
             action: crate::backend::CompiledAction::Mark(crate::backend::MARK_BASE),
         }];
+        let mut second_family = rules[0].clone();
+        second_family.family = crate::backend::IpFamily::V6;
+        rules.push(second_family);
 
         assert_eq!(
             super::application_cgroup_rule_ids(&rules).unwrap(),

@@ -24,7 +24,7 @@ ana makinenin yönlendirme durumunda değişiklik yapılmadı.
 Bu kaynaklar bugünkü upstream belgeleridir; dağıtımların kurulu kernel/nft/systemd
 sürümleri için çalıştırılmış uyumluluk kanıtı değildir.
 
-## Depoda doğrulanan durum
+## Tasarım öncesi başlangıç durumu
 
 - [Topology keşfi](../../src/daemon/service.rs:1019), bütün tablolardaki default
   rotaları topluyor; metric, carrier ve kaynak adresi taşımıyor. Kendi routing
@@ -84,3 +84,40 @@ sağlamadığını gösteren RED kanıtıdır; scoped NAT/flow-affinity başarı
 olarak raporlanamaz. Stdio harness’i gerçek backend’i çalıştırır ama
 Polkit’i test etmez; system-bus/Polkit kabul kapısı ayrı kalır.
 [Gerçek helper namespace testi](../../tests/root/namespace_routing.rs).
+
+## 15 Ekim: ortak renderer ve gerçek-helper ilerlemesi
+
+Ortak politika üreticisi artık JSON ve text çıktısını aynı belgeye dayandırıyor.
+İzole VM’de explicit IPv4 Route ve IPv6 Block içeren 86 nesnelik politika
+iki biçimde de yüklenip kernel’den geri okundu: **JSON EXACT, TEXT EXACT**.
+Karşılaştırma yalnız nft metadata/handle ve çalışan counter değerlerini yok saydı;
+mark, aile, sıra, hedef, hook, kaynak kanıtı ve verdict ifadeleri korunarak karşılaştırıldı.
+[Ortak renderer ve davranış testleri](../../tests/nftables_contract.rs).
+
+Kernel, IP payload’dan çıkarabildiği redundant protokol koşullarını dump’tan
+kaldırıyor; ardışık mark sınırlarını range’e birleştiriyor. Bu biçimleri doğrudan
+üretmek exact ownership hatalarını giderdi; semantik silen genel bir eşitlik
+normalizasyonu eklenmedi. `meta iif/oif` adlarının yükleme sırasında ifindex’e
+bağlanması ve `ct original ip/ip6 saddr` dump biçimi de gerçek VM’de doğrulandı.
+[nftables ifadeleri](https://netfilter.org/projects/nftables/manpage.html),
+[ortak politika kodu](../../src/backend/nft_document.rs).
+
+Güncel gerçek-helper root harness’i **6/6 geçti**: üç lane IPv4 paket erişimi,
+Block/Direct sayaçları, activation-failure rollback, önceki generation’a restore
+ve journal kaybı sonrası unchanged owned-table recovery. Bu stdio test transport’u
+Polkit kanıtı değildir. Strict RPF, gerçek TCP/UDP/IPv6 bağlantıları, otomatik
+failover/failback runtime’ı ve Debian/Fedora kabul kapıları hâlâ tamamlanmalıdır.
+Ana makinenin routing/kernel ayarları ve mevcut dört VM değiştirilmedi.
+
+Son koşuda pasif paket gözlemi de kaynak düzeltmesini doğruladı: A hattındaki
+ARP artık `who-has 10.10.1.1 tell 10.10.1.2`; ardından
+`10.10.1.2 > 203.0.113.10` istek ve karşılık gelen ICMP yanıtı görüldü.
+B/C hatlarında da kendi kaynak adresleriyle istek/yanıt alındı. Önceki
+mark-only koşudaki çapraz kaynaklı, yanıtsız ARP yeniden oluşmadı.
+
+Yeni `rules_v2_…` consistency seal, committed NFT politikasının değişmediğini
+kontrol eder; yetkilendirme imzası değildir. Geçici guard bunun dışında tutulur,
+ama journal’ın guarded/pending exact fingerprint’i bütün guard ifadelerini
+doğrulamaya devam eder. Journal yoksa modern guarded tablo otomatik orphan
+cleanup ile silinmez; doğrulanamayan bir geçiş durumunda temizlik reddedilir.
+[Ownership ve regression testleri](../../src/backend/privileged.rs).

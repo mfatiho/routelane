@@ -1482,6 +1482,7 @@ mod tests {
                         plan_hash: routelane::backend::KernelPlan {
                             primary: Default::default(),
                             local_networks: vec![],
+                            local_addresses: vec![],
                             generation: 1,
                             profile_id: app_profile.id.clone(),
                             lanes: vec![],

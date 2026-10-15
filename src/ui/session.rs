@@ -657,6 +657,7 @@ mod tests {
         let hash = KernelPlan {
             primary: Default::default(),
             local_networks: vec![],
+            local_addresses: vec![],
             generation,
             profile_id: "work".into(),
             lanes: vec![],

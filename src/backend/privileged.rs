@@ -13,6 +13,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use super::nft_document::{
+    has_valid_policy_seal, normalize_nft_document, state_chain_name, POLICY_SEAL_PREFIX,
+};
 use crate::domain::LaneId;
 
 use super::transaction::restore_plan as restore_kernel_plan;
@@ -1765,170 +1768,7 @@ fn expected_nft_document(
     pending_transaction: Option<&KernelPlan>,
     include_guard: bool,
 ) -> serde_json::Value {
-    let mut objects = vec![
-        serde_json::json!({}),
-        serde_json::json!({
-            "table": {"family": "inet", "name": "routelane"}
-        }),
-    ];
-    if let Some(plan) = plan {
-        objects.push(chain_object(&state_chain_name(plan)));
-    }
-    if let Some(pending) = pending_transaction {
-        objects.push(chain_object(&transaction_chain_name(pending)));
-    }
-    if include_guard {
-        objects.push(serde_json::json!({
-            "chain": {
-                "family": "inet",
-                "table": "routelane",
-                "name": "guard",
-                "type": "route",
-                "hook": "output",
-                "prio": -149,
-                "policy": "accept",
-            }
-        }));
-        objects.push(serde_json::json!({
-            "rule": {
-                "family": "inet",
-                "table": "routelane",
-                "chain": "guard",
-                "expr": [
-                    {
-                        "match": {
-                            "op": ">=",
-                            "left": {"meta": {"key": "mark"}},
-                            "right": MARK_BASE,
-                        }
-                    },
-                    {
-                        "match": {
-                            "op": "<=",
-                            "left": {"meta": {"key": "mark"}},
-                            "right": MARK_MAX,
-                        }
-                    },
-                    {"reject": {"type": "icmpx", "expr": "port-unreachable"}},
-                ],
-            }
-        }));
-    }
-    if let Some(plan) = plan {
-        objects.push(serde_json::json!({
-            "chain": {
-                "family": "inet",
-                "table": "routelane",
-                "name": "output",
-                "type": "route",
-                "hook": "output",
-                "prio": -150,
-                "policy": "accept",
-            }
-        }));
-        objects.extend(plan.rules.iter().map(nft_rule_object));
-    }
-    serde_json::json!({"nftables": objects})
-}
-
-fn chain_object(name: &str) -> serde_json::Value {
-    serde_json::json!({
-        "chain": {"family": "inet", "table": "routelane", "name": name}
-    })
-}
-
-fn nft_rule_object(rule: &super::CompiledRule) -> serde_json::Value {
-    let mut expressions = Vec::new();
-    match &rule.target {
-        CompiledTarget::Any => {}
-        CompiledTarget::Cgroup(path) => expressions.push(serde_json::json!({
-            "match": {
-                "op": "==",
-                "left": {"socket": {"key": "cgroupv2", "level": 2}},
-                "right": path,
-            }
-        })),
-        CompiledTarget::Network(network) => {
-            let protocol = if network.addr().is_ipv4() {
-                "ip"
-            } else {
-                "ip6"
-            };
-            let destination =
-                if network.prefix_len() == if network.addr().is_ipv4() { 32 } else { 128 } {
-                    serde_json::Value::String(network.addr().to_string())
-                } else {
-                    serde_json::json!({
-                        "prefix": {
-                            "addr": network.addr().to_string(),
-                            "len": network.prefix_len(),
-                        }
-                    })
-                };
-            expressions.push(serde_json::json!({
-                "match": {
-                    "op": "==",
-                    "left": {"payload": {"protocol": protocol, "field": "daddr"}},
-                    "right": destination,
-                }
-            }));
-        }
-    }
-    match rule.action {
-        CompiledAction::Mark(mark) => {
-            expressions.push(serde_json::json!({
-                "mangle": {
-                    "key": {"meta": {"key": "mark"}},
-                    "value": mark,
-                }
-            }));
-            expressions.push(serde_json::json!({"counter": null}));
-            expressions.push(serde_json::json!({"return": null}));
-        }
-        CompiledAction::Direct => {
-            expressions.push(serde_json::json!({
-                "mangle": {
-                    "key": {"meta": {"key": "mark"}},
-                    "value": 0,
-                }
-            }));
-            expressions.push(serde_json::json!({"counter": null}));
-            expressions.push(serde_json::json!({"return": null}));
-        }
-        CompiledAction::Block => {
-            expressions.push(serde_json::json!({"counter": null}));
-            let reject_type = match &rule.target {
-                CompiledTarget::Network(network) if network.addr().is_ipv4() => "icmp",
-                CompiledTarget::Network(_) => "icmpv6",
-                _ => "icmpx",
-            };
-            expressions.push(serde_json::json!({
-                "reject": {"type": reject_type, "expr": "port-unreachable"}
-            }));
-        }
-    }
-    serde_json::json!({
-        "rule": {
-            "family": "inet",
-            "table": "routelane",
-            "chain": "output",
-            "expr": expressions,
-        }
-    })
-}
-
-fn state_chain_name(plan: &KernelPlan) -> String {
-    let serialized =
-        serde_json::to_vec(&plan.content_hash()).expect("serializing a plan hash cannot fail");
-    let fingerprint = blake3::hash(&serialized).to_hex();
-    format!("state_g{}_{:.16}", plan.generation, fingerprint)
-}
-
-fn transaction_chain_name(plan: &KernelPlan) -> String {
-    let serialized =
-        serde_json::to_vec(&plan.content_hash()).expect("serializing a plan hash cannot fail");
-    let fingerprint = blake3::hash(&serialized).to_hex();
-    format!("transaction_g{}_{:.16}", plan.generation, fingerprint)
+    super::render_nft_document(plan, pending_transaction, include_guard)
 }
 
 fn run_nft_batch(
@@ -2588,9 +2428,25 @@ fn validate_orphan_nft_document(document: &serde_json::Value) -> Result<(), Priv
         .get("nftables")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| PrivilegedError::new("RouteLane nftables ownership document is invalid"))?;
+    let modern = objects.iter().any(|o| {
+        o["chain"]["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with(POLICY_SEAL_PREFIX))
+    });
+    if modern && !has_valid_policy_seal(document) {
+        return Err(PrivilegedError::new(
+            "RouteLane nftables ownership content seal does not match the complete live table",
+        ));
+    }
+    if modern && objects.iter().any(|o| o["chain"]["name"] == "guard") {
+        return Err(PrivilegedError::new(
+            "RouteLane temporary guard requires its exact transaction journal for recovery",
+        ));
+    }
     let mut tables = 0;
     let mut outputs = 0;
     let mut markers = 0;
+    let mut chains = BTreeSet::new();
     for object in objects {
         if object.get("metainfo").is_some() {
             continue;
@@ -2618,10 +2474,23 @@ fn validate_orphan_nft_document(document: &serde_json::Value) -> Result<(), Priv
                     .get("name")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| PrivilegedError::new("RouteLane nftables chain has no name"))?;
+                if !chains.insert(name.to_owned()) {
+                    return Err(PrivilegedError::new(
+                        "RouteLane nftables chain is duplicated",
+                    ));
+                }
+                if modern && !modern_owned_chain(value) {
+                    return Err(PrivilegedError::new(
+                        "RouteLane nftables chain does not match an exact owned hook or selector",
+                    ));
+                }
                 if name == "output" {
                     outputs += 1;
                 } else if valid_state_chain_name(name) {
                     markers += 1;
+                } else if modern {
+                    // The modern layout is accepted only as a complete,
+                    // unchanged sealed document, never by table name alone.
                 } else {
                     return Err(PrivilegedError::new(
                         "RouteLane nftables table contains an unrecognized ownership marker",
@@ -2629,7 +2498,17 @@ fn validate_orphan_nft_document(document: &serde_json::Value) -> Result<(), Priv
                 }
             }
             "rule" => {
-                if value.get("chain").and_then(serde_json::Value::as_str) != Some("output") {
+                let name = value.get("chain").and_then(serde_json::Value::as_str);
+                let permitted = if modern {
+                    name.is_some_and(|name| {
+                        chains.contains(name)
+                            && !valid_state_chain_name(name)
+                            && !name.starts_with(POLICY_SEAL_PREFIX)
+                    })
+                } else {
+                    name == Some("output")
+                };
+                if !permitted {
                     return Err(PrivilegedError::new(
                         "RouteLane nftables rule is outside the owned output chain",
                     ));
@@ -2643,7 +2522,62 @@ fn validate_orphan_nft_document(document: &serde_json::Value) -> Result<(), Priv
             "RouteLane nftables table has no unique validated ownership marker",
         ));
     }
+    if modern
+        && [
+            "restore4",
+            "restore6",
+            "prerouting",
+            "egress_guard",
+            "source_nat",
+        ]
+        .iter()
+        .any(|name| !chains.contains(*name))
+    {
+        return Err(PrivilegedError::new(
+            "RouteLane nftables policy is missing a required owned chain",
+        ));
+    }
     Ok(())
+}
+
+fn modern_owned_chain(chain: &serde_json::Value) -> bool {
+    let Some(name) = chain["name"].as_str() else {
+        return false;
+    };
+    let expected = match name {
+        "output" => Some(("route", "output", -150)),
+        "prerouting" => Some(("filter", "prerouting", -150)),
+        "egress_guard" => Some(("filter", "postrouting", 99)),
+        "source_nat" => Some(("nat", "postrouting", 100)),
+        "guard" => Some(("route", "output", -149)),
+        _ => None,
+    };
+    if let Some((kind, hook, priority)) = expected {
+        return chain["type"] == kind
+            && chain["hook"] == hook
+            && chain["prio"] == priority
+            && chain["policy"] == "accept";
+    }
+    let regular = name == "restore4"
+        || name == "restore6"
+        || valid_state_chain_name(name)
+        || name.strip_prefix(POLICY_SEAL_PREFIX).is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+        || ["select4_", "select6_"].iter().any(|prefix| {
+            name.strip_prefix(prefix).is_some_and(|mark| {
+                mark.len() == 8
+                    && u32::from_str_radix(mark, 16)
+                        .is_ok_and(|m| (MARK_BASE..=MARK_MAX).contains(&m))
+            })
+        });
+    regular
+        && ["type", "hook", "prio", "policy"]
+            .iter()
+            .all(|key| chain.get(key).is_none())
 }
 
 fn valid_state_chain_name(name: &str) -> bool {
@@ -3042,31 +2976,6 @@ fn read_nft_table(executor: &mut impl CommandExecutor) -> Result<serde_json::Val
     let output = run_required(executor, &command, "inspect exact RouteLane nftables table")?;
     serde_json::from_slice(&output)
         .map_err(|error| RunnerError::new(format!("invalid nftables table JSON: {error}")))
-}
-
-fn normalize_nft_document(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(object) => {
-            object.remove("metainfo");
-            object.remove("handle");
-            if object.get("counter").is_some_and(|counter| {
-                counter.as_object().is_some_and(|counter| {
-                    counter.contains_key("packets") || counter.contains_key("bytes")
-                })
-            }) {
-                object.insert("counter".to_owned(), serde_json::Value::Null);
-            }
-            for nested in object.values_mut() {
-                normalize_nft_document(nested);
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for nested in values {
-                normalize_nft_document(nested);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn route_present(
@@ -3855,14 +3764,13 @@ mod tests {
 
     use super::{
         authorization_result, build_pending_expectations, command_invocation,
-        execute_invocation_with_timeout, nft_document_fingerprint, nft_rule_object,
-        render_guarded_ruleset, render_owned_ruleset, render_transaction_ruleset, run_nft_batch,
-        validate_privileged_plan, validate_root_owned_file_attributes, AppliedStateStore,
-        ApplyResponse, AuthorizationError, Authorizer, CleanupResponse, CommandExecutor,
-        CommandInvocation, CommandOutput, CommandPrivilegedBackend, InspectResponse,
-        OrphanRecoveryResponse, PrivilegedBackend, PrivilegedError, PrivilegedService,
-        RestoreReceipt, RestoreResponse, ServiceError, StoredAppliedState, ValidationError,
-        IP_BINARY, MAX_PLAN_JSON_BYTES, NFT_BINARY,
+        execute_invocation_with_timeout, nft_document_fingerprint, render_guarded_ruleset,
+        render_owned_ruleset, render_transaction_ruleset, run_nft_batch, validate_privileged_plan,
+        validate_root_owned_file_attributes, AppliedStateStore, ApplyResponse, AuthorizationError,
+        Authorizer, CleanupResponse, CommandExecutor, CommandInvocation, CommandOutput,
+        CommandPrivilegedBackend, InspectResponse, OrphanRecoveryResponse, PrivilegedBackend,
+        PrivilegedError, PrivilegedService, RestoreReceipt, RestoreResponse, ServiceError,
+        StoredAppliedState, ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES, NFT_BINARY,
     };
     use crate::backend::{
         CommandSpec, CompiledAction, CompiledRule, CompiledTarget, IpFamily, KernelPlan,
@@ -3891,6 +3799,7 @@ mod tests {
         KernelPlan {
             primary: Default::default(),
             local_networks: vec![],
+            local_addresses: vec![],
             generation: 1,
             profile_id: ProfileId::from("default"),
             lanes: vec![fixture_lane("privacy", 0)],
@@ -3911,12 +3820,12 @@ mod tests {
     }
 
     #[test]
-    fn privileged_nft_renderer_makes_mark_action_terminal_after_counter() {
+    fn privileged_nft_renderer_delegates_mark_to_terminal_selection_after_counter() {
         let mut plan = fixture_valid_plan();
         let rule = plan.rules.remove(0);
 
         assert_eq!(
-            nft_rule_object(&rule)["rule"]["expr"],
+            serde_json::Value::Array(super::super::nft_document::explicit_rule(&plan, &rule)),
             serde_json::json!([
                 {
                     "match": {
@@ -3925,14 +3834,8 @@ mod tests {
                         "right": {"prefix": {"addr": "203.0.113.0", "len": 24}}
                     }
                 },
-                {
-                    "mangle": {
-                        "key": {"meta": {"key": "mark"}},
-                        "value": MARK_BASE
-                    }
-                },
                 {"counter": null},
-                {"return": null}
+                {"goto": {"target":"select4_524c0001"}}
             ])
         );
     }
@@ -3948,7 +3851,7 @@ mod tests {
         };
 
         assert_eq!(
-            nft_rule_object(&rule)["rule"]["expr"][0],
+            super::super::nft_document::explicit_rule(&fixture_valid_plan(), &rule)[1],
             serde_json::json!({
                 "match": {
                     "op": "==",
@@ -3990,6 +3893,24 @@ mod tests {
     }
 
     #[test]
+    fn orphan_recovery_accepts_current_policy_only_with_unchanged_content_seal() {
+        let valid = super::expected_nft_document(Some(&fixture_valid_plan()), None, false);
+        let without_metadata = serde_json::json!({"nftables": valid["nftables"].as_array().unwrap()
+            .iter().filter(|o| !o.as_object().unwrap().is_empty()).cloned().collect::<Vec<_>>()});
+        assert!(super::validate_orphan_nft_document(&without_metadata).is_ok());
+        let mut changed = without_metadata.clone();
+        let expression = changed["nftables"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .filter_map(|o| o.get_mut("rule"))
+            .find(|r| r["chain"] == "output")
+            .unwrap();
+        expression["expr"] = serde_json::json!([{"accept":null}]);
+        assert!(super::validate_orphan_nft_document(&changed).is_err());
+    }
+
+    #[test]
     fn reject_uses_explicit_kernel_canonical_type_and_code() {
         // nft 1.0.9 round-trip: an unspecified reject gains a family-specific
         // type/code. Omitting it makes an otherwise correct commit look foreign.
@@ -4004,7 +3925,8 @@ mod tests {
                 target: CompiledTarget::Network(network.parse().unwrap()),
                 action: CompiledAction::Block,
             };
-            let generated = nft_rule_object(&rule);
+            let generated = serde_json::json!({"rule":{"expr":
+                super::super::nft_document::explicit_rule(&fixture_valid_plan(), &rule)}});
             let reject = generated["rule"]["expr"]
                 .as_array()
                 .unwrap()
@@ -4034,7 +3956,14 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|object| object.get("rule"))
-            .find(|rule| rule["chain"] == "guard")
+            .find(|rule| {
+                rule["chain"] == "guard"
+                    && rule["expr"].as_array().is_some_and(|expressions| {
+                        expressions
+                            .iter()
+                            .any(|expression| expression.get("reject").is_some())
+                    })
+            })
             .unwrap();
         assert_eq!(
             guard_reject["expr"].as_array().unwrap().last().unwrap(),
