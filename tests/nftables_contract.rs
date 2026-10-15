@@ -105,7 +105,10 @@ mod affinity {
                 "mark" => json!(packet.ct_mark),
                 "direction" => json!(packet.direction),
                 "state" => json!(packet.state),
-                "ip saddr" | "ip6 saddr" => json!(packet.source),
+                // Like the kernel's src_ip/src_ip6 keys: no match across families.
+                "ip saddr" if packet.family == "ipv4" => json!(packet.source),
+                "ip6 saddr" if packet.family == "ipv6" => json!(packet.source),
+                "ip saddr" | "ip6 saddr" => Value::Null,
                 key => panic!("unsupported ct {key}"),
             };
         }
@@ -694,6 +697,24 @@ fn renders_route_direct_and_enabled_block_in_priority_order() {
     let rendered = render_ruleset(&plan, TableMode::Create).unwrap();
 
     assert_eq!(rendered, include_str!("fixtures/nftables/three-lane.nft"));
+}
+
+#[test]
+fn source_proof_rules_carry_no_redundant_family_dependency() {
+    // `ct original ip saddr`/`ip6 saddr` load family-specific conntrack keys
+    // that only match their own family. nft 1.1.6 (Ubuntu 26.04) hides an
+    // explicit nfproto in front of them in some rules but not others, so a
+    // dump of that form cannot prove the exact committed document.
+    let rendered = render_ruleset(&fixture_kernel_plan_with_all_actions(), TableMode::Create)
+        .expect("render source proof rules");
+    let source_rules: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.contains("ct original ip"))
+        .collect();
+    assert_eq!(source_rules.len(), 6);
+    for line in source_rules {
+        assert!(!line.contains("meta nfproto"), "{line}");
+    }
 }
 
 #[test]
