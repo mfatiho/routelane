@@ -166,14 +166,15 @@ fn format_response(response: DaemonResponse, output: OutputFormat) -> Result<Str
     }
     match (output, response.result) {
         (OutputFormat::StatusText, Some(DaemonResult::Status(status))) => Ok(format!(
-            "state={:?} generation={} applied_profile={}",
+            "state={:?} generation={} applied_profile={}\n{}",
             status.health.state,
             status.generation,
             status
                 .applied_profile_id
                 .as_ref()
                 .map(|id| id.as_str())
-                .unwrap_or("-")
+                .unwrap_or("-"),
+            primary_summary(&status.primary)
         )),
         (OutputFormat::StatusJson, Some(DaemonResult::Status(status))) => {
             serde_json::to_string(&status)
@@ -189,6 +190,31 @@ fn format_response(response: DaemonResponse, output: OutputFormat) -> Result<Str
             "IPC_INVALID_RESPONSE: daemon returned an unexpected result",
         )),
     }
+}
+
+/// Preferred and effective exit per family. The effective exit is chosen
+/// from local link, address and route evidence only.
+fn primary_summary(primary: &routelane::backend::RuntimeStatus) -> String {
+    use routelane::backend::FamilyExit;
+    let Some(decision) = primary.decision.as_ref() else {
+        return format!("primary phase={:?}", primary.phase);
+    };
+    let family = |preferred: &Option<routelane::domain::LaneId>, effective: &FamilyExit| {
+        format!(
+            "{}->{}",
+            preferred.as_ref().map_or("-", |id| id.as_str()),
+            match effective {
+                FamilyExit::Lane(id) => id.as_str(),
+                FamilyExit::Blocked => "blocked",
+            }
+        )
+    };
+    format!(
+        "primary phase={:?} ipv4={} ipv6={}\nnote=effective exits follow local link evidence; internet reachability is not verified",
+        primary.phase,
+        family(&decision.preferred.v4, &decision.effective.v4),
+        family(&decision.preferred.v6, &decision.effective.v6),
+    )
 }
 
 fn bounded(message: &str) -> String {

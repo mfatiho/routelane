@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-use crate::backend::PlanHash;
+use crate::backend::{PlanHash, RuntimeStatus};
 use crate::domain::{Profile, ProfileId, RuleId};
 use crate::health::HealthReport;
 
-pub const IPC_PROTOCOL_VERSION: u32 = 1;
+/// 2: runtime authority (helper-owned primary/backup decisions).
+pub const IPC_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonEnvelope {
@@ -77,6 +78,9 @@ impl DaemonResponse {
     }
 }
 
+// One short-lived message per request; boxing the status would only churn
+// every consumer of the wire type.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value")]
 pub enum DaemonResult {
@@ -99,6 +103,9 @@ pub struct DaemonStatus {
     pub desired_profile_id: Option<ProfileId>,
     pub applied_profile_id: Option<ProfileId>,
     pub last_error: Option<IpcError>,
+    /// Verified runtime authority from the helper; never derived from config.
+    #[serde(default)]
+    pub primary: RuntimeStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +143,12 @@ pub enum DaemonEvent {
         generation: u64,
         health: HealthReport,
         error: IpcError,
+    },
+    /// The helper changed the effective exit on its own (failover/failback).
+    PrimaryChanged {
+        sequence: u64,
+        generation: u64,
+        primary: RuntimeStatus,
     },
 }
 

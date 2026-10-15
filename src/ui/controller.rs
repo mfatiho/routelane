@@ -307,6 +307,7 @@ mod tests {
                 desired_profile_id: None,
                 applied_profile_id: active.then(|| "work".into()),
                 last_error: None,
+                primary: Default::default(),
             },
             profiles: vec![profile()],
         }
