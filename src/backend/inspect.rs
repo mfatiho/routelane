@@ -316,7 +316,8 @@ impl RouteEntry {
                 scope == "global" || (self.gateway.is_none() && scope == "link")
             })
             && self.preferred_source.is_none()
-            && self.flags.is_empty()
+            // Carrier loss keeps the route and flags it `linkdown`.
+            && (self.flags.is_empty() || self.flags == ["linkdown"])
             && match family {
                 IpFamily::V4 => self.preference.is_none(),
                 IpFamily::V6 => self
