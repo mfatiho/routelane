@@ -156,7 +156,7 @@ yeniden başlatma ve kaldırma.
 |---|---|---|---|---|---|---|---|
 | Ubuntu 22.04.5 | 5.15.0-198 / 5.15.0 / 1.0.2 | 249.11 / 0.105 (pkla) / 1.12.20 | 4.6.9 / 1.1.7 | 433 PASS | 18/18 + 18/18 PASS | PASS | PASS |
 | Ubuntu 24.04.5 | 6.8.0-147 / 6.1.0 / 1.0.9 | 255.4 / 124 / 1.14.10 | 4.14.5 / 1.5.0 | 433 PASS (host) | 18/18 + 18/18 PASS | PASS | PASS |
-| Ubuntu 26.04.1 | 7.0.0-34 / 6.19.0 / 1.1.6 | 259.5 / 127 / 1.16.2 | 4.22.4 / 1.9.1 | 433 PASS | standart 18/18 (3/3); strict 2/4 temiz, 2/4’te sayaç/eşik kaynaklı tek hata — aşağıya bkz. | PASS | PASS |
+| Ubuntu 26.04.1 | 7.0.0-34 / 6.19.0 / 1.1.6 | 259.5 / 127 / 1.16.2 | 4.22.4 / 1.9.1 | 433 PASS | `0203fab` sonrası standart 2/3, strict 1/2 koşu temiz; diğerlerinde sayaç/eşik kaynaklı tek hata — aşağıya bkz. | PASS | PASS |
 | Debian 12, 13 | — | — | — | — | NOT VERIFIED | NOT VERIFIED | NOT VERIFIED |
 | Fedora 43, 44 | — | — | — | — | NOT VERIFIED | NOT VERIFIED | NOT VERIFIED |
 | aarch64 (tümü) | — | — | — | — | NOT VERIFIED | NOT VERIFIED | NOT VERIFIED |
@@ -182,15 +182,19 @@ Yukarıdaki satırlar bu düzeltmelerden ve son incelemedeki `0203fab`
 commit edilmiş HEAD’den değil, kullanıcının henüz commit edilmemiş güvenilirlik
 hunk’larını da içeren çalışma ağacından yapıldı.
 
-26.04 strict-RPF modunda 4 koşunun 2’si temiz geçti; diğer ikisinde birer
-test düştü ve tekrarlanmadı: (a) Faz 1 testi
+26.04’te `0203fab` sonrası standart modda 3 koşunun 2’si, strict modda 2
+koşunun 1’i temiz geçti (`d8949e7` sonrası, `0203fab` öncesi koşu iki modda da
+temizdi). Düşen koşularda birer test kaldı ve tekrarlanmadı: (a) Faz 1 testi
 `real_helper_routes_three_lanes_and_preserves_generation_one_on_activate_failure`
 sink arayüzünün link RX sayaçlarını okur (iki farklı satırda, ölçüm
-penceresinde fazladan paket); (b) `runtime_refresh…` içinde `exchanges > 20`
-verim eşiği 19 ile kaçtı (0 UDP yanıt kaybı). Hipotez: kernel 7.0’da
-veth üzerindeki IPv6 ND/MLD trafiği link sayaçlarını kirletiyor ve yük
-altında verim eşiği sınırda kalıyor; doğrulanmadı. Bu satır bu yüzden temiz
-PASS değildir; Task 7’deki gibi nft ingress gözlemcilerine geçmek ertelendi.
+penceresinde fazladan paket; bir kez standart, bir kez strict modda);
+(b) `runtime_refresh…` içinde `exchanges > 20` verim eşiği 19 ile kaçtı
+(0 UDP yanıt kaybı). Hata moda bağlı değil; hipotez: kernel 7.0’da veth
+üzerindeki IPv6 ND/MLD trafiği link sayaçlarını kirletiyor ve yük altında verim
+eşiği sınırda kalıyor; doğrulanmadı. Bu satır bu yüzden temiz PASS değildir;
+Task 7’deki gibi nft ingress gözlemcilerine geçmek ertelendi. Matris
+`0203fab` + çalışma ağacında ölçüldü; ardından gelen kurtarma-durumu
+düzeltmesi yalnız rootless testlerle doğrulandı.
 
 Fedora rpm: `packaging/rpm/build-rpm.sh`, Docker `fedora:latest` (Fedora 44,
 cargo 1.99.0, RPM 6.0.2) içinde son ağaçtan üretildi
