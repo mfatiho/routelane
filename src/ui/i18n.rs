@@ -113,9 +113,108 @@ const UX_EN: UxTexts = UxTexts {
     remove_impact: "Definitions assigned to this connection will also be removed", snapshot_help: "Domain rules use DNS addresses resolved when applying. Different browser DNS answers or changing CDN addresses may not match. Health checks do not prove that a website loads.",
 };
 
+/// Primary connection and automatic failover copy.
+#[derive(Debug, Clone, Copy)]
+pub struct PrimaryTexts {
+    pub title: &'static str,
+    pub description: &'static str,
+    pub row: &'static str,
+    pub system_default: &'static str,
+    pub system_default_unknown: &'static str,
+    pub backups: &'static str,
+    pub backups_description: &'static str,
+    pub move_up: &'static str,
+    pub move_down: &'static str,
+    pub automatic: &'static str,
+    pub automatic_subtitle: &'static str,
+    pub change_heading: &'static str,
+    /// `{}` is the new primary connection's name.
+    pub change_body: &'static str,
+    pub preferred: &'static str,
+    pub effective_v4: &'static str,
+    pub effective_v6: &'static str,
+    pub blocked: &'static str,
+    pub not_active: &'static str,
+    pub backup_in_use: &'static str,
+    pub needs_reauthorization: &'static str,
+    pub local_evidence: &'static str,
+    /// `{}` is the backup connection now in use.
+    pub failover_notice: &'static str,
+    pub failback_notice: &'static str,
+    pub blocked_notice: &'static str,
+    pub activation_heading: &'static str,
+    /// `{}` is the allowed lane order.
+    pub activation_order: &'static str,
+    pub activation_body: &'static str,
+    pub routing_in_use: &'static str,
+}
+
+const PRIMARY_TR: PrimaryTexts = PrimaryTexts {
+    title: "Ana bağlantı",
+    description: "Özel kurallar dışındaki yeni internet bağlantıları ana bağlantıyı kullanır.",
+    row: "Ana bağlantı",
+    system_default: "Sistem varsayılanı",
+    system_default_unknown: "algılanamadı",
+    backups: "Yardımcı bağlantılar",
+    backups_description: "Ana bağlantı kesildiğinde yalnız işaretli bağlantılar, bu sırayla kullanılır.",
+    move_up: "Yukarı taşı",
+    move_down: "Aşağı taşı",
+    automatic: "Otomatik geçiş",
+    automatic_subtitle: "Kesintide onay penceresi açılmadan yardımcı bağlantıya geçilir; ana bağlantı 5 saniye kesintisiz hazır olunca geri dönülür.",
+    change_heading: "Ana bağlantı değiştirilsin mi?",
+    change_body: "Ana bağlantı {} olarak değiştirilecek. Özel kurallar dışındaki yeni internet bağlantıları bu bağlantıyı kullanacak. Mevcut oturumlar etkilenebilir. Bu değişikliği onaylıyor musunuz?",
+    preferred: "Tercih edilen ana bağlantı",
+    effective_v4: "Şu an kullanılan çıkış (IPv4)",
+    effective_v6: "Şu an kullanılan çıkış (IPv6)",
+    blocked: "Engelli — onaylı çıkış yok",
+    not_active: "Yönlendirme etkin değil",
+    backup_in_use: "Yardımcı bağlantı kullanılıyor",
+    needs_reauthorization: "Yeniden yetkilendirme gerekiyor",
+    local_evidence: "Yerel bağlantı kanıtı; internet erişimi garantisi değildir.",
+    failover_notice: "Ana bağlantı kullanılamıyor; {} kullanılıyor",
+    failback_notice: "Ana bağlantıya geri dönüldü",
+    blocked_notice: "Kullanılabilir onaylı bağlantı yok; yönetilen internet trafiği engellendi",
+    activation_heading: "Otomatik ana bağlantı yönetimi",
+    activation_order: "İzin verilen sıra: {}",
+    activation_body: "Ana bağlantı kesilince yeni bağlantılar sıradaki yardımcıya geçer; mobil veri tüketilebilir. Doğrudan kuralları artık işletim sistemi varsayılanına değil ana internet çıkışına gider. Katı ters yol filtrelemesi varsa yalnız seçili bağlantı arayüzlerinde işaret farkındalığı açılır ve yönlendirme kapatılınca önceki değer geri yüklenir.",
+    routing_in_use: "Bu bağlantı ana veya yardımcı bağlantı olarak seçili; önce ana bağlantı ayarını değiştirin",
+};
+
+const PRIMARY_EN: PrimaryTexts = PrimaryTexts {
+    title: "Primary connection",
+    description: "New internet connections outside custom rules use the primary connection.",
+    row: "Primary connection",
+    system_default: "System default",
+    system_default_unknown: "not detected",
+    backups: "Backup connections",
+    backups_description: "When the primary connection is lost, only the checked connections are used, in this order.",
+    move_up: "Move up",
+    move_down: "Move down",
+    automatic: "Automatic failover",
+    automatic_subtitle: "During an outage RouteLane switches to a backup without asking; it returns once the primary has been ready for 5 seconds.",
+    change_heading: "Change the primary connection?",
+    change_body: "The primary connection will change to {}. New internet connections outside custom rules will use it. Existing sessions may be affected. Do you confirm this change?",
+    preferred: "Preferred primary connection",
+    effective_v4: "Exit in use (IPv4)",
+    effective_v6: "Exit in use (IPv6)",
+    blocked: "Blocked — no approved exit",
+    not_active: "Routing is not active",
+    backup_in_use: "A backup connection is in use",
+    needs_reauthorization: "Authorization is needed again",
+    local_evidence: "Local connection evidence; internet access is not guaranteed.",
+    failover_notice: "Primary connection unavailable; using {}",
+    failback_notice: "Back on the primary connection",
+    blocked_notice: "No approved connection is available; managed internet traffic is blocked",
+    activation_heading: "Automatic primary connection",
+    activation_order: "Allowed order: {}",
+    activation_body: "When the primary connection is lost, new connections move to the next backup; this may use mobile data. Direct rules now use the primary internet exit instead of the operating system default. With strict reverse-path filtering only the selected connection interfaces become mark-aware, and the previous value is restored when routing is disabled.",
+    routing_in_use: "This connection is selected as primary or backup; change the primary connection settings first",
+};
+
 #[derive(Debug, Clone, Copy)]
 pub struct Texts {
     pub ux: UxTexts,
+    pub primary: PrimaryTexts,
     pub inactive: &'static str,
     pub enable_routing: &'static str,
     pub disable_routing: &'static str,
@@ -182,6 +281,7 @@ impl LanguageTexts for Language {
             Self::Tr => Texts {
                 confirm_delete_rule_heading: "Kural silinsin mi?",
                 ux: UX_TR,
+                primary: PRIMARY_TR,
                 inactive: "Yönlendirme devre dışı",
 
                 enable_routing: "Yönlendirmeyi etkinleştir",
@@ -254,6 +354,7 @@ impl LanguageTexts for Language {
             Self::En => Texts {
                 confirm_delete_rule_heading: "Delete this rule?",
                 ux: UX_EN,
+                primary: PRIMARY_EN,
                 inactive: "Routing disabled",
 
                 enable_routing: "Enable routing",

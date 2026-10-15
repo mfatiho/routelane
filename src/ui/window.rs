@@ -96,6 +96,8 @@ struct WindowUi {
     settings: RefCell<Option<adw::PreferencesWindow>>,
     toast: adw::ToastOverlay,
     last_notice: RefCell<Option<String>>,
+    /// Last verified effective exit, to announce each transition once.
+    last_effective: RefCell<Option<routelane::backend::FamilyPair<routelane::backend::FamilyExit>>>,
     recovery_dialog_open: Cell<bool>,
     quick_application: gtk::Button,
     preferences: gtk::Button,
@@ -143,16 +145,123 @@ impl WindowUi {
     }
 
     fn apply(self: &Rc<Self>) {
+        let profile = self.profile.borrow().clone();
+        let first_activation = self
+            .controller
+            .session()
+            .confirmed_status()
+            .is_none_or(|status| status.applied_profile_id.is_none());
+        let fails_over = profile.routing.automatic_failover && !profile.routing.backups.is_empty();
+        if self.document.borrow().routing_notice_pending || (first_activation && fails_over) {
+            self.disclose_then_apply(&profile);
+        } else {
+            self.apply_now(false);
+        }
+    }
+
+    /// The disclosure before automatic failover is armed. Declining saves
+    /// and activates nothing.
+    fn disclose_then_apply(self: &Rc<Self>, profile: &Profile) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let lane_name = |id: &routelane::domain::LaneId| {
+            profile
+                .lanes
+                .iter()
+                .find(|lane| &lane.id == id)
+                .map_or_else(|| id.as_str().to_owned(), |lane| lane.name.clone())
+        };
+        let primary = match &profile.routing.primary {
+            routelane::domain::PrimarySelection::FollowSystemDefault => {
+                self.texts.primary.system_default.to_owned()
+            }
+            routelane::domain::PrimarySelection::Lane(id) => lane_name(id),
+        };
+        let order = std::iter::once(primary)
+            .chain(profile.routing.backups.iter().map(lane_name))
+            .collect::<Vec<_>>()
+            .join(" → ");
+        let body = format!(
+            "{}\n\n{}",
+            self.texts.primary.activation_order.replace("{}", &order),
+            self.texts.primary.activation_body
+        );
+        let weak = Rc::downgrade(self);
+        confirm_destructive_action_with_label(
+            &window,
+            self.texts,
+            self.texts.primary.activation_heading,
+            &body,
+            self.texts.enable_routing,
+            Rc::new(move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.apply_now(true);
+                }
+            }),
+            Rc::new(|| {}),
+        );
+    }
+
+    fn apply_now(self: &Rc<Self>, acknowledged: bool) {
         let candidate = self.profile.borrow().clone();
         let mut request_profile = candidate.clone();
         request_profile.enabled = true;
         let mut document = self.document.borrow().clone();
+        if acknowledged {
+            document.routing_notice_pending = false;
+        }
         store_profile(&mut document, candidate.clone());
-        self.controller.save(
-            document,
+        if self.controller.save(
+            document.clone(),
             candidate,
             AfterSave::Request(DaemonRequest::ApplyProfile(request_profile)),
-        );
+        ) {
+            *self.document.borrow_mut() = document;
+        }
+    }
+
+    /// Announces each verified change of the effective IPv4 exit once, as a
+    /// toast and a desktop notification; never a dialog.
+    fn announce_primary_transition(&self, status: Option<&routelane::ipc::DaemonStatus>) {
+        use routelane::backend::FamilyExit;
+        let Some(decision) = status.and_then(|status| status.primary.decision.clone()) else {
+            return;
+        };
+        let previous = self
+            .last_effective
+            .replace(Some(decision.effective.clone()));
+        let Some(previous) = previous else {
+            return;
+        };
+        if previous.v4 == decision.effective.v4 {
+            return;
+        }
+        let profile = self.profile.borrow();
+        let message = match &decision.effective.v4 {
+            FamilyExit::Blocked => self.texts.primary.blocked_notice.to_owned(),
+            FamilyExit::Lane(id) if decision.preferred.v4.as_ref() == Some(id) => {
+                self.texts.primary.failback_notice.to_owned()
+            }
+            FamilyExit::Lane(id) => self.texts.primary.failover_notice.replace(
+                "{}",
+                &profile
+                    .lanes
+                    .iter()
+                    .find(|lane| &lane.id == id)
+                    .map_or_else(|| id.as_str().to_owned(), |lane| lane.name.clone()),
+            ),
+        };
+        self.toast.add_toast(&adw::Toast::new(&message));
+        if let Some(application) = self
+            .window
+            .upgrade()
+            .and_then(|window| window.application())
+        {
+            let notification = gtk::gio::Notification::new(self.texts.primary.title);
+            notification.set_body(Some(&message));
+            application.send_notification(Some("routelane-primary"), &notification);
+        }
     }
 
     fn save_rule(self: &Rc<Self>, rule: Rule) -> bool {
@@ -580,7 +689,9 @@ impl WindowUi {
         self.quick_application.set_sensitive(editable);
         self.overview.update(&profile, &session);
         self.connections.update(editable);
+        let status = session.confirmed_status().cloned();
         drop(session);
+        self.announce_primary_transition(status.as_ref());
         self.filter();
         if let Some((rules, apps)) = view {
             self.rules.restore_view(&rules);
@@ -792,6 +903,7 @@ fn build_window_with_repository(
         settings: RefCell::new(None),
         toast,
         last_notice: RefCell::new(None),
+        last_effective: RefCell::new(None),
         recovery_dialog_open: Cell::new(false),
         quick_application,
         preferences,
@@ -1604,6 +1716,133 @@ mod tests {
             preview.destroy();
         }
         settings.set_gtk_font_name(original_font.as_deref());
+        window.destroy();
+        drain();
+        assert_primary_selection_is_confirmed_cancel_safe_and_reopens(&app, texts);
+    }
+
+    fn assert_primary_selection_is_confirmed_cancel_safe_and_reopens(
+        app: &adw::Application,
+        texts: Texts,
+    ) {
+        use routelane::domain::{InterfaceSelector, Lane, LaneFailurePolicy, PrimarySelection};
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        let mut document = ConfigV3::default();
+        let mut profile = empty_default_profile();
+        profile.lanes = [("ethernet", "eth0"), ("vinn", "usb0")]
+            .into_iter()
+            .map(|(id, interface)| Lane {
+                id: id.into(),
+                name: id.to_owned(),
+                interface: InterfaceSelector::from(interface),
+                fallback_lane: None,
+                failure_policy: LaneFailurePolicy::Block,
+            })
+            .collect();
+        document.profiles.push(profile);
+        ConfigRepository::new(&path).save(&document).unwrap();
+        let saved_primary = || {
+            ConfigRepository::new(&path).load().unwrap().profiles[0]
+                .routing
+                .clone()
+        };
+        let open = || {
+            let (sender, requests) = async_channel::unbounded();
+            let (events, receiver) = async_channel::unbounded();
+            let window =
+                build_window_with_repository(app, sender, receiver, ConfigRepository::new(&path));
+            events
+                .try_send(DaemonToUi::ConnectionEstablished { epoch: 1 })
+                .unwrap();
+            events
+                .try_send(DaemonToUi::Snapshot {
+                    epoch: 1,
+                    status: DaemonStatus {
+                        generation: 0,
+                        event_sequence: 0,
+                        health: HealthReport::inactive(),
+                        desired_profile_id: None,
+                        applied_profile_id: None,
+                        last_error: None,
+                        primary: Default::default(),
+                    },
+                    profiles: vec![],
+                })
+                .unwrap();
+            drain();
+            find_named(window.upcast_ref(), "connections")
+                .unwrap()
+                .downcast::<gtk::ToggleButton>()
+                .unwrap()
+                .emit_clicked();
+            drain();
+            let selector = find_named(window.upcast_ref(), "primary-selector")
+                .unwrap()
+                .downcast::<adw::ComboRow>()
+                .unwrap();
+            (window, selector, requests, events)
+        };
+
+        let (window, selector, requests, _events) = open();
+        assert_eq!(
+            selector.selected(),
+            0,
+            "the OS default is the initial preference"
+        );
+        selector.set_selected(1);
+        drain();
+        let dialog = transient(&window);
+        assert_eq!(
+            dialog.title().as_deref(),
+            Some(texts.primary.change_heading)
+        );
+        assert_eq!(
+            dialog
+                .default_widget()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap()
+                .label()
+                .as_deref(),
+            Some(texts.cancel),
+            "Cancel is the default action"
+        );
+        escape(&dialog);
+        drain();
+        assert_eq!(
+            selector.selected(),
+            0,
+            "Escape restores the saved preference"
+        );
+        assert_eq!(
+            saved_primary().primary,
+            PrimarySelection::FollowSystemDefault
+        );
+        assert!(requests.try_recv().is_err());
+
+        selector.set_selected(1);
+        drain();
+        let dialog = transient(&window);
+        find_button(dialog.upcast_ref(), texts.confirm)
+            .unwrap()
+            .emit_clicked();
+        drain();
+        wait_for(|| saved_primary().primary == PrimarySelection::Lane("ethernet".into()));
+        assert_eq!(saved_primary().backups, vec!["vinn".into()]);
+        assert!(
+            requests.try_recv().is_err(),
+            "an inactive profile is saved without activating routing"
+        );
+        window.destroy();
+        drain();
+
+        let (window, selector, _requests, _events) = open();
+        assert_eq!(
+            selector.selected(),
+            1,
+            "the confirmed preference survives reopening"
+        );
         window.destroy();
         drain();
     }
