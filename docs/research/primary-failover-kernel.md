@@ -258,3 +258,22 @@ sinyali teslimi ve gerçek Polkit akışı burada doğrulanmadı (Task 11/12).
   sinyalini aldı; yetki geri çekildikten sonra kesinti yine yedeğe geçirdi,
   genişleme istekleri `AccessDenied` aldı. Kanıt ve sınırlar:
   `docs/primary-failover-verification.md`.
+
+## Task 12 dağıtım bulguları: nft listeleme farkları (15 Ekim 2026)
+
+Kernel davranışı (IPv6 terminal/global gateway lift, `linkdown`) Ubuntu 22.04
+(5.15), 24.04 (6.8) ve 26.04 (7.0) arasında aynı çıktı verdi. Farklar nft’nin
+JSON listelemesindeydi; kesin parmak izi bu yüzden commit’i doğrulayamadı:
+
+- **nft 1.1.6 (26.04):** `meta nfproto ipv6` ardından gelen
+  `ct original ip6 saddr` kuralında listelemeden düşer (bytecode’da durur);
+  IPv4 eşdeğerinde bazı kurallarda kalır. `ct load src_ip/src_ip6` anahtarı
+  yalnız kendi ailesinin conntrack girdisiyle eşleştiği için bağımlılık
+  gereksizdir; kaynak-kanıt kuralları artık onsuz render edilir.
+- **nft 1.0.2 (22.04):** tablo listelemesi her zinciri kendi kurallarıyla
+  ardışık verir; 1.0.9+ önce bütün zincirleri listeler. Zincir sırası ve
+  zincir içi kural sırası aynıdır; normalleştirme üst düzey nesneleri kararlı
+  biçimde bölerek (önce kural olmayanlar, sonra kurallar) karşılaştırır.
+
+Kanıt betikleri: `vm-probe-nfproto.sh`, `vm-probe-v6lift.sh` (yerel çalışma
+alanı); sonuçlar `docs/primary-failover-verification.md`.

@@ -102,3 +102,98 @@ Gözlenen çıktı (`RESULT: PASS`):
   ve elle yeniden eklenen adres/route kullanır.
 - Yoğun trafikte transaction guard penceresinde sıfır kayıp.
 - Debian, Fedora ve aarch64 (Task 12 kapısı).
+
+## Task 12 — dağıtım, paket ve yayın kapısı (15 Ekim 2026)
+
+### Paket sözleşmesi (rootless)
+
+`rtk cargo test --test primary_packaging_contract` (3 test):
+
+- `packages_ship_helper2_policy_and_consistent_versions`: deb ve rpm aynı 11
+  dosyayı aynı modlarla tam bir kez kurar; sürüm iki pakette de `Cargo.toml`’dan
+  aynı yolla okunur; IPC ve runtime protokol sürümleri eşit; helper root ve
+  sabit yolda; bus politikası Helper1/Helper2’yi birer kez açar, yetki
+  method içinde (Polkit) uygulanır; deb bağımlılığı `polkitd | policykit-1`.
+- `service_keeps_kernel_tunable_protection`: `ProtectKernelTunables=yes`,
+  yazılabilir yollar yalnız `/proc/sys/net/ipv4/conf` (Task 6 istisnası) ve
+  `-/sys/fs/cgroup/routelane.apps`; paketler drop-in eklemez.
+- `package_upgrade_preserves_private_config_and_journal`:
+  `RuntimeDirectoryPreserve=yes`; yaşam döngüsü betikleri config/journal/kernel
+  durumu silen komut çalıştırmaz, yalnız `try-restart` kullanır; durdurma
+  yalnız kaldırmada.
+
+Mutasyonlar (rpm’den tmpfiles çıkarma, `ReadWritePaths=/proc/sys`, preserve
+silme, `restart`, koşulsuz `%preun`, Helper2 politikasını silme) her biri bir
+testi düşürdü.
+
+### Spec kabul maddeleri → kanıt
+
+| # | Kanıt | Durum |
+|---|---|---|
+| 1 | `default_lane_id_is_not_a_role`, `two_lane_aliases_for_system_default_require_explicit_selection`, `primary_proposal_uses_the_other_lane_not_names_or_ids` | PASS (rootless) |
+| 2 | kernel `primary_and_rule_paths_have_correct_source_and_return` | PASS (Ubuntu satırları) |
+| 3 | `primary_cancel_escape_close_emit_no_effect`, `primary_double_confirmation_saves_once`, GTK smoke `assert_primary_selection_is_confirmed_cancel_safe_and_reopens` | PASS (rootless/GTK) |
+| 4 | kernel `gui_closed_link_loss_fails_over_without_authorization_prompt`; system bus carrier kaybı | PASS (Ubuntu satırları); gerçek fiziksel NIC NOT VERIFIED |
+| 5 | system bus: yetki geri çekildikten sonra failover, genişlemeler `AccessDenied` | PASS (test kuralı ile); etkileşimli ajan NOT VERIFIED |
+| 6 | `failback_requires_5000_ms_continuous_readiness`, kernel `runtime_refresh_fails_over_and_back_without_breaking_backup_sessions`, `backup_tcp_session_survives_new_flow_failback` | PASS |
+| 7 | `all_links_down_then_recovery_is_family_safe`, kernel `loss_signals_fail_closed_without_escape` | PASS |
+| 8 | kernel `local_dhcp_dns_and_foreign_resources_survive_cleanup`, yabancı sentinel eşitliği | PASS; Fedora firewalld/SELinux NOT VERIFIED |
+| 9 | kernel IPv6/kaynak/strict-loose RPF senaryoları, iki modda | PASS (Ubuntu satırları) |
+| 10 | `primary_config_contract` (7 test) | PASS (rootless) |
+| 11 | `partial_transaction_never_reports_armed`, `primary_daemon_contract`, system bus `kill -9` ve yükseltme | PASS |
+| 12 | Aşağıdaki dağıtım matrisi | **AÇIK** — Debian, Fedora ve aarch64 doğrulanmadı |
+
+### Dağıtım matrisi
+
+Her Ubuntu VM’i tek kullanımlık bir Multipass VM’idir (x86_64, 4 vCPU). 22.04
+ve 26.04’te kaynak ağacı VM içinde yerel olarak derlendi (`cargo test
+--all-targets`, `build-deb.sh`, root süiti); 24.04’te derleme ortamı aynı
+sürümdeki host’tur. Her VM’de: root süiti (standart ve strict RPF),
+`tests/root/system_bus_acceptance.sh` (0.1.0 → 0.1.1 silahlı yükseltme dahil),
+yeniden başlatma ve kaldırma.
+
+| Dağıtım | Kernel / iproute2 / nft | systemd / Polkit / D-Bus | GTK4 / Libadwaita | Rootless | Root süiti | System bus + yükseltme | Reboot + kaldırma |
+|---|---|---|---|---|---|---|---|
+| Ubuntu 22.04.5 | 5.15.0-198 / 5.15.0 / 1.0.2 | 249.11 / 0.105 (pkla) / 1.12.20 | 4.6.9 / 1.1.7 | 432 PASS | 18/18 + 18/18 PASS | PASS | PASS |
+| Ubuntu 24.04.5 | 6.8.0-147 / 6.1.0 / 1.0.9 | 255.4 / 124 / 1.14.10 | 4.14.5 / 1.5.0 | 432 PASS (host) | 18/18 + 18/18 PASS | PASS | PASS |
+| Ubuntu 26.04.1 | 7.0.0-34 / 6.19.0 / 1.1.6 | 259.5 / 127 / 1.16.2 | 4.22.4 / 1.9.1 | 432 PASS | 18/18 + 18/18 PASS | PASS | PASS |
+| Debian 12, 13 | — | — | — | — | NOT VERIFIED | NOT VERIFIED | NOT VERIFIED |
+| Fedora 43, 44 | — | — | — | — | NOT VERIFIED | NOT VERIFIED | NOT VERIFIED |
+| aarch64 (tümü) | — | — | — | — | NOT VERIFIED | NOT VERIFIED | NOT VERIFIED |
+
+Reboot satırı: tmpfiles `routelane.apps` cgroup’unu açılışta oluşturdu, eski
+journal yoktu, D-Bus ile başlatılan helper `Inactive` döndü (yeniden
+etkinleştirme taze onay ister). Kaldırma: paket dosyaları silindi, helper
+etkin değil, kaldırma notu gösterildi.
+
+İlk dağıtım koşusu iki gerçek uyumsuzluk buldu (ikisi de nft JSON
+listelemesinde; kernel durumu doğruydu, helper commit’i doğrulayamadı ve geri
+aldı, yani fail-closed davrandı):
+
+- 26.04 / nft 1.1.6: IPv6 kaynak-kanıt kurallarında `meta nfproto ipv6`
+  listelemeden düşüyordu → kurallar gereksiz bağımlılık olmadan render edilir
+  (`source_proof_rules_carry_no_redundant_family_dependency`).
+- 22.04 / nft 1.0.2: zincirler kurallarıyla ardışık listeleniyordu →
+  normalleştirme kararlı bölme yapar
+  (`fingerprint_and_seal_accept_nft_1_0_2_chain_interleaved_listing_order`).
+
+Yukarıdaki satırlar bu düzeltmelerden sonraki koşulardır.
+
+Fedora rpm: `packaging/rpm/build-rpm.sh`, Docker `fedora:latest` (Fedora 44,
+cargo 1.98.1, RPM 6.0.2) içinde son ağaçtan üretildi
+(`routelane-0.1.0-1.x86_64`, sha256 `f697a0ac2e2f29ce82ba1618379678c97ee75da38b39587ef0303f6f305eb7b6`); 11 dosya + `/usr/lib/routelane`
+dizini beklenen mod ve root/root sahipliğiyle, scriptlet’ler mevcut. Bu yalnız
+paket üretimidir: Fedora’da kurulum, firewalld/SELinux, Polkit ve kernel
+kabulü **NOT VERIFIED**.
+
+### Task 12 — NOT VERIFIED
+
+- Debian 12/13, Fedora 43/44 (bu makinede imaj/hipervizör yok) ve tüm
+  dağıtımlarda aarch64.
+- Ubuntu VM’lerinde GTK başlatma (ekransız VM); GTK smoke yalnız host’ta.
+- Ufw/firewalld ile birlikte çalışma ve Fedora SELinux; yabancı nft/rule
+  sentinel’leri yalnız test ad alanında doğrulandı.
+- Erişilebilirlik/ekran okuyucu, manuel tema incelemesi, yayın sitesi DNS/CDN.
+- CI: matris henüz CI’da çalışmıyor; satırlar elle VM koşularıdır.
+
+**Yayın kapısı açık değildir.**

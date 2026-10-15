@@ -1,7 +1,8 @@
 # Ana bağlantı ve otomatik yardımcı hat geçişi
 
 Tarih: 14 Ekim 2026.
-Durum: Kullanıcının “devam et” yanıtıyla tasarım onaylandı; uygulama planı kullanıcı incelemesi bekliyor.
+Durum: Kullanıcının “devam et” yanıtıyla tasarım onaylandı; plan Task 1–12 main üzerinde uygulandı (15 Ekim 2026).
+İlk sürüm kapısı açık değil: kanıt ve NOT VERIFIED satırları `docs/primary-failover-verification.md`.
 Bu belge ürün kodunu veya canlı ağ ayarlarını değiştirmez.
 Plan: `docs/superpowers/plans/2026-10-14-primary-connection-failover.md`.
 

@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-14-primary-connection-failover-design.md`
 
+**Durum (15 Ekim 2026):** Task 1–12 main üzerinde uygulandı. Dağıtım matrisi ve NOT VERIFIED satırları `docs/primary-failover-verification.md`; tüm satırlar PASS olmadan yayın kapısı açılmaz.
+
 ## Global Constraints
 
 - Tercih edilen ana bağlantı, sistem varsayılanı ve etkin çıkış ayrı kavramlardır; `LaneId("default")` rol değildir.
