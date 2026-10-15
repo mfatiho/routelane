@@ -285,7 +285,8 @@ async fn run_root_integration_stdio() -> Result<(), Box<dyn std::error::Error>> 
     ))?;
     let service = PrivilegedService::new(
         RootIntegrationAuthorizer,
-        CommandPrivilegedBackend::with_store(ProcessCommandExecutor, store),
+        CommandPrivilegedBackend::with_store(ProcessCommandExecutor, store)
+            .with_interface_settings(routelane::backend::SystemMarkAwareRpfBackend),
     );
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();

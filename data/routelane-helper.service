@@ -19,3 +19,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# Mark-aware reverse-path filtering: the helper writes only a selected lane
+# interface's src_valid_mark below this path (never all/default); every other
+# kernel tunable stays read-only under ProtectKernelTunables=yes.
+ReadWritePaths=/proc/sys/net/ipv4/conf

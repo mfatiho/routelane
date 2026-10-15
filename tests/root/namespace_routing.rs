@@ -366,6 +366,9 @@ fn root_worker_exercises_real_helper_transport() {
     let inspected = helper.ok(json!({"method": "inspect"}));
     assert_eq!(inspected["generation"], 1);
     assert_eq!(inspected["routelane_table_present"], true);
+    // Strict RPF needs per-lane mark awareness; loose RPF needs no write.
+    let strict = env::var_os("ROUTELANE_TEST_STRICT_RPF").is_some();
+    assert_lane_mark_awareness(&names, u8::from(strict));
 
     assert_probe_reaches_only("203.0.113.10", 0, &names, None);
     assert_probe_reaches_only("198.51.100.10", 1, &names, None);
@@ -423,6 +426,17 @@ fn root_worker_exercises_real_helper_transport() {
     assert_eq!(restored["generation"], 1);
     assert_eq!(helper.ok(json!({"method": "inspect"}))["generation"], 1);
 
+    // Cleanup restores exactly the journaled interface settings.
+    assert_eq!(helper.ok(json!({"method": "cleanup"}))["cleaned"], true);
+    assert_managed_resources_absent();
+    assert_lane_mark_awareness(&names, 0);
+    helper.ok(json!({
+        "method": "apply",
+        "plan_json": serde_json::to_string(&generation_one).unwrap(),
+    }));
+    assert_lane_mark_awareness(&names, u8::from(strict));
+    assert_link_loss_fails_closed(&names);
+
     drop(helper);
     fs::remove_file(&isolated_state).expect("simulate a lost validated helper journal");
     let mut helper = HelperProcess::spawn(state_directory.path());
@@ -433,6 +447,9 @@ fn root_worker_exercises_real_helper_transport() {
     let cleaned = helper.ok(json!({"method": "recover_orphaned_resources"}));
     assert_eq!(cleaned["cleaned"], true);
     assert_managed_resources_absent();
+    // A lost journal also loses its setting receipts: orphan recovery cannot
+    // prove the previous value and leaves the interface setting untouched.
+    assert_lane_mark_awareness(&names, u8::from(strict));
     let empty = helper.ok(json!({"method": "inspect"}));
     assert_eq!(empty["generation"], Value::Null);
     assert_eq!(empty["routelane_table_present"], false);
@@ -445,6 +462,71 @@ fn root_worker_exercises_real_helper_transport() {
         production_state_before,
         "root integration helper must leave the production journal unchanged"
     );
+}
+
+/// The kernel drops a lane's unicast default when its link goes down; the
+/// owned terminal route must then reject marked traffic instead of letting it
+/// fall through to the main table.
+fn assert_link_loss_fails_closed(names: &RunNames) {
+    let lane_c = &names.client_interfaces[2];
+    let mark = format!("{:#010x}", MARK_BASE + 2);
+    let before = command_output(Command::new("/usr/sbin/ip").args([
+        "route",
+        "get",
+        "192.0.2.10",
+        "mark",
+        &mark,
+    ]));
+    assert!(
+        before.status.success(),
+        "lane C is routable before link loss"
+    );
+    run_ip(["link", "set", lane_c, "down"]);
+    for family in ["-4", "-6"] {
+        let table = command_output(
+            Command::new("/usr/sbin/ip")
+                .args([family, "-j", "-N", "route", "show", "table", "20002"]),
+        );
+        let routes: Value = serde_json::from_slice(&table.stdout).unwrap();
+        let mut terminal =
+            json!({"type": "7", "dst": "default", "metric": 4_294_967_294u32, "flags": []});
+        if family == "-6" {
+            terminal["dev"] = json!("lo");
+            terminal["pref"] = json!("medium");
+        }
+        assert_eq!(
+            routes,
+            json!([terminal]),
+            "{family} table keeps only its terminal route after link loss"
+        );
+    }
+    let after = command_output(Command::new("/usr/sbin/ip").args([
+        "route",
+        "get",
+        "192.0.2.10",
+        "mark",
+        &mark,
+    ]));
+    assert!(
+        !after.status.success(),
+        "marked lane C traffic must not fall through after link loss: {}",
+        String::from_utf8_lossy(&after.stdout)
+    );
+    run_ip(["link", "set", lane_c, "up"]);
+}
+
+fn assert_lane_mark_awareness(names: &RunNames, expected: u8) {
+    for interface in &names.client_interfaces[..3] {
+        let path = format!("/proc/sys/net/ipv4/conf/{interface}/src_valid_mark");
+        let value = fs::read_to_string(&path).expect("read client interface src_valid_mark");
+        assert_eq!(
+            value.trim().parse::<u8>().unwrap(),
+            expected,
+            "{interface} src_valid_mark"
+        );
+    }
+    let global = fs::read_to_string("/proc/sys/net/ipv4/conf/all/src_valid_mark").unwrap();
+    assert_eq!(global.trim(), "0", "the global setting is never written");
 }
 
 fn require_root_capabilities() -> RunNames {
@@ -517,6 +599,30 @@ impl NamespaceHarness {
                 "dev",
                 &route.interface,
             ]);
+        }
+        if env::var_os("ROUTELANE_TEST_STRICT_RPF").is_some() {
+            // Test-only setup, exclusively inside the run-owned client netns.
+            // Production must preserve all/default/rp_filter and touch only
+            // src_valid_mark on an authorized, journaled interface.
+            for interface in std::iter::once("all")
+                .chain(harness.names.client_interfaces.iter().map(String::as_str))
+            {
+                let rpf = format!("net.ipv4.conf.{interface}.rp_filter=1");
+                let mark = format!("net.ipv4.conf.{interface}.src_valid_mark=0");
+                checked_output(
+                    Command::new("/usr/sbin/ip").args([
+                        "netns",
+                        "exec",
+                        &harness.names.client,
+                        "/usr/sbin/sysctl",
+                        "-q",
+                        "-w",
+                        &rpf,
+                        &mark,
+                    ]),
+                    "configure isolated strict-RPF fixture",
+                );
+            }
         }
         harness
     }

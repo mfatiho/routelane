@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
@@ -18,17 +18,24 @@ use super::nft_document::{
 };
 use crate::domain::LaneId;
 
+use super::interface_settings::{InterfaceSettingReceipt, MarkAwareRpf, MarkAwareRpfBackend};
+use super::legacy_journal::{legacy_nft_fingerprint, LegacyJournalV1};
 use super::transaction::restore_plan as restore_kernel_plan;
 use super::{
-    apply_plan as apply_kernel_plan, build_policy_commands, build_snapshot_commands,
-    detect_resource_conflicts, detect_resource_conflicts_for_update, AppliedKernelState,
-    CommandSpec, CompiledAction, CompiledTarget, IpFamily, KernelPlan, KernelRunner,
-    KernelSnapshot, PlanHash, Program, RunnerError, SnapshotInput, TableMode, MARK_BASE, MARK_MAX,
-    RULE_PRIORITY_BASE, RULE_PRIORITY_MAX, TABLE_BASE, TABLE_MAX,
+    apply_plan as apply_kernel_plan, build_snapshot_commands, detect_resource_conflicts,
+    detect_resource_conflicts_for_update, install_steps, retire_steps, transition_steps,
+    AppliedKernelState, CommandSpec, CompiledAction, CompiledTarget, IpFamily, KernelPlan,
+    KernelRunner, KernelSnapshot, OwnedRoute, PlanHash, Program, RoutingStep, RunnerError,
+    SnapshotInput, TableMode, MARK_BASE, MARK_MAX, RULE_PRIORITY_BASE, RULE_PRIORITY_MAX,
+    TABLE_BASE, TABLE_MAX, TERMINAL_ROUTE_METRIC,
 };
 
 pub const MAX_PLAN_JSON_BYTES: usize = 1024 * 1024;
-const MAX_STATE_BYTES: u64 = (MAX_PLAN_JSON_BYTES as u64 * 2) + 4096;
+/// Two bounded plans plus fingerprints, at most one setting receipt per lane
+/// (committed and pending) and the envelope.
+const MAX_STATE_BYTES: u64 = (MAX_PLAN_JSON_BYTES as u64 * 2) + 128 * 1024;
+/// Explicit journal schema. Unversioned journals are schema 1 and cleanup-only.
+const JOURNAL_VERSION: u32 = 2;
 const IP_BINARY: &str = "/usr/sbin/ip";
 const NFT_BINARY: &str = "/usr/sbin/nft";
 const STATE_DIRECTORY: &str = "/run/routelane";
@@ -36,7 +43,7 @@ const STATE_FILE: &str = "/run/routelane/applied-plan.json";
 const O_NOFOLLOW: i32 = 0o400000;
 const MAX_LANES: usize = 100;
 const MAX_RULES: usize = 10_000;
-const ROUTING_CRASH_MODEL_VERSION: &str = "exact-command-prefix-v3";
+const ROUTING_CRASH_MODEL_VERSION: &str = "exact-command-prefix-v4-terminal";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_COMMAND_PIPE_BYTES: usize = 1024 * 1024;
@@ -371,6 +378,7 @@ fn execute_invocation_with_timeout(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredAppliedState {
+    journal_version: u32,
     pub active: Option<KernelPlan>,
     pub active_nft_fingerprint: Option<String>,
     pub pending: Option<KernelPlan>,
@@ -382,6 +390,59 @@ pub struct StoredAppliedState {
     restore_receipt: Option<RestoreReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     orphan_cleanup: Option<OrphanedOwnership>,
+    /// Interface settings the committed generation changed, restored at cleanup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    interface_settings: Vec<InterfaceSettingReceipt>,
+    /// Setting intents journaled by an in-flight transition before each write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_interface_settings: Vec<InterfaceSettingReceipt>,
+    /// An unversioned schema-1 journal awaiting cleanup; never armed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_v1: Option<LegacyJournalV1>,
+}
+
+impl Default for StoredAppliedState {
+    fn default() -> Self {
+        Self {
+            journal_version: JOURNAL_VERSION,
+            active: None,
+            active_nft_fingerprint: None,
+            pending: None,
+            pending_expectations: None,
+            cleanup_pending: false,
+            restore_receipt: None,
+            orphan_cleanup: None,
+            interface_settings: vec![],
+            pending_interface_settings: vec![],
+            legacy_v1: None,
+        }
+    }
+}
+
+/// Decodes a persisted journal. A versioned journal must be exactly this
+/// schema; an unversioned one is accepted only as a strict schema-1 record,
+/// wrapped for cleanup and never converted into a current plan.
+fn decode_journal(json: &[u8]) -> Result<StoredAppliedState, PrivilegedError> {
+    let value: serde_json::Value = serde_json::from_slice(json)
+        .map_err(|error| state_error(format!("decode persisted applied state: {error}")))?;
+    let Some(version) = value.get("journal_version").cloned() else {
+        let legacy: LegacyJournalV1 = serde_json::from_value(value).map_err(|error| {
+            state_error(format!(
+                "decode unversioned schema-1 applied state: {error}"
+            ))
+        })?;
+        return Ok(StoredAppliedState {
+            legacy_v1: Some(legacy),
+            ..StoredAppliedState::default()
+        });
+    };
+    if version.as_u64() != Some(u64::from(JOURNAL_VERSION)) {
+        return Err(state_error(format!(
+            "unsupported applied-state journal version {version}"
+        )));
+    }
+    serde_json::from_value(value)
+        .map_err(|error| state_error(format!("decode persisted applied state: {error}")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,11 +519,8 @@ impl StoredAppliedState {
         Self {
             active,
             active_nft_fingerprint,
-            pending: None,
-            pending_expectations: None,
-            cleanup_pending: false,
             restore_receipt,
-            orphan_cleanup: None,
+            ..Self::default()
         }
     }
 }
@@ -571,9 +629,7 @@ impl AppliedStateStore for FileAppliedStateStore {
                 "persisted applied state exceeds the size limit",
             ));
         }
-        serde_json::from_slice(&json)
-            .map(Some)
-            .map_err(|error| state_error(format!("decode persisted applied state: {error}")))
+        decode_journal(&json).map(Some)
     }
 
     fn save(&mut self, state: &StoredAppliedState) -> Result<(), PrivilegedError> {
@@ -674,10 +730,44 @@ fn state_error(message: impl Into<String>) -> PrivilegedError {
 pub struct CommandPrivilegedBackend<E, S = InMemoryAppliedStateStore> {
     executor: E,
     store: S,
+    settings: Box<dyn MarkAwareRpfBackend>,
     current: Option<AppliedKernelState>,
     current_nft_fingerprint: Option<String>,
+    interface_settings: Vec<InterfaceSettingReceipt>,
     restore_receipt: Option<RestoreReceipt>,
+    legacy: Option<LegacyJournalV1>,
     initialized: bool,
+}
+
+/// Used until a backend is given the fixed-purpose system adapter; any lane
+/// that would need a mark-aware setting fails closed instead of skipping it.
+struct UnconfiguredMarkAwareRpf;
+
+impl MarkAwareRpfBackend for UnconfiguredMarkAwareRpf {
+    fn identity(&mut self, _: &str) -> Result<super::InterfaceIdentity, PrivilegedError> {
+        Err(PrivilegedError::new(
+            "mark-aware interface settings are not configured for this backend",
+        ))
+    }
+    fn rp_filter(&mut self, _: &str) -> Result<u8, PrivilegedError> {
+        Err(PrivilegedError::new(
+            "mark-aware interface settings are not configured for this backend",
+        ))
+    }
+    fn src_valid_mark(&mut self, _: &str) -> Result<u8, PrivilegedError> {
+        Err(PrivilegedError::new(
+            "mark-aware interface settings are not configured for this backend",
+        ))
+    }
+    fn set_src_valid_mark(
+        &mut self,
+        _: &super::InterfaceIdentity,
+        _: u8,
+    ) -> Result<(), PrivilegedError> {
+        Err(PrivilegedError::new(
+            "mark-aware interface settings are not configured for this backend",
+        ))
+    }
 }
 
 impl<E> CommandPrivilegedBackend<E, InMemoryAppliedStateStore> {
@@ -691,11 +781,20 @@ impl<E, S> CommandPrivilegedBackend<E, S> {
         Self {
             executor,
             store,
+            settings: Box::new(UnconfiguredMarkAwareRpf),
             current: None,
             current_nft_fingerprint: None,
+            interface_settings: vec![],
             restore_receipt: None,
+            legacy: None,
             initialized: false,
         }
+    }
+
+    /// Supplies the fixed-purpose adapter for per-interface `src_valid_mark`.
+    pub fn with_interface_settings(mut self, settings: impl MarkAwareRpfBackend + 'static) -> Self {
+        self.settings = Box::new(settings);
+        self
     }
 }
 
@@ -705,6 +804,7 @@ pub type SystemPrivilegedBackend =
 impl Default for SystemPrivilegedBackend {
     fn default() -> Self {
         Self::with_store(ProcessCommandExecutor, FileAppliedStateStore::default())
+            .with_interface_settings(super::SystemMarkAwareRpfBackend)
     }
 }
 
@@ -715,6 +815,7 @@ where
 {
     fn apply(&mut self, plan: &KernelPlan) -> Result<ApplyResponse, PrivilegedError> {
         self.ensure_reconciled()?;
+        self.refuse_legacy_activation()?;
         self.revalidate_current_ownership()?;
         if let Some(current) = self.current.as_ref() {
             if plan.generation < current.generation {
@@ -735,6 +836,7 @@ where
                         &mut self.store,
                         self.current.as_ref(),
                         self.current_nft_fingerprint.as_deref(),
+                        &self.interface_settings,
                     )?;
                     self.restore_receipt = None;
                 }
@@ -750,6 +852,7 @@ where
         previous: Option<&KernelPlan>,
     ) -> Result<RestoreResponse, PrivilegedError> {
         self.ensure_reconciled()?;
+        self.refuse_legacy_activation()?;
         self.revalidate_current_ownership()?;
         let receipt = RestoreReceipt::new(failed_candidate, previous);
         if previous.is_some_and(|plan| plan.generation >= failed_candidate.generation) {
@@ -808,13 +911,21 @@ where
                 .with_nft_ownership(current.generation, current.plan_hash),
             _ => captured.snapshot,
         };
+        let diagnostics = if self.legacy.is_some() {
+            vec![
+                "a schema-1 RouteLane journal is cleanup-only; run cleanup before activating"
+                    .to_owned(),
+            ]
+        } else {
+            vec![]
+        };
         Ok(InspectResponse {
             generation: self.current.as_ref().map(|state| state.generation),
             plan_hash: self.current.as_ref().map(|state| state.plan_hash),
             applied_plan: self.current.as_ref().map(|state| state.plan().clone()),
             routelane_table_present: snapshot.has_nft_table("inet", "routelane"),
             snapshot,
-            diagnostics: vec![],
+            diagnostics,
         })
     }
 
@@ -824,7 +935,7 @@ where
 
     fn recover_orphaned(&mut self) -> Result<OrphanRecoveryResponse, PrivilegedError> {
         self.ensure_reconciled()?;
-        if self.current.is_some() {
+        if self.current.is_some() || self.legacy.is_some() {
             return Err(PrivilegedError::new(
                 "validated RouteLane state must use normal cleanup",
             ));
@@ -837,13 +948,8 @@ where
             });
         }
         self.store.save(&StoredAppliedState {
-            active: None,
-            active_nft_fingerprint: None,
-            pending: None,
-            pending_expectations: None,
-            cleanup_pending: false,
-            restore_receipt: None,
             orphan_cleanup: Some(ownership),
+            ..StoredAppliedState::default()
         })?;
         resume_orphan_cleanup(&mut self.executor, &mut self.store)?;
         Ok(OrphanRecoveryResponse {
@@ -863,6 +969,9 @@ where
         restore_receipt: Option<RestoreReceipt>,
     ) -> Result<CleanupResponse, PrivilegedError> {
         self.ensure_reconciled()?;
+        if self.legacy.is_some() {
+            return self.cleanup_legacy();
+        }
         let Some(current) = self.current.clone() else {
             if restore_receipt.is_none() {
                 self.store.clear()?;
@@ -882,17 +991,18 @@ where
         self.store.save(&StoredAppliedState {
             active: Some(current.plan().clone()),
             active_nft_fingerprint: self.current_nft_fingerprint.clone(),
-            pending: None,
-            pending_expectations: None,
             cleanup_pending: true,
             restore_receipt: restore_receipt.clone(),
-            orphan_cleanup: None,
+            interface_settings: self.interface_settings.clone(),
+            ..StoredAppliedState::default()
         })?;
         let mut runner = CommandKernelRunner::new(&mut self.executor, Some(current));
         runner
             .snapshot()
             .and_then(|_| runner.restore(None))
             .map_err(|error| PrivilegedError::new(error.to_string()))?;
+        let diagnostics = restore_setting_receipts(&mut *self.settings, &self.interface_settings);
+        self.interface_settings.clear();
         match restore_receipt.clone() {
             Some(receipt) => {
                 self.store
@@ -905,9 +1015,170 @@ where
         self.restore_receipt = restore_receipt;
         Ok(CleanupResponse {
             cleaned: true,
+            diagnostics,
+        })
+    }
+
+    fn refuse_legacy_activation(&self) -> Result<(), PrivilegedError> {
+        if self.legacy.is_some() {
+            return Err(PrivilegedError::new(
+                "a schema-1 RouteLane journal is cleanup-only; clean it up before activation",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Removes exactly what a schema-1 helper proved it owned. The record is
+    /// never converted into a current plan, so it cannot arm routing.
+    fn cleanup_legacy(&mut self) -> Result<CleanupResponse, PrivilegedError> {
+        let mut legacy = self
+            .legacy
+            .clone()
+            .expect("legacy cleanup requires a schema-1 record");
+        if legacy.pending.is_some()
+            || legacy.pending_expectations.is_some()
+            || legacy.orphan_cleanup.is_some()
+        {
+            return Err(PrivilegedError::new(
+                "an interrupted schema-1 transaction cannot be proven by this helper; leaving its resources untouched",
+            ));
+        }
+        let Some(active) = legacy.active.clone() else {
+            self.store.clear()?;
+            self.legacy = None;
+            return Ok(CleanupResponse {
+                cleaned: false,
+                diagnostics: vec!["no schema-1 RouteLane ownership to clean".to_owned()],
+            });
+        };
+        let fingerprint = legacy.active_nft_fingerprint.clone().ok_or_else(|| {
+            PrivilegedError::new("schema-1 journal is missing its nftables fingerprint")
+        })?;
+        let (routes, rules) = active.ownership();
+        let expected = RoutingOwnership {
+            routes: routes
+                .into_iter()
+                .map(|route| RouteOwnership {
+                    family: route.family,
+                    table: route.table,
+                    gateway: route.gateway,
+                    interface: route.interface,
+                    terminal: false,
+                })
+                .collect(),
+            rules: rules
+                .into_iter()
+                .map(|rule| RuleOwnership {
+                    family: rule.family,
+                    priority: rule.priority,
+                    table: rule.table,
+                    mark: rule.mark,
+                })
+                .collect(),
+        };
+        let verify = |executor: &mut E, exact: bool| -> Result<bool, PrivilegedError> {
+            let captured = capture_snapshot(executor)
+                .map_err(|error| PrivilegedError::new(error.to_string()))?;
+            let live = live_routing_ownership(&captured)?;
+            let owned = if exact {
+                live == expected
+            } else {
+                routing_ownership_is_subset(&live, &expected)
+            };
+            if !owned {
+                return Err(PrivilegedError::new(
+                    "schema-1 journal does not own the exact live RouteLane routing state",
+                ));
+            }
+            if !captured.snapshot.has_nft_table("inet", "routelane") {
+                return if live == RoutingOwnership::default() && !exact {
+                    Ok(false)
+                } else {
+                    Err(PrivilegedError::new(
+                        "schema-1 journal is missing its committed nftables table",
+                    ))
+                };
+            }
+            let document = read_nft_table_once(executor)
+                .map_err(|error| PrivilegedError::new(error.to_string()))?;
+            let marker = active.state_chain_name();
+            let marked = document
+                .get("nftables")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|objects| {
+                    objects.iter().any(|object| {
+                        object
+                            .get("chain")
+                            .and_then(|chain| chain.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(marker.as_str())
+                    })
+                });
+            if !marked || legacy_nft_fingerprint(&document) != fingerprint {
+                return Err(PrivilegedError::new(
+                    "schema-1 journal does not exactly own the live inet/routelane table",
+                ));
+            }
+            Ok(true)
+        };
+        let table_present = verify(&mut self.executor, !legacy.cleanup_pending)?;
+        legacy.cleanup_pending = true;
+        self.store.save(&StoredAppliedState {
+            legacy_v1: Some(legacy),
+            ..StoredAppliedState::default()
+        })?;
+        let to_runner = |error: RunnerError| PrivilegedError::new(error.to_string());
+        for rule in &expected.rules {
+            let family = if rule.family == 4 {
+                IpFamily::V4
+            } else {
+                IpFamily::V6
+            };
+            run_routing_step(
+                &mut self.executor,
+                &RoutingStep::DeleteRule {
+                    family,
+                    priority: rule.priority,
+                    table: rule.table,
+                    mark: rule.mark,
+                },
+                "remove schema-1 RouteLane policy rule",
+            )
+            .map_err(to_runner)?;
+        }
+        for route in &expected.routes {
+            let family = if route.family == 4 {
+                IpFamily::V4
+            } else {
+                IpFamily::V6
+            };
+            run_routing_step(
+                &mut self.executor,
+                &RoutingStep::FlushTable {
+                    family,
+                    table: route.table,
+                },
+                "flush schema-1 RouteLane routing table",
+            )
+            .map_err(to_runner)?;
+        }
+        if table_present && verify(&mut self.executor, false)? {
+            run_nft_batch(
+                &mut self.executor,
+                b"delete table inet routelane\n".to_vec(),
+                "delete schema-1 RouteLane nftables table",
+            )
+            .map_err(to_runner)?;
+        }
+        verify_exact_kernel_state(&mut self.executor, None, None)?;
+        self.store.clear()?;
+        self.legacy = None;
+        Ok(CleanupResponse {
+            cleaned: true,
             diagnostics: vec![],
         })
     }
+
     fn ensure_inspection_ready(&mut self) -> Result<(), PrivilegedError> {
         if self.initialized {
             return self.ensure_reconciled();
@@ -916,6 +1187,16 @@ where
             self.initialized = true;
             return Ok(());
         };
+        if record.legacy_v1.is_some() {
+            validate_legacy_envelope(&record)?;
+            self.current = None;
+            self.current_nft_fingerprint = None;
+            self.interface_settings.clear();
+            self.restore_receipt = None;
+            self.legacy = record.legacy_v1;
+            self.initialized = true;
+            return Ok(());
+        }
         if record.pending.is_some() || record.cleanup_pending {
             return self.ensure_reconciled();
         }
@@ -925,9 +1206,12 @@ where
             record.active_nft_fingerprint.as_deref(),
         )?;
         validate_restore_receipt(&record)?;
+        validate_setting_receipts(&record)?;
         self.current = record.active.as_ref().map(AppliedKernelState::from_plan);
         self.current_nft_fingerprint = record.active_nft_fingerprint;
+        self.interface_settings = record.interface_settings;
         self.restore_receipt = record.restore_receipt;
+        self.legacy = None;
         self.initialized = true;
         Ok(())
     }
@@ -939,21 +1223,82 @@ where
     ) -> Result<ApplyResponse, PrivilegedError> {
         let previous = self.current.clone();
         let previous_nft_fingerprint = self.current_nft_fingerprint.clone();
+        let previous_settings = self.interface_settings.clone();
         preflight_plan(&mut self.executor, previous.as_ref(), plan)?;
         let pending_expectations =
             build_pending_expectations(previous.as_ref().map(AppliedKernelState::plan), plan)?;
-        self.store.save(&StoredAppliedState {
+        let mut record = StoredAppliedState {
             active: previous.as_ref().map(|state| state.plan().clone()),
             active_nft_fingerprint: previous_nft_fingerprint.clone(),
             pending: Some(plan.clone()),
             pending_expectations: Some(pending_expectations.clone()),
-            cleanup_pending: false,
             restore_receipt: restore_receipt.clone(),
-            orphan_cleanup: None,
-        })?;
+            interface_settings: previous_settings.clone(),
+            ..StoredAppliedState::default()
+        };
+        self.store.save(&record)?;
         self.restore_receipt = None;
 
+        // Kernel state is still untouched: undo any journaled setting write and
+        // return the journal to the previous committed generation.
+        let new_settings = match ensure_interface_settings(
+            &mut *self.settings,
+            &mut self.store,
+            &mut record,
+            plan,
+        ) {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                let restored = restore_setting_receipts(
+                    &mut *self.settings,
+                    &record.pending_interface_settings,
+                );
+                let state_repair = persist_committed(
+                    &mut self.store,
+                    previous.as_ref(),
+                    previous_nft_fingerprint.as_deref(),
+                    &previous_settings,
+                );
+                return Err(PrivilegedError::new(format!(
+                    "{error}; setting restore: {}; state repair: {}",
+                    if restored.is_empty() {
+                        "ok".to_owned()
+                    } else {
+                        restored.join("; ")
+                    },
+                    result_label(&state_repair),
+                )));
+            }
+        };
+        let committed_settings = previous_settings
+            .iter()
+            .chain(&new_settings)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let settings = &mut *self.settings;
         let mut runner = CommandKernelRunner::new(&mut self.executor, previous.clone());
+        let mut undo = |runner: &mut CommandKernelRunner<'_, E>,
+                        store: &mut S,
+                        rollback_succeeded: bool|
+         -> Result<(), PrivilegedError> {
+            repair_committed_journal_after_rollback(
+                store,
+                &mut *runner.executor,
+                previous.as_ref(),
+                previous_nft_fingerprint.as_deref(),
+                &previous_settings,
+                rollback_succeeded,
+            )?;
+            // Only after the journal is back on the previous generation; a
+            // retained pending journal restores these during recovery instead.
+            let diverged = restore_setting_receipts(settings, &new_settings);
+            if diverged.is_empty() {
+                Ok(())
+            } else {
+                Err(PrivilegedError::new(diverged.join("; ")))
+            }
+        };
         let transition = if restore_receipt.is_some() {
             restore_kernel_plan(
                 &mut runner,
@@ -970,13 +1315,7 @@ where
             Err(error) => {
                 let rollback_succeeded =
                     error.rollback_error().is_none() && error.cleanup_error().is_none();
-                let state_repair = repair_committed_journal_after_rollback(
-                    &mut self.store,
-                    &mut *runner.executor,
-                    previous.as_ref(),
-                    previous_nft_fingerprint.as_deref(),
-                    rollback_succeeded,
-                );
+                let state_repair = undo(&mut runner, &mut self.store, rollback_succeeded);
                 return match state_repair {
                     Ok(()) => Err(PrivilegedError::new(error.to_string())),
                     Err(state_repair) => Err(PrivilegedError::new(format!(
@@ -990,13 +1329,7 @@ where
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 let rollback = runner.restore(previous.as_ref());
-                let state_repair = repair_committed_journal_after_rollback(
-                    &mut self.store,
-                    &mut *runner.executor,
-                    previous.as_ref(),
-                    previous_nft_fingerprint.as_deref(),
-                    rollback.is_ok(),
-                );
+                let state_repair = undo(&mut runner, &mut self.store, rollback.is_ok());
                 return Err(PrivilegedError::new(format!(
                     "kernel apply completed but exact nftables state could not be recorded: {error}; rollback: {}; state repair: {}",
                     result_label(&rollback),
@@ -1020,13 +1353,7 @@ where
                 )
             });
             let rollback = runner.restore(previous.as_ref());
-            let state_repair = repair_committed_journal_after_rollback(
-                &mut self.store,
-                &mut *runner.executor,
-                previous.as_ref(),
-                previous_nft_fingerprint.as_deref(),
-                rollback.is_ok(),
-            );
+            let state_repair = undo(&mut runner, &mut self.store, rollback.is_ok());
             return Err(PrivilegedError::new(format!(
                 "{mismatch}; rollback: {}; state repair: {}",
                 result_label(&rollback),
@@ -1039,15 +1366,10 @@ where
             Some(&applied),
             Some(&applied_nft_fingerprint),
             restore_receipt.clone(),
+            &committed_settings,
         ) {
             let rollback = runner.restore(previous.as_ref());
-            let state_repair = repair_committed_journal_after_rollback(
-                &mut self.store,
-                &mut *runner.executor,
-                previous.as_ref(),
-                previous_nft_fingerprint.as_deref(),
-                rollback.is_ok(),
-            );
+            let state_repair = undo(&mut runner, &mut self.store, rollback.is_ok());
             return Err(PrivilegedError::new(format!(
                 "kernel apply completed but state commit failed: {persistence}; rollback: {}; state repair: {}",
                 result_label(&rollback),
@@ -1057,6 +1379,7 @@ where
 
         self.current = Some(applied);
         self.current_nft_fingerprint = Some(applied_nft_fingerprint);
+        self.interface_settings = committed_settings;
         self.restore_receipt = restore_receipt;
         Ok(ApplyResponse::from_plan(plan, vec![]))
     }
@@ -1099,6 +1422,17 @@ where
                 return Ok(());
             }
         };
+        if record.legacy_v1.is_some() {
+            // Schema-1 state is only ever removed by an explicit cleanup.
+            validate_legacy_envelope(&record)?;
+            self.current = None;
+            self.current_nft_fingerprint = None;
+            self.interface_settings.clear();
+            self.restore_receipt = None;
+            self.legacy = record.legacy_v1;
+            self.initialized = true;
+            return Ok(());
+        }
         validate_stored_plan(record.active.as_ref(), "active")?;
         validate_stored_plan(record.pending.as_ref(), "pending")?;
         validate_stored_fingerprint_pair(
@@ -1111,6 +1445,7 @@ where
             record.pending_expectations.as_ref(),
         )?;
         validate_restore_receipt(&record)?;
+        validate_setting_receipts(&record)?;
 
         if record.orphan_cleanup.is_some() {
             validate_orphan_journal(&record)?;
@@ -1136,6 +1471,7 @@ where
                 .map_err(|error| {
                     PrivilegedError::new(format!("resume persisted cleanup: {error}"))
                 })?;
+            restore_setting_receipts(&mut *self.settings, &record.interface_settings);
             match record.restore_receipt.clone() {
                 Some(receipt) => {
                     self.store
@@ -1145,6 +1481,7 @@ where
             }
             self.current = None;
             self.current_nft_fingerprint = None;
+            self.interface_settings.clear();
             self.restore_receipt = record.restore_receipt;
             self.initialized = true;
             return Ok(());
@@ -1180,13 +1517,23 @@ where
                     "recovered kernel state differs from the exact rollback target; pending journal retained: {error}"
                 ))
             })?;
-            persist_committed(
+            let interrupted = record
+                .pending_interface_settings
+                .iter()
+                .filter(|receipt| !record.interface_settings.contains(receipt))
+                .cloned()
+                .collect::<Vec<_>>();
+            restore_setting_receipts(&mut *self.settings, &interrupted);
+            persist_committed_with_receipt(
                 &mut self.store,
                 active.as_ref(),
                 record.active_nft_fingerprint.as_deref(),
+                None,
+                &record.interface_settings,
             )?;
             self.current = active;
             self.current_nft_fingerprint = record.active_nft_fingerprint;
+            self.interface_settings = record.interface_settings;
             self.restore_receipt = None;
             self.initialized = true;
             return Ok(());
@@ -1208,6 +1555,7 @@ where
             }
             self.current = Some(active);
             self.current_nft_fingerprint = Some(expected_nft_fingerprint.to_owned());
+            self.interface_settings = record.interface_settings;
             self.restore_receipt = record.restore_receipt;
         } else {
             if record.restore_receipt.is_none() {
@@ -1314,8 +1662,9 @@ fn persist_committed(
     store: &mut impl AppliedStateStore,
     state: Option<&AppliedKernelState>,
     nft_fingerprint: Option<&str>,
+    settings: &[InterfaceSettingReceipt],
 ) -> Result<(), PrivilegedError> {
-    persist_committed_with_receipt(store, state, nft_fingerprint, None)
+    persist_committed_with_receipt(store, state, nft_fingerprint, None, settings)
 }
 
 fn persist_committed_with_receipt(
@@ -1323,13 +1672,22 @@ fn persist_committed_with_receipt(
     state: Option<&AppliedKernelState>,
     nft_fingerprint: Option<&str>,
     restore_receipt: Option<RestoreReceipt>,
+    settings: &[InterfaceSettingReceipt],
 ) -> Result<(), PrivilegedError> {
+    if state.is_none() && !settings.is_empty() {
+        return Err(PrivilegedError::new(
+            "interface setting receipts require an active committed plan",
+        ));
+    }
     match (state, nft_fingerprint) {
-        (Some(state), Some(fingerprint)) => store.save(&StoredAppliedState::committed(
-            Some(state.plan().clone()),
-            Some(fingerprint.to_owned()),
-            restore_receipt,
-        )),
+        (Some(state), Some(fingerprint)) => store.save(&StoredAppliedState {
+            interface_settings: settings.to_vec(),
+            ..StoredAppliedState::committed(
+                Some(state.plan().clone()),
+                Some(fingerprint.to_owned()),
+                restore_receipt,
+            )
+        }),
         (None, None) => match restore_receipt {
             Some(receipt) => store.save(&StoredAppliedState::committed(None, None, Some(receipt))),
             None => store.clear(),
@@ -1345,6 +1703,7 @@ fn repair_committed_journal_after_rollback(
     executor: &mut impl CommandExecutor,
     state: Option<&AppliedKernelState>,
     nft_fingerprint: Option<&str>,
+    settings: &[InterfaceSettingReceipt],
     rollback_succeeded: bool,
 ) -> Result<(), PrivilegedError> {
     if !rollback_succeeded {
@@ -1353,7 +1712,117 @@ fn repair_committed_journal_after_rollback(
         ));
     }
     verify_exact_kernel_state(executor, state, nft_fingerprint)?;
-    persist_committed(store, state, nft_fingerprint)
+    persist_committed(store, state, nft_fingerprint, settings)
+}
+
+/// Lanes whose IPv4 replies need mark-aware reverse-path filtering.
+fn mark_aware_identities(plan: &KernelPlan) -> Vec<super::InterfaceIdentity> {
+    let mut identities = Vec::new();
+    for lane in &plan.lanes {
+        if lane.availability != super::LaneAvailability::Available || lane.route_v4.is_none() {
+            continue;
+        }
+        if let Some(identity) = &lane.identity {
+            if !identities.contains(identity) {
+                identities.push(identity.clone());
+            }
+        }
+    }
+    identities
+}
+
+/// Journals each setting intent (durably) before its write. Returns receipts
+/// for writes this transition made; already-owned interfaces are skipped.
+fn ensure_interface_settings(
+    settings: &mut dyn MarkAwareRpfBackend,
+    store: &mut impl AppliedStateStore,
+    record: &mut StoredAppliedState,
+    plan: &KernelPlan,
+) -> Result<Vec<InterfaceSettingReceipt>, PrivilegedError> {
+    let mut applied = Vec::new();
+    for identity in mark_aware_identities(plan) {
+        if record
+            .interface_settings
+            .iter()
+            .any(|receipt| receipt.identity == identity)
+        {
+            continue;
+        }
+        let mut coordinator =
+            MarkAwareRpf::new(&mut *settings, |receipt: &InterfaceSettingReceipt| {
+                record.pending_interface_settings.push(receipt.clone());
+                store.save(record).map_err(|error| {
+                    PrivilegedError::new(format!("interface setting journal: {error}"))
+                })
+            });
+        if let Some(receipt) = coordinator.ensure_mark_aware_rpf(&identity)? {
+            applied.push(receipt);
+        }
+    }
+    Ok(applied)
+}
+
+/// Compare-and-restore. A changed value or replaced interface is reported and
+/// left untouched; the receipt is then spent.
+fn restore_setting_receipts(
+    settings: &mut dyn MarkAwareRpfBackend,
+    receipts: &[InterfaceSettingReceipt],
+) -> Vec<String> {
+    let mut coordinator = MarkAwareRpf::new(settings, |_: &InterfaceSettingReceipt| Ok(()));
+    receipts
+        .iter()
+        .filter_map(|receipt| {
+            coordinator
+                .restore_mark_aware_rpf(receipt)
+                .err()
+                .map(|error| {
+                    format!(
+                        "interface {} src_valid_mark left unchanged: {error}",
+                        receipt.identity.name
+                    )
+                })
+        })
+        .collect()
+}
+
+fn validate_setting_receipts(record: &StoredAppliedState) -> Result<(), PrivilegedError> {
+    if !record.interface_settings.is_empty() && record.active.is_none() {
+        return Err(PrivilegedError::new(
+            "invalid persisted state: interface setting receipts without an active plan",
+        ));
+    }
+    if !record.pending_interface_settings.is_empty() && record.pending.is_none() {
+        return Err(PrivilegedError::new(
+            "invalid persisted state: pending interface settings without a pending plan",
+        ));
+    }
+    let receipts = record
+        .interface_settings
+        .iter()
+        .chain(&record.pending_interface_settings);
+    if receipts
+        .clone()
+        .any(|receipt| receipt.previous != 0 || receipt.applied != 1)
+        || receipts.count() > 2 * MAX_LANES
+    {
+        return Err(PrivilegedError::new(
+            "invalid persisted state: interface setting receipts are out of bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_legacy_envelope(record: &StoredAppliedState) -> Result<(), PrivilegedError> {
+    let empty = StoredAppliedState {
+        legacy_v1: record.legacy_v1.clone(),
+        ..StoredAppliedState::default()
+    };
+    if *record != empty {
+        return Err(PrivilegedError::new(
+            "invalid persisted state: a schema-1 journal cannot carry current-schema state",
+        ));
+    }
+    Ok(())
 }
 
 fn verify_exact_kernel_state(
@@ -1422,9 +1891,7 @@ fn preflight_plan(
             "routing resource conflict before journaling: {conflict:?}"
         ))
     })?;
-    if unowned_requested_resource_present(&captured, current.map(AppliedKernelState::plan), next)
-        .map_err(|error| PrivilegedError::new(error.to_string()))?
-    {
+    if unowned_requested_resource_present(&captured, current.map(AppliedKernelState::plan), next)? {
         return Err(PrivilegedError::new(
             "routing resource conflict before journaling: requested route or policy-rule state exists without persisted RouteLane ownership",
         ));
@@ -1436,57 +1903,18 @@ fn unowned_requested_resource_present(
     captured: &CapturedSnapshot,
     current: Option<&KernelPlan>,
     next: &KernelPlan,
-) -> Result<bool, RunnerError> {
-    let ipv4_routes: Vec<serde_json::Value> = serde_json::from_slice(&captured.ipv4_routes)
-        .map_err(|error| RunnerError::new(format!("invalid IPv4 route data: {error}")))?;
-    let ipv6_routes: Vec<serde_json::Value> = serde_json::from_slice(&captured.ipv6_routes)
-        .map_err(|error| RunnerError::new(format!("invalid IPv6 route data: {error}")))?;
-    let ipv4_rules: Vec<serde_json::Value> = serde_json::from_slice(&captured.ipv4_rules)
-        .map_err(|error| RunnerError::new(format!("invalid IPv4 rule data: {error}")))?;
-    let ipv6_rules: Vec<serde_json::Value> = serde_json::from_slice(&captured.ipv6_rules)
-        .map_err(|error| RunnerError::new(format!("invalid IPv6 rule data: {error}")))?;
-
-    for lane in next
-        .lanes
+) -> Result<bool, PrivilegedError> {
+    let live = live_routing_ownership(captured)?;
+    let requested = plan_routing_ownership(next);
+    let owned = current.map(plan_routing_ownership).unwrap_or_default();
+    Ok(live
+        .routes
         .iter()
-        .filter(|lane| lane.availability == super::LaneAvailability::Available)
-    {
-        if let Some(route) = lane.route_v4 {
-            let gateway = route.gateway().map(ToString::to_string);
-            if route_present(
-                &ipv4_routes,
-                lane.table,
-                gateway.as_deref(),
-                &lane.interface,
-            ) && !current.is_some_and(|plan| plan_has_route(plan, IpFamily::V4, lane))
-            {
-                return Ok(true);
-            }
-            if rule_present(&ipv4_rules, lane.rule_priority, lane.table, lane.mark)
-                && !current.is_some_and(|plan| plan_has_policy_rule(plan, IpFamily::V4, lane))
-            {
-                return Ok(true);
-            }
-        }
-        if let Some(route) = lane.route_v6 {
-            let gateway = route.gateway().map(ToString::to_string);
-            if route_present(
-                &ipv6_routes,
-                lane.table,
-                gateway.as_deref(),
-                &lane.interface,
-            ) && !current.is_some_and(|plan| plan_has_route(plan, IpFamily::V6, lane))
-            {
-                return Ok(true);
-            }
-            if rule_present(&ipv6_rules, lane.rule_priority, lane.table, lane.mark)
-                && !current.is_some_and(|plan| plan_has_policy_rule(plan, IpFamily::V6, lane))
-            {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+        .any(|route| requested.routes.contains(route) && !owned.routes.contains(route))
+        || live
+            .rules
+            .iter()
+            .any(|rule| requested.rules.contains(rule) && !owned.rules.contains(rule)))
 }
 
 struct CommandKernelRunner<'a, E> {
@@ -1538,21 +1966,11 @@ where
     }
 
     fn prepare_routes(&mut self, next: &KernelPlan) -> Result<(), RunnerError> {
-        let previous_commands = self
-            .previous
-            .as_ref()
-            .map(|state| build_policy_commands(state.plan()))
-            .unwrap_or_default();
-        for command in build_policy_commands(next) {
-            let is_policy_rule = command
-                .args
-                .starts_with(&["rule".to_owned(), "add".to_owned()]);
-            if is_policy_rule && previous_commands.contains(&command) {
-                continue;
-            }
-            run_required(
+        let previous = self.previous.as_ref().map(AppliedKernelState::plan);
+        for step in transition_steps(previous, next) {
+            run_routing_step(
                 self.executor,
-                &command,
+                &step,
                 "prepare RouteLane route or policy rule",
             )?;
         }
@@ -1603,8 +2021,13 @@ where
             .ok_or_else(|| RunnerError::new("next plan is unavailable during cleanup"))?
             .clone();
 
-        remove_old_policy_rules(self.executor, &previous, &next)?;
-        flush_unreused_route_tables(self.executor, &previous, &next)?;
+        for step in retire_steps(&previous, &next) {
+            run_routing_step(
+                self.executor,
+                &step,
+                "remove previous RouteLane route, policy rule or table",
+            )?;
+        }
         Ok(())
     }
 
@@ -1631,7 +2054,13 @@ where
         }
 
         remove_plan_policy_rules(self.executor, &plans)?;
-        flush_plan_route_tables(self.executor, &plans)?;
+        for step in rollback_table_order(&plans) {
+            run_routing_step(
+                self.executor,
+                &step,
+                "flush RouteLane table during rollback",
+            )?;
+        }
 
         if self.table_present {
             run_nft_batch(
@@ -1644,10 +2073,10 @@ where
         self.guard_installed = false;
 
         if let Some(state) = state {
-            for command in build_policy_commands(state.plan()) {
-                run_required(
+            for step in install_steps(state.plan()) {
+                run_routing_step(
                     self.executor,
-                    &command,
+                    &step,
                     "restore previous RouteLane route or policy rule",
                 )?;
             }
@@ -1836,54 +2265,10 @@ fn captured_plan_present(
     if !captured.snapshot.has_nft_table("inet", "routelane") {
         return Ok(false);
     }
-    let ipv4_routes: Vec<serde_json::Value> = serde_json::from_slice(&captured.ipv4_routes)
-        .map_err(|error| {
-            RunnerError::new(format!("invalid IPv4 route verification data: {error}"))
-        })?;
-    let ipv6_routes: Vec<serde_json::Value> = serde_json::from_slice(&captured.ipv6_routes)
-        .map_err(|error| {
-            RunnerError::new(format!("invalid IPv6 route verification data: {error}"))
-        })?;
-    let ipv4_rules: Vec<serde_json::Value> =
-        serde_json::from_slice(&captured.ipv4_rules).map_err(|error| {
-            RunnerError::new(format!("invalid IPv4 rule verification data: {error}"))
-        })?;
-    let ipv6_rules: Vec<serde_json::Value> =
-        serde_json::from_slice(&captured.ipv6_rules).map_err(|error| {
-            RunnerError::new(format!("invalid IPv6 rule verification data: {error}"))
-        })?;
-
-    for lane in plan
-        .lanes
-        .iter()
-        .filter(|lane| lane.availability == super::LaneAvailability::Available)
-    {
-        if let Some(route) = lane.route_v4 {
-            let gateway = route.gateway().map(ToString::to_string);
-            if !route_present(
-                &ipv4_routes,
-                lane.table,
-                gateway.as_deref(),
-                &lane.interface,
-            ) || !rule_present(&ipv4_rules, lane.rule_priority, lane.table, lane.mark)
-            {
-                return Ok(false);
-            }
-        }
-        if let Some(route) = lane.route_v6 {
-            let gateway = route.gateway().map(ToString::to_string);
-            if !route_present(
-                &ipv6_routes,
-                lane.table,
-                gateway.as_deref(),
-                &lane.interface,
-            ) || !rule_present(&ipv6_rules, lane.rule_priority, lane.table, lane.mark)
-            {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
+    let live =
+        live_routing_ownership(captured).map_err(|error| RunnerError::new(error.to_string()))?;
+    let expected = plan_routing_ownership(plan);
+    Ok(expected.routes.is_subset(&live.routes) && expected.rules.is_subset(&live.rules))
 }
 
 fn verify_persisted_ownership(
@@ -2028,6 +2413,10 @@ struct RouteOwnership {
     table: u32,
     gateway: Option<String>,
     interface: String,
+    /// Lowest-preference unreachable default; omitted when false so unicast-only
+    /// ownership keeps its previous serialized fingerprint.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    terminal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2102,25 +2491,93 @@ fn routing_state_reachable_for_phase(
 
 fn plan_routing_ownership(plan: &KernelPlan) -> RoutingOwnership {
     let mut ownership = RoutingOwnership::default();
-    for lane in plan
-        .lanes
-        .iter()
-        .filter(|lane| lane.availability == super::LaneAvailability::Available)
-    {
-        if let Some(route) = lane_route_ownership(lane, IpFamily::V4) {
-            ownership.routes.insert(route);
-            ownership
-                .rules
-                .insert(lane_rule_ownership(lane, IpFamily::V4));
-        }
-        if let Some(route) = lane_route_ownership(lane, IpFamily::V6) {
-            ownership.routes.insert(route);
-            ownership
-                .rules
-                .insert(lane_rule_ownership(lane, IpFamily::V6));
-        }
+    for step in install_steps(plan) {
+        apply_routing_step(&mut ownership, &step);
     }
     ownership
+}
+
+fn route_ownership(family: IpFamily, table: u32, route: &OwnedRoute) -> RouteOwnership {
+    match route {
+        OwnedRoute::Unicast { gateway, interface } => RouteOwnership {
+            family: family_number(family),
+            table,
+            gateway: gateway.map(|gateway| gateway.to_string()),
+            interface: interface.clone(),
+            terminal: false,
+        },
+        OwnedRoute::Terminal => RouteOwnership {
+            family: family_number(family),
+            table,
+            gateway: None,
+            interface: String::new(),
+            terminal: true,
+        },
+    }
+}
+
+fn rule_ownership(family: IpFamily, priority: u32, table: u32, mark: u32) -> RuleOwnership {
+    RuleOwnership {
+        family: family_number(family),
+        priority,
+        table,
+        mark,
+    }
+}
+
+/// Models one typed step exactly as the kernel applies it: a replace swaps
+/// the route of the same kind in the same table, removals are idempotent.
+fn apply_routing_step(state: &mut RoutingOwnership, step: &RoutingStep) {
+    match step {
+        RoutingStep::ReplaceRoute {
+            family,
+            table,
+            route,
+        } => {
+            let route = route_ownership(*family, *table, route);
+            state.routes.retain(|existing| {
+                existing.family != route.family
+                    || existing.table != route.table
+                    || existing.terminal != route.terminal
+            });
+            state.routes.insert(route);
+        }
+        RoutingStep::DeleteRoute {
+            family,
+            table,
+            route,
+        } => {
+            state
+                .routes
+                .remove(&route_ownership(*family, *table, route));
+        }
+        RoutingStep::AddRule {
+            family,
+            priority,
+            table,
+            mark,
+        } => {
+            state
+                .rules
+                .insert(rule_ownership(*family, *priority, *table, *mark));
+        }
+        RoutingStep::DeleteRule {
+            family,
+            priority,
+            table,
+            mark,
+        } => {
+            state
+                .rules
+                .remove(&rule_ownership(*family, *priority, *table, *mark));
+        }
+        RoutingStep::FlushTable { family, table } => {
+            let family = family_number(*family);
+            state
+                .routes
+                .retain(|route| route.family != family || route.table != *table);
+        }
+    }
 }
 
 fn build_forward_routing_states(
@@ -2133,33 +2590,9 @@ fn build_forward_routing_states(
         return Ok(vec![state]);
     }
     let mut guard_states = vec![state.clone()];
-
-    for lane in pending
-        .lanes
-        .iter()
-        .filter(|lane| lane.availability == super::LaneAvailability::Available)
-    {
-        for family in [IpFamily::V4, IpFamily::V6] {
-            if let Some(route) = lane_route_ownership(lane, family) {
-                state.routes.retain(|existing| {
-                    existing.family != route.family || existing.table != route.table
-                });
-                state.routes.insert(route);
-                guard_states.push(state.clone());
-            }
-        }
-    }
-    for lane in pending
-        .lanes
-        .iter()
-        .filter(|lane| lane.availability == super::LaneAvailability::Available)
-    {
-        for family in [IpFamily::V4, IpFamily::V6] {
-            if lane_route_ownership(lane, family).is_some() {
-                state.rules.insert(lane_rule_ownership(lane, family));
-                guard_states.push(state.clone());
-            }
-        }
+    for step in transition_steps(active, pending) {
+        apply_routing_step(&mut state, &step);
+        guard_states.push(state.clone());
     }
     if phase == PendingNftPhase::Guard {
         return Ok(guard_states);
@@ -2167,28 +2600,8 @@ fn build_forward_routing_states(
 
     let mut activated_states = vec![state.clone()];
     if let Some(active) = active {
-        for lane in active
-            .lanes
-            .iter()
-            .filter(|lane| lane.availability == super::LaneAvailability::Available)
-        {
-            for family in [IpFamily::V4, IpFamily::V6] {
-                if lane_route_ownership(lane, family).is_some()
-                    && !plan_has_policy_rule(pending, family, lane)
-                {
-                    state.rules.remove(&lane_rule_ownership(lane, family));
-                    activated_states.push(state.clone());
-                }
-            }
-        }
-        let pending_route_keys = plan_route_keys(pending);
-        for (family, table) in plan_route_keys(active) {
-            if pending_route_keys.contains(&(family, table)) {
-                continue;
-            }
-            state
-                .routes
-                .retain(|route| route.family != family_number(family) || route.table != table);
+        for step in retire_steps(active, pending) {
+            apply_routing_step(&mut state, &step);
             activated_states.push(state.clone());
         }
     }
@@ -2210,48 +2623,67 @@ fn build_forward_routing_states(
     }
 }
 
+/// Rules a rollback removes, in the exact order `restore` removes them.
+fn rollback_rule_order<'a>(plans: impl IntoIterator<Item = &'a KernelPlan>) -> Vec<RoutingStep> {
+    let mut rules = Vec::new();
+    for plan in plans {
+        for step in install_steps(plan) {
+            if let RoutingStep::AddRule {
+                family,
+                priority,
+                table,
+                mark,
+            } = step
+            {
+                let delete = RoutingStep::DeleteRule {
+                    family,
+                    priority,
+                    table,
+                    mark,
+                };
+                if !rules.contains(&delete) {
+                    rules.push(delete);
+                }
+            }
+        }
+    }
+    rules
+}
+
+/// Tables a rollback flushes, in the exact order `restore` flushes them.
+fn rollback_table_order<'a>(plans: impl IntoIterator<Item = &'a KernelPlan>) -> Vec<RoutingStep> {
+    let mut tables = Vec::new();
+    for plan in plans {
+        for lane in &plan.lanes {
+            for family in [IpFamily::V4, IpFamily::V6] {
+                let flush = RoutingStep::FlushTable {
+                    family,
+                    table: lane.table,
+                };
+                if !tables.contains(&flush) {
+                    tables.push(flush);
+                }
+            }
+        }
+    }
+    tables
+}
+
 fn rollback_prefix_reaches(
     starting_state: &RoutingOwnership,
     active: Option<&KernelPlan>,
     pending: &KernelPlan,
     expected: &RoutingOwnership,
 ) -> bool {
+    let plans = || active.into_iter().chain(std::iter::once(pending));
     let mut state = starting_state.clone();
-    let mut rules = BTreeSet::new();
-    for plan in active.into_iter().chain(std::iter::once(pending)) {
-        for lane in plan
-            .lanes
-            .iter()
-            .filter(|lane| lane.availability == super::LaneAvailability::Available)
-        {
-            for family in [IpFamily::V4, IpFamily::V6] {
-                if lane_route_ownership(lane, family).is_none() {
-                    continue;
-                }
-                let rule = lane_rule_ownership(lane, family);
-                if rules.insert(rule.clone()) && state.rules.remove(&rule) && state == *expected {
-                    return true;
-                }
-            }
-        }
-    }
-
-    let mut route_keys = Vec::new();
-    for key in active
+    for step in rollback_rule_order(plans())
         .into_iter()
-        .chain(std::iter::once(pending))
-        .flat_map(plan_route_keys)
+        .chain(rollback_table_order(plans()))
     {
-        if !route_keys.contains(&key) {
-            route_keys.push(key);
-        }
-    }
-    for (family, table) in route_keys {
-        let old_len = state.routes.len();
-        state
-            .routes
-            .retain(|route| route.family != family_number(family) || route.table != table);
-        if state.routes.len() != old_len && state == *expected {
+        let before = state.clone();
+        apply_routing_step(&mut state, &step);
+        if state != before && state == *expected {
             return true;
         }
     }
@@ -2264,32 +2696,9 @@ fn build_absent_rollback_states(active: Option<&KernelPlan>) -> Vec<RoutingOwner
     let Some(active) = active else {
         return states;
     };
-    for lane in active
-        .lanes
-        .iter()
-        .filter(|lane| lane.availability == super::LaneAvailability::Available)
-    {
-        for family in [IpFamily::V4, IpFamily::V6] {
-            if let Some(route) = lane_route_ownership(lane, family) {
-                state.routes.retain(|existing| {
-                    existing.family != route.family || existing.table != route.table
-                });
-                state.routes.insert(route);
-                states.push(state.clone());
-            }
-        }
-    }
-    for lane in active
-        .lanes
-        .iter()
-        .filter(|lane| lane.availability == super::LaneAvailability::Available)
-    {
-        for family in [IpFamily::V4, IpFamily::V6] {
-            if lane_route_ownership(lane, family).is_some() {
-                state.rules.insert(lane_rule_ownership(lane, family));
-                states.push(state.clone());
-            }
-        }
+    for step in install_steps(active) {
+        apply_routing_step(&mut state, &step);
+        states.push(state.clone());
     }
     states
 }
@@ -2298,28 +2707,6 @@ fn routing_ownership_fingerprint(ownership: &RoutingOwnership) -> Result<String,
     let encoded = serde_json::to_vec(ownership)
         .map_err(|error| PrivilegedError::new(format!("encode routing ownership: {error}")))?;
     Ok(blake3::hash(&encoded).to_hex().to_string())
-}
-
-fn lane_route_ownership(lane: &super::LanePlan, family: IpFamily) -> Option<RouteOwnership> {
-    let gateway = match family {
-        IpFamily::V4 => lane.route_v4?.gateway().map(ToString::to_string),
-        IpFamily::V6 => lane.route_v6?.gateway().map(ToString::to_string),
-    };
-    Some(RouteOwnership {
-        family: family_number(family),
-        table: lane.table,
-        gateway,
-        interface: lane.interface.clone(),
-    })
-}
-
-fn lane_rule_ownership(lane: &super::LanePlan, family: IpFamily) -> RuleOwnership {
-    RuleOwnership {
-        family: family_number(family),
-        priority: lane.rule_priority,
-        table: lane.table,
-        mark: lane.mark,
-    }
 }
 
 fn family_number(family: IpFamily) -> u8 {
@@ -2411,7 +2798,11 @@ fn validate_orphan_routing(ownership: &RoutingOwnership) -> Result<(), Privilege
         if ownership
             .routes
             .iter()
-            .filter(|candidate| candidate.family == route.family && candidate.table == route.table)
+            .filter(|candidate| {
+                candidate.family == route.family
+                    && candidate.table == route.table
+                    && candidate.terminal == route.terminal
+            })
             .count()
             != 1
         {
@@ -2603,6 +2994,7 @@ fn orphan_journal(ownership: OrphanedOwnership) -> StoredAppliedState {
         cleanup_pending: false,
         restore_receipt: None,
         orphan_cleanup: Some(ownership),
+        ..StoredAppliedState::default()
     }
 }
 
@@ -2735,41 +3127,19 @@ fn collect_live_routes(
             "type", "dst", "gateway", "dev", "table", "metric", "protocol", "scope", "prefsrc",
             "flags", "pref",
         ];
-        if object.keys().any(|key| !allowed.contains(&key.as_str()))
-            || route.get("dst").and_then(serde_json::Value::as_str) != Some("default")
-            || !absent_or_exact_string(route.get("type"), "unicast")
-            || !absent_or_exact_u32(route.get("metric"), if family == 4 { 0 } else { 1024 })
-            || !absent_or_exact_string(route.get("protocol"), "boot")
-            || !route_scope_is_exact(
-                route.get("scope"),
-                route
-                    .get("gateway")
-                    .and_then(serde_json::Value::as_str)
-                    .is_none(),
-            )
-            || route.get("prefsrc").is_some()
-            || !absent_or_empty_array(route.get("flags"))
-            || (family == 4 && route.get("pref").is_some())
-            || (family == 6 && !absent_or_exact_string(route.get("pref"), "medium"))
-        {
+        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
             return Err(PrivilegedError::new(
                 "live RouteLane routing-table entry has foreign semantics",
             ));
         }
-        let resource = RouteOwnership {
-            family,
-            table,
-            gateway: route
-                .get("gateway")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            interface: route
-                .get("dev")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    PrivilegedError::new("live RouteLane route is missing its interface")
-                })?
-                .to_owned(),
+        let resource = if route
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| matches!(kind, "unreachable" | "7"))
+        {
+            live_terminal_route(&route, family, table)?
+        } else {
+            live_unicast_route(&route, family, table)?
         };
         if !ownership.routes.insert(resource) {
             return Err(PrivilegedError::new(
@@ -2778,6 +3148,87 @@ fn collect_live_routes(
         }
     }
     Ok(())
+}
+
+fn live_terminal_route(
+    route: &serde_json::Value,
+    family: u8,
+    table: u32,
+) -> Result<RouteOwnership, PrivilegedError> {
+    // IPv4 reports no device; IPv6 attaches reject routes to loopback.
+    let device_is_exact = if family == 4 {
+        route.get("dev").is_none()
+    } else {
+        absent_or_exact_string(route.get("dev"), "lo")
+    };
+    if route.get("dst").and_then(serde_json::Value::as_str) != Some("default")
+        || json_u32(route.get("metric")) != Some(TERMINAL_ROUTE_METRIC)
+        || route.get("gateway").is_some()
+        || !device_is_exact
+        // iproute2 prints enums symbolically, or numerically with `-N`.
+        || !route
+            .get("protocol")
+            .is_none_or(|value| matches!(value.as_str(), Some("boot" | "3")))
+        || !route
+            .get("scope")
+            .is_none_or(|value| matches!(value.as_str(), Some("global" | "0")))
+        || route.get("prefsrc").is_some()
+        || !absent_or_empty_array(route.get("flags"))
+        || (family == 4 && route.get("pref").is_some())
+        || (family == 6 && !absent_or_exact_string(route.get("pref"), "medium"))
+    {
+        return Err(PrivilegedError::new(
+            "live RouteLane terminal route has foreign semantics",
+        ));
+    }
+    Ok(RouteOwnership {
+        family,
+        table,
+        gateway: None,
+        interface: String::new(),
+        terminal: true,
+    })
+}
+
+fn live_unicast_route(
+    route: &serde_json::Value,
+    family: u8,
+    table: u32,
+) -> Result<RouteOwnership, PrivilegedError> {
+    if route.get("dst").and_then(serde_json::Value::as_str) != Some("default")
+        || !absent_or_exact_string(route.get("type"), "unicast")
+        || !absent_or_exact_u32(route.get("metric"), if family == 4 { 0 } else { 1024 })
+        || !absent_or_exact_string(route.get("protocol"), "boot")
+        || !route_scope_is_exact(
+            route.get("scope"),
+            route
+                .get("gateway")
+                .and_then(serde_json::Value::as_str)
+                .is_none(),
+        )
+        || route.get("prefsrc").is_some()
+        || !absent_or_empty_array(route.get("flags"))
+        || (family == 4 && route.get("pref").is_some())
+        || (family == 6 && !absent_or_exact_string(route.get("pref"), "medium"))
+    {
+        return Err(PrivilegedError::new(
+            "live RouteLane routing-table entry has foreign semantics",
+        ));
+    }
+    Ok(RouteOwnership {
+        family,
+        table,
+        gateway: route
+            .get("gateway")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        interface: route
+            .get("dev")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| PrivilegedError::new("live RouteLane route is missing its interface"))?
+            .to_owned(),
+        terminal: false,
+    })
 }
 
 fn collect_live_rules(
@@ -2964,6 +3415,40 @@ fn routing_model_fingerprint(
 }
 
 fn read_nft_table(executor: &mut impl CommandExecutor) -> Result<serde_json::Value, RunnerError> {
+    let document = read_nft_table_once(executor)?;
+    if !super::nft_document::has_symbolic_ifindices(&document) {
+        return Ok(document);
+    }
+    // Never resolve a current dump with stale stored name→index assumptions.
+    // Bracket the actual dump with immutable-identity observations; fail closed
+    // if a device is renamed/replaced during this read-only proof.
+    let before = read_nft_link_bindings()?;
+    let mut document = read_nft_table_once(executor)?;
+    let after = read_nft_link_bindings()?;
+    if before != after {
+        return Err(RunnerError::new("interface identities changed during exact nft ownership inspection; retry with fresh topology"));
+    }
+    super::nft_document::resolve_dump_ifindices(&mut document, &before)?;
+    Ok(document)
+}
+
+fn read_nft_link_bindings() -> Result<BTreeMap<String, super::InterfaceIdentity>, RunnerError> {
+    let links = run_topology_query(super::topology::TopologyQuery::Links)?;
+    let topology = super::parse_topology(super::TopologyInput {
+        links: &links,
+        addresses: b"[]",
+        routes_v4: b"[]",
+        routes_v6: b"[]",
+        rules_v4: b"[]",
+        rules_v6: b"[]",
+    })
+    .map_err(|e| RunnerError::new(e.to_string()))?;
+    Ok(topology.interface_identities())
+}
+
+fn read_nft_table_once(
+    executor: &mut impl CommandExecutor,
+) -> Result<serde_json::Value, RunnerError> {
     let command = CommandSpec {
         program: Program::Nft,
         family: None,
@@ -2978,28 +3463,6 @@ fn read_nft_table(executor: &mut impl CommandExecutor) -> Result<serde_json::Val
         .map_err(|error| RunnerError::new(format!("invalid nftables table JSON: {error}")))
 }
 
-fn route_present(
-    routes: &[serde_json::Value],
-    table: u32,
-    gateway: Option<&str>,
-    interface: &str,
-) -> bool {
-    routes.iter().any(|route| {
-        route.get("dst").and_then(serde_json::Value::as_str) == Some("default")
-            && json_u32(route.get("table")) == Some(table)
-            && route.get("gateway").and_then(serde_json::Value::as_str) == gateway
-            && route.get("dev").and_then(serde_json::Value::as_str) == Some(interface)
-    })
-}
-
-fn rule_present(rules: &[serde_json::Value], priority: u32, table: u32, mark: u32) -> bool {
-    rules.iter().any(|rule| {
-        json_u32(rule.get("priority")) == Some(priority)
-            && json_u32(rule.get("table")) == Some(table)
-            && rule.get("fwmark").and_then(parse_mark) == Some(mark)
-    })
-}
-
 fn json_u32(value: Option<&serde_json::Value>) -> Option<u32> {
     match value? {
         serde_json::Value::Number(number) => number.as_u64()?.try_into().ok(),
@@ -3008,258 +3471,100 @@ fn json_u32(value: Option<&serde_json::Value>) -> Option<u32> {
     }
 }
 
-fn parse_mark(value: &serde_json::Value) -> Option<u32> {
-    match value {
-        serde_json::Value::Number(number) => number.as_u64()?.try_into().ok(),
-        serde_json::Value::String(text) => {
-            let value = text
-                .split_once('/')
-                .map_or(text.as_str(), |(value, _)| value);
-            value.strip_prefix("0x").map_or_else(
-                || value.parse().ok(),
-                |hex| u32::from_str_radix(hex, 16).ok(),
-            )
-        }
-        _ => None,
-    }
-}
-
-fn remove_old_policy_rules(
+/// Runs one typed routing step. Removals are skipped when the exact resource is
+/// already absent, so a kernel-dropped route or an interrupted removal can resume.
+fn run_routing_step(
     executor: &mut impl CommandExecutor,
-    previous: &KernelPlan,
-    next: &KernelPlan,
+    step: &RoutingStep,
+    context: &str,
 ) -> Result<(), RunnerError> {
-    for lane in previous
-        .lanes
-        .iter()
-        .filter(|lane| lane.availability == super::LaneAvailability::Available)
-    {
-        if lane.route_v4.is_some() && !plan_has_policy_rule(next, IpFamily::V4, lane) {
-            delete_one_rule_if_present(executor, IpFamily::V4, lane)?;
-        }
-        if lane.route_v6.is_some() && !plan_has_policy_rule(next, IpFamily::V6, lane) {
-            delete_one_rule_if_present(executor, IpFamily::V6, lane)?;
-        }
-    }
-    Ok(())
-}
-
-fn plan_has_policy_rule(plan: &KernelPlan, family: IpFamily, expected: &super::LanePlan) -> bool {
-    plan.lanes.iter().any(|lane| {
-        lane.availability == super::LaneAvailability::Available
-            && lane.table == expected.table
-            && lane.mark == expected.mark
-            && lane.rule_priority == expected.rule_priority
-            && match family {
-                IpFamily::V4 => lane.route_v4.is_some(),
-                IpFamily::V6 => lane.route_v6.is_some(),
-            }
-    })
-}
-
-fn plan_has_route(plan: &KernelPlan, family: IpFamily, expected: &super::LanePlan) -> bool {
-    plan.lanes.iter().any(|lane| {
-        lane.availability == super::LaneAvailability::Available
-            && lane.table == expected.table
-            && lane.interface == expected.interface
-            && match family {
-                IpFamily::V4 => lane.route_v4 == expected.route_v4,
-                IpFamily::V6 => lane.route_v6 == expected.route_v6,
-            }
-    })
-}
-
-fn delete_one_rule_if_present(
-    executor: &mut impl CommandExecutor,
-    family: IpFamily,
-    lane: &super::LanePlan,
-) -> Result<(), RunnerError> {
-    if !live_rule_present(executor, family, lane)? {
-        return Ok(());
-    }
-    let command = ip_command(
-        family,
-        [
-            "rule".to_owned(),
-            "del".to_owned(),
-            "fwmark".to_owned(),
-            format!("{:#010x}", lane.mark),
-            "lookup".to_owned(),
-            lane.table.to_string(),
-            "priority".to_owned(),
-            lane.rule_priority.to_string(),
-        ],
-    );
-    run_required(executor, &command, "remove previous RouteLane policy rule").map(|_| ())
-}
-
-fn live_rule_present(
-    executor: &mut impl CommandExecutor,
-    family: IpFamily,
-    lane: &super::LanePlan,
-) -> Result<bool, RunnerError> {
-    let command = ip_command(family, ["-j", "-N", "rule", "show"]);
-    let output = run_required(executor, &command, "inspect RouteLane policy rule")?;
-    let rules: Vec<serde_json::Value> = serde_json::from_slice(&output)
-        .map_err(|error| RunnerError::new(format!("invalid policy rule JSON: {error}")))?;
-    Ok(rule_present(
-        &rules,
-        lane.rule_priority,
-        lane.table,
-        lane.mark,
-    ))
-}
-
-fn flush_unreused_route_tables(
-    executor: &mut impl CommandExecutor,
-    previous: &KernelPlan,
-    next: &KernelPlan,
-) -> Result<(), RunnerError> {
-    let next_routes = plan_route_keys(next);
-    let captured = capture_snapshot(executor)?;
-    for (family, table) in plan_route_keys(previous) {
-        if next_routes.contains(&(family, table)) {
-            continue;
-        }
-        let routes = match family {
-            IpFamily::V4 => &captured.ipv4_routes,
-            IpFamily::V6 => &captured.ipv6_routes,
-        };
-        if !route_table_present(routes, table)? {
-            continue;
-        }
-        let command = ip_command(
+    let present = match step {
+        RoutingStep::DeleteRoute {
             family,
-            [
-                "route".to_owned(),
-                "flush".to_owned(),
-                "table".to_owned(),
-                table.to_string(),
-            ],
-        );
-        run_required(executor, &command, "flush previous RouteLane routing table")?;
+            table,
+            route,
+        } => live_family_ownership(executor, *family)?
+            .routes
+            .contains(&route_ownership(*family, *table, route)),
+        RoutingStep::DeleteRule {
+            family,
+            priority,
+            table,
+            mark,
+        } => live_family_ownership(executor, *family)?
+            .rules
+            .contains(&rule_ownership(*family, *priority, *table, *mark)),
+        RoutingStep::FlushTable { family, table } => {
+            let command = ip_command(*family, ["-j", "-N", "route", "show", "table", "all"]);
+            let routes = run_required(executor, &command, "inspect RouteLane routing table")?;
+            route_table_present(&routes, *table)?
+        }
+        RoutingStep::ReplaceRoute { .. } | RoutingStep::AddRule { .. } => true,
+    };
+    if present {
+        run_required(executor, &step.command(), context)?;
     }
     Ok(())
 }
 
-fn plan_route_keys(plan: &KernelPlan) -> Vec<(IpFamily, u32)> {
-    let mut keys = Vec::new();
-    for lane in plan
-        .lanes
-        .iter()
-        .filter(|lane| lane.availability == super::LaneAvailability::Available)
-    {
-        let ipv4 = (IpFamily::V4, lane.table);
-        if lane.route_v4.is_some() && !keys.contains(&ipv4) {
-            keys.push(ipv4);
-        }
-        let ipv6 = (IpFamily::V6, lane.table);
-        if lane.route_v6.is_some() && !keys.contains(&ipv6) {
-            keys.push(ipv6);
-        }
-    }
-    keys
+fn live_family_ownership(
+    executor: &mut impl CommandExecutor,
+    family: IpFamily,
+) -> Result<RoutingOwnership, RunnerError> {
+    let routes = run_required(
+        executor,
+        &ip_command(family, ["-j", "-N", "route", "show", "table", "all"]),
+        "inspect RouteLane routes",
+    )?;
+    let rules = run_required(
+        executor,
+        &ip_command(family, ["-j", "-N", "rule", "show"]),
+        "inspect RouteLane policy rules",
+    )?;
+    let mut ownership = RoutingOwnership::default();
+    let number = family_number(family);
+    collect_live_routes(&routes, number, &mut ownership)
+        .and_then(|()| collect_live_rules(&rules, number, &mut ownership))
+        .map_err(|error| RunnerError::new(error.to_string()))?;
+    Ok(ownership)
 }
 
 fn remove_plan_policy_rules(
     executor: &mut impl CommandExecutor,
     plans: &[KernelPlan],
 ) -> Result<(), RunnerError> {
-    let mut rules = Vec::new();
-    for plan in plans {
-        for lane in plan
-            .lanes
-            .iter()
-            .filter(|lane| lane.availability == super::LaneAvailability::Available)
-        {
-            if lane.route_v4.is_some() {
-                let rule = (IpFamily::V4, lane.rule_priority, lane.table, lane.mark);
-                if !rules.contains(&rule) {
-                    rules.push(rule);
-                }
-            }
-            if lane.route_v6.is_some() {
-                let rule = (IpFamily::V6, lane.rule_priority, lane.table, lane.mark);
-                if !rules.contains(&rule) {
-                    rules.push(rule);
-                }
-            }
-        }
-    }
-
-    for (family, priority, table, mark) in rules {
-        for _ in 0..3 {
-            let lane = super::LanePlan {
-                identity: None,
-                source_v4: vec![],
-                source_v6: vec![],
-                id: LaneId::from("rollback"),
-                interface: "lo".to_owned(),
-                route_v4: None,
-                route_v6: None,
-                availability: super::LaneAvailability::Available,
-                table,
-                mark,
-                rule_priority: priority,
-                failure_policy: crate::domain::LaneFailurePolicy::Inactive,
-            };
-            if !live_rule_present(executor, family, &lane)? {
-                break;
-            }
-            delete_one_rule_if_present(executor, family, &lane)?;
-        }
-        let lane = super::LanePlan {
-            identity: None,
-            source_v4: vec![],
-            source_v6: vec![],
-            id: LaneId::from("rollback"),
-            interface: "lo".to_owned(),
-            route_v4: None,
-            route_v6: None,
-            availability: super::LaneAvailability::Available,
+    for step in rollback_rule_order(plans) {
+        let RoutingStep::DeleteRule {
+            family,
+            priority,
             table,
             mark,
-            rule_priority: priority,
-            failure_policy: crate::domain::LaneFailurePolicy::Inactive,
+        } = step
+        else {
+            unreachable!("rollback rule order yields rule removals");
         };
-        if live_rule_present(executor, family, &lane)? {
+        let rule = rule_ownership(family, priority, table, mark);
+        for _ in 0..3 {
+            if !live_family_ownership(executor, family)?
+                .rules
+                .contains(&rule)
+            {
+                break;
+            }
+            run_required(
+                executor,
+                &step.command(),
+                "remove RouteLane policy rule during rollback",
+            )?;
+        }
+        if live_family_ownership(executor, family)?
+            .rules
+            .contains(&rule)
+        {
             return Err(RunnerError::new(
                 "too many duplicate RouteLane policy rules during rollback",
             ));
         }
-    }
-    Ok(())
-}
-
-fn flush_plan_route_tables(
-    executor: &mut impl CommandExecutor,
-    plans: &[KernelPlan],
-) -> Result<(), RunnerError> {
-    let mut keys = Vec::new();
-    for key in plans.iter().flat_map(plan_route_keys) {
-        if !keys.contains(&key) {
-            keys.push(key);
-        }
-    }
-    let captured = capture_snapshot(executor)?;
-    for (family, table) in keys {
-        let routes = match family {
-            IpFamily::V4 => &captured.ipv4_routes,
-            IpFamily::V6 => &captured.ipv6_routes,
-        };
-        if !route_table_present(routes, table)? {
-            continue;
-        }
-        let command = ip_command(
-            family,
-            [
-                "route".to_owned(),
-                "flush".to_owned(),
-                "table".to_owned(),
-                table.to_string(),
-            ],
-        );
-        run_required(executor, &command, "flush RouteLane table during rollback")?;
     }
     Ok(())
 }
@@ -3768,14 +4073,15 @@ mod tests {
         render_owned_ruleset, render_transaction_ruleset, run_nft_batch, validate_privileged_plan,
         validate_root_owned_file_attributes, AppliedStateStore, ApplyResponse, AuthorizationError,
         Authorizer, CleanupResponse, CommandExecutor, CommandInvocation, CommandOutput,
-        CommandPrivilegedBackend, InspectResponse, OrphanRecoveryResponse, PrivilegedBackend,
-        PrivilegedError, PrivilegedService, RestoreReceipt, RestoreResponse, ServiceError,
-        StoredAppliedState, ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES, NFT_BINARY,
+        CommandPrivilegedBackend, InspectResponse, InterfaceSettingReceipt, OrphanRecoveryResponse,
+        PrivilegedBackend, PrivilegedError, PrivilegedService, RestoreReceipt, RestoreResponse,
+        ServiceError, StoredAppliedState, ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES,
+        NFT_BINARY,
     };
     use crate::backend::{
         CommandSpec, CompiledAction, CompiledRule, CompiledTarget, IpFamily, KernelPlan,
         LaneAvailability, LanePlan, Program, ResourceState, RouteMode, TableMode, MARK_BASE,
-        RULE_PRIORITY_BASE, TABLE_BASE,
+        RULE_PRIORITY_BASE, TABLE_BASE, TERMINAL_ROUTE_METRIC,
     };
 
     fn fixture_lane(id: &str, offset: u32) -> LanePlan {
@@ -3908,6 +4214,86 @@ mod tests {
             .unwrap();
         expression["expr"] = serde_json::json!([{"accept":null}]);
         assert!(super::validate_orphan_nft_document(&changed).is_err());
+    }
+
+    #[test]
+    fn new_nft_chains_are_verified_not_just_table_markers() {
+        let expected = super::expected_nft_document(Some(&fixture_valid_plan()), None, false);
+        let mut changed = expected.clone();
+        let hook = changed["nftables"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .filter_map(|o| o.get_mut("chain"))
+            .find(|c| c["name"] == "prerouting")
+            .unwrap();
+        hook["prio"] = serde_json::json!(-100);
+        assert_ne!(
+            nft_document_fingerprint(&expected).unwrap(),
+            nft_document_fingerprint(&changed).unwrap()
+        );
+        assert!(super::validate_orphan_nft_document(&changed).is_err());
+    }
+
+    #[test]
+    fn live_ifindex_dump_is_bound_to_observed_device_not_old_name_assumptions() {
+        use std::collections::BTreeMap;
+        let identity = crate::backend::InterfaceIdentity {
+            ifindex: 2,
+            name: "eth0".into(),
+            kind: "ether".into(),
+            hardware_address: None,
+        };
+        let mut by_name = serde_json::json!({"nftables":[{"rule":{"expr":[
+            {"match":{"left":{"meta":{"key":"oif"}},"op":"==","right":"eth0"}}
+        ]}}]});
+        let expected = serde_json::json!({"nftables":[{"rule":{"expr":[
+            {"match":{"left":{"meta":{"key":"oif"}},"op":"==","right":2}}
+        ]}}]});
+        super::super::nft_document::resolve_dump_ifindices(
+            &mut by_name,
+            &BTreeMap::from([("eth0".into(), identity.clone())]),
+        )
+        .unwrap();
+        assert_eq!(by_name, expected);
+        let mut removed = serde_json::json!({"nftables":[{"rule":{"expr":[
+            {"match":{"left":{"meta":{"key":"oif"}},"op":"==","right":"2"}}
+        ]}}]});
+        super::super::nft_document::resolve_dump_ifindices(&mut removed, &BTreeMap::new()).unwrap();
+        assert_eq!(removed, expected);
+        let mut replacement = identity;
+        replacement.ifindex = 9;
+        let mut changed = serde_json::json!({"nftables":[{"rule":{"expr":[
+            {"match":{"left":{"meta":{"key":"oif"}},"op":"==","right":"eth0"}}
+        ]}}]});
+        super::super::nft_document::resolve_dump_ifindices(
+            &mut changed,
+            &BTreeMap::from([("eth0".into(), replacement)]),
+        )
+        .unwrap();
+        assert_ne!(
+            changed, expected,
+            "a current name must resolve to its current index, never an old assumed binding"
+        );
+    }
+
+    #[test]
+    fn numeric_only_interface_names_cannot_fake_local_iif_zero_in_json_proof() {
+        use std::collections::BTreeMap;
+        let identity = crate::backend::InterfaceIdentity {
+            ifindex: 9,
+            name: "0".into(),
+            kind: "dummy".into(),
+            hardware_address: None,
+        };
+        let mut document = serde_json::json!({"nftables":[{"rule":{"expr":[
+            {"match":{"left":{"meta":{"key":"iif"}},"op":"==","right":"0"}}
+        ]}}]});
+        assert!(super::super::nft_document::resolve_dump_ifindices(
+            &mut document,
+            &BTreeMap::from([("0".into(), identity)])
+        )
+        .is_err());
     }
 
     #[test]
@@ -4303,6 +4689,83 @@ mod tests {
         fail_route_flush: bool,
         tamper_json_result: bool,
         foreign_reserved_route: bool,
+        /// Everything beyond the legacy IPv4 table-20000 unicast/rule flags.
+        extra_routes: Vec<(IpFamily, serde_json::Value)>,
+        extra_rules: Vec<(IpFamily, serde_json::Value)>,
+    }
+
+    fn fake_flag_route(spec: &CommandSpec) -> bool {
+        spec.family == Some(IpFamily::V4)
+            && spec.args.windows(2).any(|pair| pair == ["table", "20000"])
+            && !spec.args.iter().any(|argument| argument == "unreachable")
+    }
+
+    fn fake_route_json(spec: &CommandSpec) -> serde_json::Value {
+        let value_after = |key: &str| {
+            spec.args
+                .windows(2)
+                .find(|pair| pair[0] == key)
+                .map(|pair| pair[1].clone())
+        };
+        let table: u32 = value_after("table").unwrap().parse().unwrap();
+        let v6 = spec.family == Some(IpFamily::V6);
+        if spec.args.iter().any(|argument| argument == "unreachable") {
+            let mut route = serde_json::json!({
+                "type": "7",
+                "dst": "default",
+                "table": table,
+                "metric": value_after("metric").unwrap().parse::<u32>().unwrap(),
+                "flags": [],
+            });
+            if v6 {
+                route["dev"] = serde_json::json!("lo");
+                route["pref"] = serde_json::json!("medium");
+            }
+            return route;
+        }
+        let mut route = serde_json::json!({
+            "dst": "default",
+            "dev": value_after("dev").unwrap(),
+            "table": table,
+            "flags": [],
+        });
+        match value_after("via") {
+            Some(gateway) => route["gateway"] = serde_json::json!(gateway),
+            None => route["scope"] = serde_json::json!("link"),
+        }
+        if v6 {
+            route["metric"] = serde_json::json!(1024);
+            route["pref"] = serde_json::json!("medium");
+        }
+        route
+    }
+
+    fn fake_same_route(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+        left["table"] == right["table"] && left.get("type") == right.get("type")
+    }
+
+    fn fake_rule_json(spec: &CommandSpec) -> serde_json::Value {
+        let value_after = |key: &str| {
+            spec.args
+                .windows(2)
+                .find(|pair| pair[0] == key)
+                .map(|pair| pair[1].clone())
+                .unwrap()
+        };
+        serde_json::json!({
+            "priority": value_after("priority").parse::<u32>().unwrap(),
+            "src": "all",
+            "fwmark": value_after("fwmark"),
+            "table": value_after("lookup").parse::<u32>().unwrap(),
+        })
+    }
+
+    fn fake_flag_rule(spec: &CommandSpec) -> bool {
+        spec.family == Some(IpFamily::V4)
+            && spec
+                .args
+                .windows(2)
+                .any(|pair| pair == ["priority", "10000"])
     }
 
     #[derive(Clone)]
@@ -4353,43 +4816,103 @@ mod tests {
                                 "flags": [],
                             }));
                         }
+                        body.extend(
+                            state
+                                .extra_routes
+                                .iter()
+                                .filter(|(family, _)| Some(*family) == spec.family)
+                                .map(|(_, route)| route.clone()),
+                        );
                         Ok(CommandOutput::success(serde_json::to_vec(&body).unwrap()))
                     }
                     [json, numeric, "rule", "show"] if *json == "-j" && *numeric == "-N" => {
-                        let body = if state.has_rule && spec.family == Some(IpFamily::V4) {
-                            serde_json::json!([{
+                        let mut body = if state.has_rule && spec.family == Some(IpFamily::V4) {
+                            vec![serde_json::json!({
                                 "priority": 10_000,
                                 "src": "all",
                                 "fwmark": "0x524c0001",
                                 "table": 20_000,
-                            }])
+                            })]
                         } else {
-                            serde_json::json!([])
+                            vec![]
                         };
+                        body.extend(
+                            state
+                                .extra_rules
+                                .iter()
+                                .filter(|(family, _)| Some(*family) == spec.family)
+                                .map(|(_, rule)| rule.clone()),
+                        );
                         Ok(CommandOutput::success(serde_json::to_vec(&body).unwrap()))
                     }
-                    ["route", "replace", ..] => {
+                    ["route", "replace", ..] if fake_flag_route(spec) => {
                         state.has_route = true;
                         state.gatewayless_route =
                             !spec.args.iter().any(|argument| argument == "via");
                         Ok(CommandOutput::success(vec![]))
                     }
-                    ["rule", "add", ..] => {
+                    ["route", "replace", ..] => {
+                        let family = spec.family.unwrap();
+                        let route = fake_route_json(spec);
+                        state.extra_routes.retain(|(existing_family, existing)| {
+                            *existing_family != family || !fake_same_route(existing, &route)
+                        });
+                        state.extra_routes.push((family, route));
+                        Ok(CommandOutput::success(vec![]))
+                    }
+                    ["route", "del", ..] if fake_flag_route(spec) => {
+                        state.has_route = false;
+                        state.gatewayless_route = false;
+                        Ok(CommandOutput::success(vec![]))
+                    }
+                    ["route", "del", ..] => {
+                        let family = spec.family.unwrap();
+                        let route = fake_route_json(spec);
+                        state.extra_routes.retain(|(existing_family, existing)| {
+                            *existing_family != family || !fake_same_route(existing, &route)
+                        });
+                        Ok(CommandOutput::success(vec![]))
+                    }
+                    ["rule", "add", ..] if fake_flag_rule(spec) => {
                         state.has_rule = true;
                         Ok(CommandOutput::success(vec![]))
                     }
-                    ["rule", "del", ..] => {
+                    ["rule", "add", ..] => {
+                        let rule = fake_rule_json(spec);
+                        state.extra_rules.push((spec.family.unwrap(), rule));
+                        Ok(CommandOutput::success(vec![]))
+                    }
+                    ["rule", "del", ..] if fake_flag_rule(spec) => {
                         state.has_rule = false;
                         Ok(CommandOutput::success(vec![]))
                     }
-                    ["route", "flush", ..] => {
+                    ["rule", "del", ..] => {
+                        let family = spec.family.unwrap();
+                        let rule = fake_rule_json(spec);
+                        if let Some(index) = state
+                            .extra_rules
+                            .iter()
+                            .position(|existing| existing == &(family, rule.clone()))
+                        {
+                            state.extra_rules.remove(index);
+                        }
+                        Ok(CommandOutput::success(vec![]))
+                    }
+                    ["route", "flush", "table", table] => {
                         if state.fail_route_flush {
                             return Ok(CommandOutput::failure(
                                 "injected route-table flush failure",
                             ));
                         }
-                        state.has_route = false;
-                        state.gatewayless_route = false;
+                        let table: u32 = table.parse().unwrap();
+                        let family = spec.family.unwrap();
+                        if family == IpFamily::V4 && table == 20_000 {
+                            state.has_route = false;
+                            state.gatewayless_route = false;
+                        }
+                        state.extra_routes.retain(|(existing_family, route)| {
+                            *existing_family != family || route["table"] != table
+                        });
                         Ok(CommandOutput::success(vec![]))
                     }
                     _ => Err(crate::backend::RunnerError::new(format!(
@@ -5078,6 +5601,7 @@ mod tests {
                 cleanup_pending: false,
                 restore_receipt: Some(RestoreReceipt::new(&failed_candidate, Some(&previous))),
                 orphan_cleanup: None,
+                ..StoredAppliedState::default()
             });
         }
         let mut restarted = CommandPrivilegedBackend::with_store(
@@ -5130,6 +5654,7 @@ mod tests {
                 cleanup_pending: true,
                 restore_receipt: Some(RestoreReceipt::new(&failed_candidate, None)),
                 orphan_cleanup: None,
+                ..StoredAppliedState::default()
             });
         }
         let mut restarted = CommandPrivilegedBackend::with_store(
@@ -5185,6 +5710,7 @@ mod tests {
                 cleanup_pending: false,
                 restore_receipt: Some(RestoreReceipt::new(&different_candidate, Some(&previous))),
                 orphan_cleanup: None,
+                ..StoredAppliedState::default()
             });
         }
         let journal_before = store.state.lock().unwrap().clone();
@@ -5448,6 +5974,87 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_mark_has_terminal_route() {
+        let state = Arc::new(Mutex::new(FakeKernelState::default()));
+        let mut backend = CommandPrivilegedBackend::new(FakeCommandExecutor {
+            state: Arc::clone(&state),
+        });
+        let mut plan = fixture_two_lane_plan();
+        plan.lanes[1].availability = LaneAvailability::Unavailable;
+        backend.apply(&plan).unwrap();
+
+        {
+            let kernel = state.lock().unwrap();
+            assert!(kernel.has_route && kernel.has_rule);
+            for table in [20_000, 20_001] {
+                for family in [IpFamily::V4, IpFamily::V6] {
+                    assert!(
+                        kernel.extra_routes.iter().any(|(f, route)| *f == family
+                            && route["table"] == table
+                            && route["type"] == "7"
+                            && route["metric"] == TERMINAL_ROUTE_METRIC),
+                        "table {table} {family:?} must fail closed"
+                    );
+                }
+                assert!(kernel
+                    .extra_rules
+                    .iter()
+                    .any(|(f, rule)| *f == IpFamily::V6 && rule["table"] == table));
+            }
+            assert!(
+                kernel
+                    .extra_rules
+                    .iter()
+                    .any(|(f, rule)| *f == IpFamily::V4 && rule["table"] == 20_001),
+                "an unavailable lane's mark still resolves to its terminal table"
+            );
+            assert!(
+                !kernel
+                    .extra_routes
+                    .iter()
+                    .any(|(_, route)| route.get("dev").is_some_and(|dev| dev == "wg1")),
+                "an unavailable lane never receives a unicast exit"
+            );
+        }
+
+        backend.cleanup().unwrap();
+        let kernel = state.lock().unwrap();
+        assert!(!kernel.has_route && !kernel.has_rule && !kernel.has_table);
+        assert!(kernel.extra_routes.is_empty() && kernel.extra_rules.is_empty());
+    }
+
+    #[test]
+    fn terminal_route_with_foreign_metric_is_not_owned() {
+        let mut ownership = super::RoutingOwnership::default();
+        let foreign = serde_json::json!([{
+            "type": "unreachable",
+            "dst": "default",
+            "table": 20_000,
+            "metric": 4_294_967_295u32,
+            "flags": [],
+        }]);
+        let error =
+            super::collect_live_routes(&serde_json::to_vec(&foreign).unwrap(), 4, &mut ownership)
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("terminal route has foreign semantics"));
+
+        let owned = serde_json::json!([{
+            "type": "7",
+            "dst": "default",
+            "dev": "lo",
+            "table": "20000",
+            "metric": TERMINAL_ROUTE_METRIC,
+            "flags": [],
+            "pref": "medium",
+        }]);
+        super::collect_live_routes(&serde_json::to_vec(&owned).unwrap(), 6, &mut ownership)
+            .unwrap();
+        assert!(ownership.routes.iter().all(|route| route.terminal));
+    }
+
+    #[test]
     fn higher_generation_reuses_identical_policy_rule_without_deleting_it() {
         let state = Arc::new(Mutex::new(FakeKernelState::default()));
         let executor = FakeCommandExecutor {
@@ -5455,7 +6062,20 @@ mod tests {
         };
         let mut backend = CommandPrivilegedBackend::new(executor);
         let first = fixture_valid_plan();
+        let rule_adds = |state: &FakeKernelState| {
+            state
+                .commands
+                .iter()
+                .filter(|command| {
+                    command
+                        .args
+                        .starts_with(&["rule".to_owned(), "add".to_owned()])
+                })
+                .count()
+        };
         backend.apply(&first).unwrap();
+        // One rule per lane×family: the IPv6 rule guards the terminal route.
+        assert_eq!(rule_adds(&state.lock().unwrap()), 2);
         let mut second = first.clone();
         second.generation = 2;
 
@@ -5464,15 +6084,13 @@ mod tests {
 
         assert!(state.has_rule);
         assert_eq!(
-            state
-                .commands
-                .iter()
-                .filter(|command| command
-                    .args
-                    .starts_with(&["rule".to_owned(), "add".to_owned()]))
-                .count(),
-            1
+            rule_adds(&state),
+            2,
+            "identical rules are reused, not re-added"
         );
+        assert!(!state.commands.iter().any(|command| command
+            .args
+            .starts_with(&["rule".to_owned(), "del".to_owned()])));
     }
 
     #[test]
@@ -5532,9 +6150,12 @@ mod tests {
     fn pending_expectations_include_exact_rollback_command_prefixes() {
         let pending = fixture_two_lane_plan();
         let mut rollback_prefix = super::plan_routing_ownership(&pending);
-        rollback_prefix
-            .rules
-            .remove(&super::lane_rule_ownership(&pending.lanes[0], IpFamily::V4));
+        rollback_prefix.rules.remove(&super::rule_ownership(
+            IpFamily::V4,
+            pending.lanes[0].rule_priority,
+            pending.lanes[0].table,
+            pending.lanes[0].mark,
+        ));
 
         assert!(super::routing_state_reachable_for_phase(
             &rollback_prefix,
@@ -5551,39 +6172,39 @@ mod tests {
         let mut pending = fixture_valid_plan();
         pending.generation = 2;
         pending.lanes = vec![fixture_lane("work", 1)];
+        let unicast = |table, gateway: &str, interface: &str| super::RouteOwnership {
+            family: 4,
+            table,
+            gateway: Some(gateway.to_owned()),
+            interface: interface.to_owned(),
+            terminal: false,
+        };
+        let terminal = |family, table| super::RouteOwnership {
+            family,
+            table,
+            gateway: None,
+            interface: String::new(),
+            terminal: true,
+        };
+        let rule = |family, offset: u32| super::RuleOwnership {
+            family,
+            priority: 10_000 + offset,
+            table: 20_000 + offset,
+            mark: 0x524c0001 + offset,
+        };
+        // The old IPv4 rule is already gone; its IPv6 rule and table remain.
         let live = super::RoutingOwnership {
             routes: [
-                super::RouteOwnership {
-                    family: 4,
-                    table: 20_000,
-                    gateway: Some("10.0.0.1".to_owned()),
-                    interface: "wg0".to_owned(),
-                },
-                super::RouteOwnership {
-                    family: 4,
-                    table: 20_001,
-                    gateway: Some("10.0.1.1".to_owned()),
-                    interface: "wg1".to_owned(),
-                },
+                unicast(20_000, "10.0.0.1", "wg0"),
+                terminal(4, 20_000),
+                terminal(6, 20_000),
+                unicast(20_001, "10.0.1.1", "wg1"),
+                terminal(4, 20_001),
+                terminal(6, 20_001),
             ]
             .into_iter()
             .collect(),
-            rules: [
-                super::RuleOwnership {
-                    family: 4,
-                    priority: 10_000,
-                    table: 20_000,
-                    mark: 0x524c0001,
-                },
-                super::RuleOwnership {
-                    family: 4,
-                    priority: 10_001,
-                    table: 20_001,
-                    mark: 0x524c0002,
-                },
-            ]
-            .into_iter()
-            .collect(),
+            rules: [rule(6, 0), rule(4, 1), rule(6, 1)].into_iter().collect(),
         };
 
         assert!(super::routing_state_reachable_for_phase(
@@ -5619,6 +6240,7 @@ mod tests {
             cleanup_pending: false,
             restore_receipt: None,
             orphan_cleanup: None,
+            ..StoredAppliedState::default()
         };
         assert!(
             serde_json::to_vec(&journal).unwrap().len() < super::MAX_STATE_BYTES as usize,
@@ -5626,9 +6248,12 @@ mod tests {
         );
 
         let mut rollback_prefix = super::plan_routing_ownership(&pending);
-        rollback_prefix
-            .rules
-            .remove(&super::lane_rule_ownership(&pending.lanes[0], IpFamily::V4));
+        rollback_prefix.rules.remove(&super::rule_ownership(
+            IpFamily::V4,
+            pending.lanes[0].rule_priority,
+            pending.lanes[0].table,
+            pending.lanes[0].mark,
+        ));
         assert!(super::routing_state_reachable_for_phase(
             &rollback_prefix,
             None,
@@ -5641,6 +6266,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeAppliedStateStore {
         state: Arc<Mutex<Option<StoredAppliedState>>>,
+        fail_commit_generation: Arc<Mutex<Option<u64>>>,
+        fail_setting_journal: Arc<Mutex<bool>>,
     }
 
     impl AppliedStateStore for FakeAppliedStateStore {
@@ -5649,6 +6276,26 @@ mod tests {
         }
 
         fn save(&mut self, state: &StoredAppliedState) -> Result<(), PrivilegedError> {
+            if !state.pending_interface_settings.is_empty()
+                && *self.fail_setting_journal.lock().unwrap()
+            {
+                return Err(PrivilegedError::new(
+                    "injected setting journal fsync failure",
+                ));
+            }
+            let mut failure = self.fail_commit_generation.lock().unwrap();
+            if failure.is_some()
+                && state.pending.is_none()
+                && state
+                    .active
+                    .as_ref()
+                    .is_some_and(|plan| Some(plan.generation) == *failure)
+            {
+                *failure = None;
+                return Err(PrivilegedError::new(
+                    "injected committed journal fsync failure",
+                ));
+            }
             *self.state.lock().unwrap() = Some(state.clone());
             Ok(())
         }
@@ -5657,6 +6304,35 @@ mod tests {
             *self.state.lock().unwrap() = None;
             Ok(())
         }
+    }
+
+    #[test]
+    fn pending_commit_failure_restores_exact_previous_state() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        let previous = fixture_valid_plan();
+        backend.apply(&previous).unwrap();
+        let journal_before = store.state.lock().unwrap().clone();
+        let nft_before = super::live_nft_fingerprint(&mut backend.executor).unwrap();
+        let mut candidate = previous.clone();
+        candidate.generation = 2;
+        candidate.rules[0].target = CompiledTarget::Network("198.51.100.0/24".parse().unwrap());
+        *store.fail_commit_generation.lock().unwrap() = Some(2);
+        let error = backend.apply(&candidate).unwrap_err();
+        assert!(error.to_string().contains("state commit failed"));
+        assert!(error.to_string().contains("rollback: ok"));
+        assert_eq!(*store.state.lock().unwrap(), journal_before);
+        assert_eq!(
+            super::live_nft_fingerprint(&mut backend.executor).unwrap(),
+            nft_before
+        );
+        assert_eq!(backend.inspect().unwrap().applied_plan, Some(previous));
     }
 
     fn mutation_count(state: &FakeKernelState) -> usize {
@@ -5792,6 +6468,7 @@ mod tests {
                 cleanup_pending: false,
                 restore_receipt: None,
                 orphan_cleanup: None,
+                ..StoredAppliedState::default()
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -5854,6 +6531,7 @@ mod tests {
                 cleanup_pending: false,
                 restore_receipt: None,
                 orphan_cleanup: None,
+                ..StoredAppliedState::default()
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -5922,6 +6600,7 @@ mod tests {
                     cleanup_pending: false,
                     restore_receipt: None,
                     orphan_cleanup: None,
+                    ..StoredAppliedState::default()
                 });
             }
             let mut crash_executor = FakeCommandExecutor {
@@ -5987,6 +6666,7 @@ mod tests {
                 cleanup_pending: false,
                 restore_receipt: None,
                 orphan_cleanup: None,
+                ..StoredAppliedState::default()
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -6044,6 +6724,7 @@ mod tests {
                 cleanup_pending: false,
                 restore_receipt: None,
                 orphan_cleanup: None,
+                ..StoredAppliedState::default()
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -6104,6 +6785,7 @@ mod tests {
                 cleanup_pending: false,
                 restore_receipt: None,
                 orphan_cleanup: None,
+                ..StoredAppliedState::default()
             });
         }
         let mut crash_executor = FakeCommandExecutor {
@@ -6297,6 +6979,7 @@ mod tests {
             cleanup_pending: false,
             restore_receipt: None,
             orphan_cleanup: None,
+            ..StoredAppliedState::default()
         });
         let mut backend = CommandPrivilegedBackend::with_store(
             FakeCommandExecutor {
@@ -6654,5 +7337,332 @@ mod tests {
             *allowed_events.lock().unwrap(),
             vec!["inspect", "authorize", "cleanup", "authorize", "restore"]
         );
+    }
+
+    #[derive(Default)]
+    struct FakeRpfState {
+        identity: Option<crate::backend::InterfaceIdentity>,
+        src_valid_mark: u8,
+        writes: Vec<u8>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeRpf(Arc<Mutex<FakeRpfState>>);
+
+    impl FakeRpf {
+        fn strict(identity: &crate::backend::InterfaceIdentity) -> Self {
+            Self(Arc::new(Mutex::new(FakeRpfState {
+                identity: Some(identity.clone()),
+                ..FakeRpfState::default()
+            })))
+        }
+        fn value(&self) -> u8 {
+            self.0.lock().unwrap().src_valid_mark
+        }
+        fn writes(&self) -> Vec<u8> {
+            self.0.lock().unwrap().writes.clone()
+        }
+    }
+
+    impl super::MarkAwareRpfBackend for FakeRpf {
+        fn identity(
+            &mut self,
+            name: &str,
+        ) -> Result<crate::backend::InterfaceIdentity, PrivilegedError> {
+            self.0
+                .lock()
+                .unwrap()
+                .identity
+                .clone()
+                .filter(|identity| identity.name == name)
+                .ok_or_else(|| PrivilegedError::new("interface no longer exists"))
+        }
+        fn rp_filter(&mut self, _: &str) -> Result<u8, PrivilegedError> {
+            Ok(1)
+        }
+        fn src_valid_mark(&mut self, name: &str) -> Result<u8, PrivilegedError> {
+            Ok(if name == "all" {
+                0
+            } else {
+                self.0.lock().unwrap().src_valid_mark
+            })
+        }
+        fn set_src_valid_mark(
+            &mut self,
+            identity: &crate::backend::InterfaceIdentity,
+            value: u8,
+        ) -> Result<(), PrivilegedError> {
+            assert_eq!(identity.name, "wg0", "only the lane interface may change");
+            let mut state = self.0.lock().unwrap();
+            state.src_valid_mark = value;
+            state.writes.push(value);
+            Ok(())
+        }
+    }
+
+    fn lane_identity() -> crate::backend::InterfaceIdentity {
+        crate::backend::InterfaceIdentity {
+            ifindex: 7,
+            name: "wg0".to_owned(),
+            kind: "wireguard".to_owned(),
+            hardware_address: None,
+        }
+    }
+
+    fn identified_plan() -> KernelPlan {
+        let mut plan = fixture_valid_plan();
+        plan.lanes[0].identity = Some(lane_identity());
+        plan
+    }
+
+    fn rpf_backend(
+        kernel: &Arc<Mutex<FakeKernelState>>,
+        store: &FakeAppliedStateStore,
+        rpf: &FakeRpf,
+    ) -> CommandPrivilegedBackend<FakeCommandExecutor, FakeAppliedStateStore> {
+        CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(kernel),
+            },
+            store.clone(),
+        )
+        .with_interface_settings(rpf.clone())
+    }
+
+    #[test]
+    fn interface_setting_receipt_is_committed_then_restored_by_cleanup() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let rpf = FakeRpf::strict(&lane_identity());
+        let mut backend = rpf_backend(&kernel, &store, &rpf);
+
+        backend.apply(&identified_plan()).unwrap();
+        assert_eq!(rpf.value(), 1);
+        let journal = store.state.lock().unwrap().clone().unwrap();
+        assert_eq!(journal.interface_settings.len(), 1);
+        assert_eq!(journal.interface_settings[0].identity, lane_identity());
+        assert!(journal.pending_interface_settings.is_empty());
+
+        let mut second = identified_plan();
+        second.generation = 2;
+        backend.apply(&second).unwrap();
+        assert_eq!(rpf.writes(), vec![1], "an owned setting is not rewritten");
+
+        backend.cleanup().unwrap();
+        assert_eq!(rpf.value(), 0);
+        assert_eq!(rpf.writes(), vec![1, 0]);
+        assert!(store.state.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn cleanup_reports_replaced_interface_without_writing_its_setting() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let rpf = FakeRpf::strict(&lane_identity());
+        let mut backend = rpf_backend(&kernel, &store, &rpf);
+        backend.apply(&identified_plan()).unwrap();
+        // Another device now carries the name; its value is not ours to restore.
+        rpf.0.lock().unwrap().identity.as_mut().unwrap().ifindex = 9;
+
+        let cleaned = backend.cleanup().unwrap();
+        assert!(cleaned.cleaned);
+        assert!(cleaned
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("wg0 src_valid_mark left unchanged")));
+        assert_eq!(rpf.writes(), vec![1]);
+        assert_eq!(rpf.value(), 1);
+        assert!(store.state.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_activation_restores_journaled_interface_setting() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState {
+            fail_activation: true,
+            ..FakeKernelState::default()
+        }));
+        let store = FakeAppliedStateStore::default();
+        let rpf = FakeRpf::strict(&lane_identity());
+        let mut backend = rpf_backend(&kernel, &store, &rpf);
+
+        assert!(backend.apply(&identified_plan()).is_err());
+        assert_eq!(rpf.value(), 0);
+        assert_eq!(rpf.writes(), vec![1, 0]);
+        assert!(store
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|journal| journal.interface_settings.is_empty()
+                && journal.pending_interface_settings.is_empty()));
+    }
+
+    #[test]
+    fn setting_journal_failure_means_zero_setting_writes() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        *store.fail_setting_journal.lock().unwrap() = true;
+        let rpf = FakeRpf::strict(&lane_identity());
+        let mut backend = rpf_backend(&kernel, &store, &rpf);
+
+        let error = backend.apply(&identified_plan()).unwrap_err();
+        assert!(error.to_string().contains("setting journal"));
+        assert_eq!(rpf.writes(), Vec::<u8>::new());
+        let kernel = kernel.lock().unwrap();
+        assert!(!kernel.has_table && !kernel.has_route && !kernel.has_rule);
+    }
+
+    #[test]
+    fn commit_failure_restores_interface_setting_and_previous_state() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let rpf = FakeRpf::strict(&lane_identity());
+        let mut backend = rpf_backend(&kernel, &store, &rpf);
+        let previous = fixture_valid_plan();
+        backend.apply(&previous).unwrap();
+        let journal_before = store.state.lock().unwrap().clone();
+        let mut candidate = identified_plan();
+        candidate.generation = 2;
+        *store.fail_commit_generation.lock().unwrap() = Some(2);
+
+        let error = backend.apply(&candidate).unwrap_err();
+        assert!(error.to_string().contains("state commit failed"));
+        assert_eq!(rpf.value(), 0);
+        assert_eq!(*store.state.lock().unwrap(), journal_before);
+        assert_eq!(backend.inspect().unwrap().applied_plan, Some(previous));
+    }
+
+    #[test]
+    fn interrupted_setting_write_is_restored_by_recovery() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let rpf = FakeRpf::strict(&lane_identity());
+        let plan = identified_plan();
+        let receipt = InterfaceSettingReceipt {
+            identity: lane_identity(),
+            previous: 0,
+            applied: 1,
+        };
+        // Crash after the journaled write, before any kernel mutation.
+        rpf.0.lock().unwrap().src_valid_mark = 1;
+        *store.state.lock().unwrap() = Some(StoredAppliedState {
+            pending_expectations: Some(build_pending_expectations(None, &plan).unwrap()),
+            pending: Some(plan),
+            pending_interface_settings: vec![receipt],
+            ..StoredAppliedState::default()
+        });
+        let mut backend = rpf_backend(&kernel, &store, &rpf);
+
+        backend.cleanup().unwrap();
+        assert_eq!(rpf.value(), 0);
+        assert!(store.state.lock().unwrap().is_none());
+    }
+
+    fn legacy_plan() -> crate::backend::legacy_journal::LegacyPlanV1 {
+        use crate::backend::legacy_journal::{LegacyAvailabilityV1, LegacyLaneV1, LegacyPlanV1};
+        LegacyPlanV1 {
+            generation: 3,
+            profile_id: ProfileId::from("default"),
+            lanes: vec![LegacyLaneV1 {
+                id: LaneId::from("privacy"),
+                interface: "wg0".to_owned(),
+                route_v4: Some(RouteMode::Via("10.0.0.1".parse().unwrap())),
+                route_v6: None,
+                availability: LegacyAvailabilityV1::Available,
+                table: TABLE_BASE,
+                mark: MARK_BASE,
+                rule_priority: RULE_PRIORITY_BASE,
+                failure_policy: LaneFailurePolicy::Inactive,
+            }],
+            rules: vec![],
+        }
+    }
+
+    fn legacy_backend(
+        tamper: bool,
+    ) -> (
+        Arc<Mutex<FakeKernelState>>,
+        FakeAppliedStateStore,
+        CommandPrivilegedBackend<FakeCommandExecutor, FakeAppliedStateStore>,
+    ) {
+        let legacy = legacy_plan();
+        let kernel = Arc::new(Mutex::new(FakeKernelState {
+            has_route: true,
+            has_rule: true,
+            has_table: true,
+            marker: Some(legacy.state_chain_name()),
+            ..FakeKernelState::default()
+        }));
+        let mut executor = FakeCommandExecutor {
+            state: Arc::clone(&kernel),
+        };
+        let document = super::read_nft_table_once(&mut executor).unwrap();
+        let fingerprint = crate::backend::legacy_journal::legacy_nft_fingerprint(&document);
+        kernel.lock().unwrap().output_tampered = tamper;
+        kernel.lock().unwrap().commands.clear();
+        let unversioned = serde_json::json!({
+            "active": legacy,
+            "active_nft_fingerprint": fingerprint,
+            "pending": null,
+            "pending_expectations": null,
+            "cleanup_pending": false,
+            "restore_receipt": null,
+        });
+        let store = FakeAppliedStateStore::default();
+        *store.state.lock().unwrap() =
+            Some(super::decode_journal(&serde_json::to_vec(&unversioned).unwrap()).unwrap());
+        let backend = CommandPrivilegedBackend::with_store(executor, store.clone());
+        (kernel, store, backend)
+    }
+
+    #[test]
+    fn old_journal_can_clean_but_cannot_arm_runtime() {
+        let (kernel, store, mut backend) = legacy_backend(false);
+
+        let error = backend.apply(&fixture_valid_plan()).unwrap_err();
+        assert!(error.to_string().contains("cleanup-only"));
+        assert_eq!(mutation_count(&kernel.lock().unwrap()), 0);
+        let inspection = backend.inspect().unwrap();
+        assert_eq!(inspection.applied_plan, None);
+        assert!(inspection
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("schema-1")));
+        assert!(backend.recover_orphaned().is_err());
+
+        assert!(backend.cleanup().unwrap().cleaned);
+        let kernel = kernel.lock().unwrap();
+        assert!(!kernel.has_route && !kernel.has_rule && !kernel.has_table);
+        assert!(store.state.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn changed_legacy_table_is_not_cleaned() {
+        let (kernel, store, mut backend) = legacy_backend(true);
+        assert!(backend.cleanup().is_err());
+        assert_eq!(mutation_count(&kernel.lock().unwrap()), 0);
+        assert!(store.state.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn journal_versions_are_explicit_and_strict() {
+        let current = serde_json::to_vec(&StoredAppliedState::default()).unwrap();
+        assert!(String::from_utf8_lossy(&current).contains("\"journal_version\":2"));
+        assert_eq!(
+            super::decode_journal(&current).unwrap(),
+            StoredAppliedState::default()
+        );
+        let future =
+            br#"{"journal_version":3,"active":null,"active_nft_fingerprint":null,"pending":null}"#;
+        assert!(super::decode_journal(future).is_err());
+        // An unversioned record carrying current-schema fields is not schema 1.
+        let mut plan = serde_json::to_value(fixture_valid_plan()).unwrap();
+        plan["lanes"][0]["identity"] = serde_json::Value::Null;
+        let mixed = serde_json::json!({
+            "active": plan,
+            "active_nft_fingerprint": "x",
+            "pending": null,
+        });
+        assert!(super::decode_journal(&serde_json::to_vec(&mixed).unwrap()).is_err());
     }
 }

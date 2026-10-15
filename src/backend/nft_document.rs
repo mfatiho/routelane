@@ -10,6 +10,78 @@ use super::{
 
 pub(super) const POLICY_SEAL_PREFIX: &str = "rules_v2_";
 
+fn is_ifindex_match(expression: &Value) -> bool {
+    matches!(
+        expression["match"]["left"]["meta"]["key"].as_str(),
+        Some("iif" | "oif")
+    )
+}
+
+pub(super) fn has_symbolic_ifindices(document: &Value) -> bool {
+    document
+        .get("nftables")
+        .and_then(Value::as_array)
+        .is_some_and(|objects| {
+            objects
+                .iter()
+                .filter_map(|o| o["rule"]["expr"].as_array())
+                .flatten()
+                .any(|expr| is_ifindex_match(expr) && expr["match"]["right"].is_string())
+        })
+}
+
+/// Resolve ONLY ifindex-typed operands, never name predicates or other symbols.
+/// nft 1.0.9 prints these as a name if the index exists, or a decimal string.
+/// Numeric-only device names make that representation ambiguous (including 0).
+pub(super) fn resolve_dump_ifindices(
+    document: &mut Value,
+    identities: &std::collections::BTreeMap<String, super::InterfaceIdentity>,
+) -> Result<(), super::RunnerError> {
+    if identities
+        .keys()
+        .any(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(super::RunnerError::new("numeric-only interface names make exact nft ifindex ownership proof ambiguous; no network resources were adopted"));
+    }
+    let objects = document
+        .get_mut("nftables")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            super::RunnerError::new("invalid nftables document for interface identity proof")
+        })?;
+    for object in objects {
+        let Some(expressions) = object
+            .get_mut("rule")
+            .and_then(|r| r.get_mut("expr"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for expression in expressions {
+            if !is_ifindex_match(expression) {
+                continue;
+            }
+            let operand = &expression["match"]["right"];
+            let index = if let Some(name) = operand.as_str() {
+                if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
+                    name.parse::<u32>().ok()
+                } else {
+                    identities.get(name).map(|i| i.ifindex)
+                }
+            } else {
+                operand.as_u64().and_then(|n| u32::try_from(n).ok())
+            };
+            let index = index.filter(|i| *i <= i32::MAX as u32).ok_or_else(|| {
+                super::RunnerError::new(
+                    "nft ifindex operand cannot be bound to the stable observed interface snapshot",
+                )
+            })?;
+            expression["match"]["right"] = json!(index);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn normalize_nft_document(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -158,7 +230,11 @@ fn destination(n: &IpNet) -> Value {
 }
 fn ready(lane: &LanePlan, f: IpFamily) -> bool {
     lane.availability == LaneAvailability::Available
-        && lane.identity.is_some()
+        && lane.identity.as_ref().is_some_and(|identity| {
+            identity.ifindex > 0
+                && identity.ifindex <= i32::MAX as u32
+                && identity.name == lane.interface
+        })
         && match f {
             IpFamily::V4 => lane.route_v4.is_some() && !lane.source_v4.is_empty(),
             IpFamily::V6 => lane.route_v6.is_some() && !lane.source_v6.is_empty(),
@@ -395,7 +471,7 @@ pub fn render_nft_document(
 
         let mut reply = Chain::base("prerouting", "filter", "prerouting", -150);
         let mut egress = Chain::base("egress_guard", "filter", "postrouting", 99);
-        egress.rule(vec![matches(meta("iif"), "!=", json!("0")), ret()]);
+        egress.rule(vec![matches(meta("iif"), "!=", json!(0)), ret()]);
         controls(&mut egress, &plan.local_networks);
         let mut nat = Chain::base("source_nat", "nat", "postrouting", 100);
         for f in [IpFamily::V4, IpFamily::V6] {
@@ -403,12 +479,12 @@ pub fn render_nft_document(
                 continue;
             };
             for lane in plan.lanes.iter().filter(|l| ready(l, f)) {
-                // meta iif/oif with an interface name resolves a fixed ifindex
-                // at load, unlike iifname/oifname alone. The privileged runtime
-                // boundary must validate that identity against fresh topology.
+                // Use the observed index itself; reloading an older guarded
+                // plan must never resolve a reused name to a new device.
+                let index = lane.identity.as_ref().expect("ready lane identity").ifindex;
                 reply.rule(vec![
                     family(f),
-                    equal(meta("iif"), lane.interface.clone()),
+                    equal(meta("iif"), index),
                     equal(meta("iifname"), lane.interface.clone()),
                     equal(ct("direction"), "reply"),
                     source.clone(),
@@ -418,8 +494,8 @@ pub fn render_nft_document(
                 ]);
                 let scope = vec![
                     family(f),
-                    equal(meta("iif"), "0"),
-                    equal(meta("oif"), lane.interface.clone()),
+                    equal(meta("iif"), 0),
+                    equal(meta("oif"), index),
                     equal(meta("oifname"), lane.interface.clone()),
                     equal(ct("direction"), "original"),
                     source.clone(),

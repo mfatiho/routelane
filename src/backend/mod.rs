@@ -1,5 +1,7 @@
 mod cgroup;
 mod inspect;
+mod interface_settings;
+mod legacy_journal;
 mod nft_document;
 mod nftables;
 mod plan;
@@ -18,6 +20,9 @@ pub use inspect::{
     KernelSnapshot, ResourceConflict, ResourceState, SnapshotCommands, SnapshotInput,
     SnapshotParseError, SnapshotSource,
 };
+pub use interface_settings::{
+    InterfaceSettingReceipt, MarkAwareRpf, MarkAwareRpfBackend, SystemMarkAwareRpfBackend,
+};
 pub use nft_document::render_nft_document;
 pub use nftables::{render_ruleset, NftRenderError, TableMode};
 pub use plan::{
@@ -27,7 +32,8 @@ pub use plan::{
 };
 pub use planner::{compile_profile, compile_profile_with_primary, Capability, PlanError};
 pub use policy_route::{
-    build_policy_commands, build_terminal_policy_commands, CommandSpec, IpFamily, Program,
+    build_policy_commands, install_steps, lane_unicast_route, retire_steps, transition_steps,
+    CommandSpec, IpFamily, OwnedRoute, Program, RoutingStep, TERMINAL_ROUTE_METRIC,
 };
 pub use primary::{FamilyExit, FamilyPair, PrimaryDecision, PrimarySelector};
 pub use privileged::{
