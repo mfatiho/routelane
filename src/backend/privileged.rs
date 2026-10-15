@@ -5051,6 +5051,55 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_and_seal_accept_nft_1_0_2_chain_interleaved_listing_order() {
+        // nft 1.0.2 (Ubuntu 22.04) lists each chain followed by its rules;
+        // newer nft and the rendered document list all chains first.
+        let expected = super::expected_nft_document(Some(&fixture_valid_plan()), None, false);
+        let objects: Vec<serde_json::Value> = expected["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| !o.as_object().unwrap().is_empty())
+            .cloned()
+            .collect();
+        let mut interleaved: Vec<serde_json::Value> = objects
+            .iter()
+            .filter(|o| o.get("rule").is_none() && o.get("chain").is_none())
+            .cloned()
+            .collect();
+        for chain in objects.iter().filter(|o| o.get("chain").is_some()) {
+            interleaved.push(chain.clone());
+            interleaved.extend(
+                objects
+                    .iter()
+                    .filter(|o| o["rule"]["chain"] == chain["chain"]["name"])
+                    .cloned(),
+            );
+        }
+        assert_eq!(interleaved.len(), objects.len());
+        let chains_first = serde_json::json!({ "nftables": objects });
+        let interleaved = serde_json::json!({ "nftables": interleaved });
+        assert_ne!(chains_first, interleaved);
+        assert_eq!(
+            nft_document_fingerprint(&chains_first).unwrap(),
+            nft_document_fingerprint(&interleaved).unwrap()
+        );
+        assert!(super::validate_orphan_nft_document(&interleaved).is_ok());
+
+        // Rule order inside a chain is still exact.
+        let mut swapped = interleaved.clone();
+        let list = swapped["nftables"].as_array_mut().unwrap();
+        let output: Vec<usize> = (0..list.len())
+            .filter(|&i| list[i]["rule"]["chain"] == "output")
+            .collect();
+        list.swap(output[0], output[1]);
+        assert_ne!(
+            nft_document_fingerprint(&interleaved).unwrap(),
+            nft_document_fingerprint(&swapped).unwrap()
+        );
+    }
+
+    #[test]
     fn orphan_recovery_accepts_current_policy_only_with_unchanged_content_seal() {
         let valid = super::expected_nft_document(Some(&fixture_valid_plan()), None, false);
         let without_metadata = serde_json::json!({"nftables": valid["nftables"].as_array().unwrap()

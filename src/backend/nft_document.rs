@@ -83,6 +83,16 @@ pub(super) fn resolve_dump_ifindices(
 }
 
 pub(super) fn normalize_nft_document(value: &mut Value) {
+    // nft 1.0.2 lists each chain followed by its rules, newer nft all chains
+    // first. Neither placement has meaning; rule order within a chain does,
+    // and a stable partition keeps it.
+    if let Some(objects) = value.get_mut("nftables").and_then(Value::as_array_mut) {
+        let (mut ordered, rules): (Vec<Value>, Vec<Value>) = std::mem::take(objects)
+            .into_iter()
+            .partition(|object| object.get("rule").is_none());
+        ordered.extend(rules);
+        *objects = ordered;
+    }
     match value {
         Value::Object(object) => {
             object.remove("metainfo");
@@ -482,8 +492,9 @@ pub fn render_nft_document(
                 // Use the observed index itself; reloading an older guarded
                 // plan must never resolve a reused name to a new device.
                 let index = lane.identity.as_ref().expect("ready lane identity").ifindex;
+                // `source` loads a family-specific conntrack key, so no nfproto
+                // dependency: nft 1.1.6 dumps that dependency inconsistently.
                 reply.rule(vec![
-                    family(f),
                     equal(meta("iif"), index),
                     equal(meta("iifname"), lane.interface.clone()),
                     equal(ct("direction"), "reply"),
@@ -493,7 +504,6 @@ pub fn render_nft_document(
                     ret(),
                 ]);
                 let scope = vec![
-                    family(f),
                     equal(meta("iif"), 0),
                     equal(meta("oif"), index),
                     equal(meta("oifname"), lane.interface.clone()),
