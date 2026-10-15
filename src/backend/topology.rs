@@ -106,6 +106,23 @@ impl TopologySnapshot {
     pub fn is_observed(&self) -> bool {
         self.observed
     }
+
+    /// Keeps only interfaces whose full current identity is one of `allowed`;
+    /// a reused name with a different device becomes an absent interface.
+    pub fn restricted_to<'a>(
+        &self,
+        allowed: impl IntoIterator<Item = &'a InterfaceIdentity>,
+    ) -> TopologySnapshot {
+        let allowed = allowed.into_iter().collect::<Vec<_>>();
+        let mut restricted = self.clone();
+        restricted.interfaces.retain(|_, entry| {
+            entry
+                .identity
+                .as_ref()
+                .is_some_and(|identity| allowed.contains(&identity))
+        });
+        restricted
+    }
     pub fn routing_conflicts(&self) -> &[String] {
         &self.conflicts
     }

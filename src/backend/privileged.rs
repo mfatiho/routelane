@@ -20,6 +20,11 @@ use crate::domain::LaneId;
 
 use super::interface_settings::{InterfaceSettingReceipt, MarkAwareRpf, MarkAwareRpfBackend};
 use super::legacy_journal::{legacy_nft_fingerprint, LegacyJournalV1};
+use super::runtime::{
+    policy_hash, restrict_to_grant, RuntimeActivation, RuntimeApplyResponse, RuntimeEnvironment,
+    RuntimeGrant, RuntimePhase, RuntimeRecord, RuntimeRestoreReceipt, RuntimeStatus,
+    RUNTIME_PROTOCOL_VERSION,
+};
 use super::transaction::restore_plan as restore_kernel_plan;
 use super::{
     apply_plan as apply_kernel_plan, build_snapshot_commands, detect_resource_conflicts,
@@ -29,11 +34,16 @@ use super::{
     SnapshotInput, TableMode, MARK_BASE, MARK_MAX, RULE_PRIORITY_BASE, RULE_PRIORITY_MAX,
     TABLE_BASE, TABLE_MAX, TERMINAL_ROUTE_METRIC,
 };
+use super::{compile_profile_with_primary, PrimarySelector, TopologySnapshot};
 
 pub const MAX_PLAN_JSON_BYTES: usize = 1024 * 1024;
-/// Two bounded plans plus fingerprints, at most one setting receipt per lane
-/// (committed and pending) and the envelope.
-const MAX_STATE_BYTES: u64 = (MAX_PLAN_JSON_BYTES as u64 * 2) + 128 * 1024;
+/// Bounded runtime record: one activation plus grant identities.
+const MAX_RUNTIME_RECORD_BYTES: u64 = super::MAX_ACTIVATION_JSON_BYTES as u64 + 64 * 1024;
+/// Active, pending and restorable plans; committed, pending and restorable
+/// runtime records; at most one setting receipt per lane (committed and
+/// pending); fingerprints and the envelope.
+const MAX_STATE_BYTES: u64 =
+    (MAX_PLAN_JSON_BYTES as u64 * 3) + (MAX_RUNTIME_RECORD_BYTES * 3) + 256 * 1024;
 /// Explicit journal schema. Unversioned journals are schema 1 and cleanup-only.
 const JOURNAL_VERSION: u32 = 2;
 const IP_BINARY: &str = "/usr/sbin/ip";
@@ -399,6 +409,37 @@ pub struct StoredAppliedState {
     /// An unversioned schema-1 journal awaiting cleanup; never armed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_v1: Option<LegacyJournalV1>,
+    /// Runtime authority committed together with `active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<RuntimeRecord>,
+    /// Runtime authority that commits only together with `pending`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_runtime: Option<RuntimeRecord>,
+    /// Single-use restore of the record `active` replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_restore: Option<RuntimeRestoreReceipt>,
+}
+
+/// Committed-generation state that is journaled alongside the plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CommittedExtras {
+    settings: Vec<InterfaceSettingReceipt>,
+    runtime: Option<RuntimeRecord>,
+    runtime_restore: Option<RuntimeRestoreReceipt>,
+}
+
+impl CommittedExtras {
+    fn of(record: &StoredAppliedState) -> Self {
+        Self {
+            settings: record.interface_settings.clone(),
+            runtime: record.runtime.clone(),
+            runtime_restore: record.runtime_restore.clone(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Default for StoredAppliedState {
@@ -415,6 +456,9 @@ impl Default for StoredAppliedState {
             interface_settings: vec![],
             pending_interface_settings: vec![],
             legacy_v1: None,
+            runtime: None,
+            pending_runtime: None,
+            runtime_restore: None,
         }
     }
 }
@@ -508,6 +552,11 @@ pub struct PendingExpectations {
     pub committed_nft_fingerprint: String,
     pub committed_routing_fingerprint: String,
     pub routing_model_fingerprint: String,
+    /// Unicast defaults (family number, table) the kernel had already removed
+    /// from the active generation on link/address loss when this transition
+    /// started. The crash and rollback models start from that live basis.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub lost_unicast: BTreeSet<(u8, u32)>,
 }
 
 impl StoredAppliedState {
@@ -737,6 +786,41 @@ pub struct CommandPrivilegedBackend<E, S = InMemoryAppliedStateStore> {
     restore_receipt: Option<RestoreReceipt>,
     legacy: Option<LegacyJournalV1>,
     initialized: bool,
+    environment: Box<dyn RuntimeEnvironment>,
+    runtime: Option<ArmedRuntime>,
+    runtime_restore: Option<RuntimeRestoreReceipt>,
+    runtime_loaded: bool,
+}
+
+/// The armed runtime: the journaled record plus process-local selector state
+/// (a restart resumes from the record and restarts any failback wait).
+struct ArmedRuntime {
+    record: RuntimeRecord,
+    selector: Option<PrimarySelector>,
+    phase: RuntimePhase,
+    last_error: Option<String>,
+}
+
+/// Used until a backend is given the kernel's boot/netns facts; a runtime
+/// cannot be armed without them.
+struct UnconfiguredEnvironment;
+
+impl RuntimeEnvironment for UnconfiguredEnvironment {
+    fn boot_id(&mut self) -> Result<String, PrivilegedError> {
+        Err(PrivilegedError::new(
+            "runtime environment is not configured",
+        ))
+    }
+    fn network_namespace(&mut self) -> Result<u64, PrivilegedError> {
+        Err(PrivilegedError::new(
+            "runtime environment is not configured",
+        ))
+    }
+    fn new_token(&mut self) -> Result<String, PrivilegedError> {
+        Err(PrivilegedError::new(
+            "runtime environment is not configured",
+        ))
+    }
 }
 
 /// Used until a backend is given the fixed-purpose system adapter; any lane
@@ -788,7 +872,20 @@ impl<E, S> CommandPrivilegedBackend<E, S> {
             restore_receipt: None,
             legacy: None,
             initialized: false,
+            environment: Box::new(UnconfiguredEnvironment),
+            runtime: None,
+            runtime_restore: None,
+            runtime_loaded: false,
         }
+    }
+
+    /// Supplies the boot, network-namespace and token source a grant binds to.
+    pub fn with_runtime_environment(
+        mut self,
+        environment: impl RuntimeEnvironment + 'static,
+    ) -> Self {
+        self.environment = Box::new(environment);
+        self
     }
 
     /// Supplies the fixed-purpose adapter for per-interface `src_valid_mark`.
@@ -805,6 +902,7 @@ impl Default for SystemPrivilegedBackend {
     fn default() -> Self {
         Self::with_store(ProcessCommandExecutor, FileAppliedStateStore::default())
             .with_interface_settings(super::SystemMarkAwareRpfBackend)
+            .with_runtime_environment(super::SystemRuntimeEnvironment)
     }
 }
 
@@ -816,7 +914,8 @@ where
     fn apply(&mut self, plan: &KernelPlan) -> Result<ApplyResponse, PrivilegedError> {
         self.ensure_reconciled()?;
         self.refuse_legacy_activation()?;
-        self.revalidate_current_ownership()?;
+        self.refuse_armed_runtime()?;
+        let lost_unicast = self.revalidate_current_ownership_for(plan)?;
         if let Some(current) = self.current.as_ref() {
             if plan.generation < current.generation {
                 return Err(PrivilegedError::new(format!(
@@ -832,18 +931,19 @@ where
                     )));
                 }
                 if self.restore_receipt.is_some() {
+                    let extras = self.committed_extras();
                     persist_committed(
                         &mut self.store,
                         self.current.as_ref(),
                         self.current_nft_fingerprint.as_deref(),
-                        &self.interface_settings,
+                        &extras,
                     )?;
                     self.restore_receipt = None;
                 }
                 return Ok(ApplyResponse::from_plan(plan, vec![]));
             }
         }
-        self.transition_to(plan, None)
+        self.transition_with(plan, None, &lost_unicast, None, None)
     }
 
     fn restore(
@@ -853,6 +953,7 @@ where
     ) -> Result<RestoreResponse, PrivilegedError> {
         self.ensure_reconciled()?;
         self.refuse_legacy_activation()?;
+        self.refuse_armed_runtime()?;
         self.revalidate_current_ownership()?;
         let receipt = RestoreReceipt::new(failed_candidate, previous);
         if previous.is_some_and(|plan| plan.generation >= failed_candidate.generation) {
@@ -911,6 +1012,8 @@ where
                 .with_nft_ownership(current.generation, current.plan_hash),
             _ => captured.snapshot,
         };
+        self.load_runtime()?;
+        let runtime = self.runtime_status();
         let diagnostics = if self.legacy.is_some() {
             vec![
                 "a schema-1 RouteLane journal is cleanup-only; run cleanup before activating"
@@ -926,6 +1029,7 @@ where
             routelane_table_present: snapshot.has_nft_table("inet", "routelane"),
             snapshot,
             diagnostics,
+            runtime,
         })
     }
 
@@ -957,6 +1061,28 @@ where
             diagnostics: vec![],
         })
     }
+
+    fn activate_runtime(
+        &mut self,
+        activation: &RuntimeActivation,
+        uid: u32,
+        topology: &TopologySnapshot,
+        now: Duration,
+    ) -> Result<RuntimeApplyResponse, PrivilegedError> {
+        self.activate_runtime_inner(activation, uid, topology, now)
+    }
+
+    fn refresh_runtime(
+        &mut self,
+        topology: &TopologySnapshot,
+        now: Duration,
+    ) -> Result<RuntimeStatus, PrivilegedError> {
+        self.refresh_runtime_inner(topology, now)
+    }
+
+    fn restore_runtime(&mut self, token: &str, uid: u32) -> Result<RuntimeStatus, PrivilegedError> {
+        self.restore_runtime_inner(token, uid)
+    }
 }
 
 impl<E, S> CommandPrivilegedBackend<E, S>
@@ -972,6 +1098,11 @@ where
         if self.legacy.is_some() {
             return self.cleanup_legacy();
         }
+        // Revoke runtime authority before any resource changes, so a queued
+        // refresh can never resurrect what this cleanup removes.
+        self.runtime = None;
+        self.runtime_restore = None;
+        self.runtime_loaded = true;
         let Some(current) = self.current.clone() else {
             if restore_receipt.is_none() {
                 self.store.clear()?;
@@ -1221,12 +1352,30 @@ where
         plan: &KernelPlan,
         restore_receipt: Option<RestoreReceipt>,
     ) -> Result<ApplyResponse, PrivilegedError> {
+        self.transition_with(plan, restore_receipt, &BTreeSet::new(), None, None)
+    }
+
+    /// Transactional move to `plan`. `lost_unicast` is the tolerated live
+    /// basis of the previous generation; `runtime` and `runtime_restore`
+    /// commit atomically with the plan (None clears them).
+    fn transition_with(
+        &mut self,
+        plan: &KernelPlan,
+        restore_receipt: Option<RestoreReceipt>,
+        lost_unicast: &BTreeSet<(u8, u32)>,
+        runtime: Option<RuntimeRecord>,
+        runtime_restore: Option<RuntimeRestoreReceipt>,
+    ) -> Result<ApplyResponse, PrivilegedError> {
         let previous = self.current.clone();
         let previous_nft_fingerprint = self.current_nft_fingerprint.clone();
-        let previous_settings = self.interface_settings.clone();
+        let previous_extras = self.committed_extras();
+        let previous_settings = previous_extras.settings.clone();
         preflight_plan(&mut self.executor, previous.as_ref(), plan)?;
-        let pending_expectations =
-            build_pending_expectations(previous.as_ref().map(AppliedKernelState::plan), plan)?;
+        let pending_expectations = build_pending_expectations_from(
+            previous.as_ref().map(AppliedKernelState::plan),
+            lost_unicast,
+            plan,
+        )?;
         let mut record = StoredAppliedState {
             active: previous.as_ref().map(|state| state.plan().clone()),
             active_nft_fingerprint: previous_nft_fingerprint.clone(),
@@ -1234,6 +1383,9 @@ where
             pending_expectations: Some(pending_expectations.clone()),
             restore_receipt: restore_receipt.clone(),
             interface_settings: previous_settings.clone(),
+            runtime: previous_extras.runtime.clone(),
+            pending_runtime: runtime.clone(),
+            runtime_restore: previous_extras.runtime_restore.clone(),
             ..StoredAppliedState::default()
         };
         self.store.save(&record)?;
@@ -1257,7 +1409,7 @@ where
                     &mut self.store,
                     previous.as_ref(),
                     previous_nft_fingerprint.as_deref(),
-                    &previous_settings,
+                    &previous_extras,
                 );
                 return Err(PrivilegedError::new(format!(
                     "{error}; setting restore: {}; state repair: {}",
@@ -1270,14 +1422,19 @@ where
                 )));
             }
         };
-        let committed_settings = previous_settings
-            .iter()
-            .chain(&new_settings)
-            .cloned()
-            .collect::<Vec<_>>();
+        let committed_extras = CommittedExtras {
+            settings: previous_settings
+                .iter()
+                .chain(&new_settings)
+                .cloned()
+                .collect(),
+            runtime,
+            runtime_restore,
+        };
 
         let settings = &mut *self.settings;
-        let mut runner = CommandKernelRunner::new(&mut self.executor, previous.clone());
+        let mut runner = CommandKernelRunner::new(&mut self.executor, previous.clone())
+            .with_lost_unicast(lost_unicast);
         let mut undo = |runner: &mut CommandKernelRunner<'_, E>,
                         store: &mut S,
                         rollback_succeeded: bool|
@@ -1287,7 +1444,8 @@ where
                 &mut *runner.executor,
                 previous.as_ref(),
                 previous_nft_fingerprint.as_deref(),
-                &previous_settings,
+                lost_unicast,
+                &previous_extras,
                 rollback_succeeded,
             )?;
             // Only after the journal is back on the previous generation; a
@@ -1366,7 +1524,7 @@ where
             Some(&applied),
             Some(&applied_nft_fingerprint),
             restore_receipt.clone(),
-            &committed_settings,
+            &committed_extras,
         ) {
             let rollback = runner.restore(previous.as_ref());
             let state_repair = undo(&mut runner, &mut self.store, rollback.is_ok());
@@ -1379,7 +1537,8 @@ where
 
         self.current = Some(applied);
         self.current_nft_fingerprint = Some(applied_nft_fingerprint);
-        self.interface_settings = committed_settings;
+        self.interface_settings = committed_extras.settings;
+        self.runtime_restore = committed_extras.runtime_restore;
         self.restore_receipt = restore_receipt;
         Ok(ApplyResponse::from_plan(plan, vec![]))
     }
@@ -1499,7 +1658,9 @@ where
                 pending,
                 expectations,
             )?;
-            let mut runner = CommandKernelRunner::new(&mut self.executor, active.clone());
+            let lost = expectations.lost_unicast.clone();
+            let mut runner = CommandKernelRunner::new(&mut self.executor, active.clone())
+                .with_lost_unicast(&lost);
             runner.next = Some(pending.clone());
             runner
                 .snapshot()
@@ -1507,10 +1668,11 @@ where
                 .map_err(|error| {
                     PrivilegedError::new(format!("recover pending kernel transaction: {error}"))
                 })?;
-            verify_exact_kernel_state(
+            verify_exact_kernel_basis(
                 &mut self.executor,
                 active.as_ref(),
                 record.active_nft_fingerprint.as_deref(),
+                &lost,
             )
             .map_err(|error| {
                 PrivilegedError::new(format!(
@@ -1529,8 +1691,9 @@ where
                 active.as_ref(),
                 record.active_nft_fingerprint.as_deref(),
                 None,
-                &record.interface_settings,
+                &CommittedExtras::of(&record),
             )?;
+            self.runtime_loaded = false;
             self.current = active;
             self.current_nft_fingerprint = record.active_nft_fingerprint;
             self.interface_settings = record.interface_settings;
@@ -1571,6 +1734,388 @@ where
     }
 }
 
+impl<E, S> CommandPrivilegedBackend<E, S>
+where
+    E: CommandExecutor,
+    S: AppliedStateStore,
+{
+    fn committed_extras(&self) -> CommittedExtras {
+        CommittedExtras {
+            settings: self.interface_settings.clone(),
+            runtime: self.runtime.as_ref().map(|runtime| runtime.record.clone()),
+            runtime_restore: self.runtime_restore.clone(),
+        }
+    }
+
+    /// Tolerated kernel-dropped unicast routes of the committed generation
+    /// relative to `next`; exact for everything else.
+    fn revalidate_current_ownership_for(
+        &mut self,
+        next: &KernelPlan,
+    ) -> Result<BTreeSet<(u8, u32)>, PrivilegedError> {
+        match (
+            self.current.as_ref(),
+            self.current_nft_fingerprint.as_deref(),
+        ) {
+            (Some(current), Some(fingerprint)) => {
+                tolerated_lost_unicast(&mut self.executor, current.plan(), fingerprint, next)
+            }
+            (Some(_), None) => Err(PrivilegedError::new(
+                "active RouteLane state is missing its committed nftables fingerprint",
+            )),
+            (None, _) => Ok(BTreeSet::new()),
+        }
+    }
+
+    fn refuse_armed_runtime(&mut self) -> Result<(), PrivilegedError> {
+        self.load_runtime()?;
+        if self.runtime.is_some() {
+            return Err(PrivilegedError::new(
+                "runtime authority is armed; change it through runtime activation or cleanup",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Loads the journaled runtime record once. A record whose boot, network
+    /// namespace or policy no longer match is frozen: it never mutates again
+    /// and needs a new authorization (or cleanup).
+    fn load_runtime(&mut self) -> Result<(), PrivilegedError> {
+        if self.runtime_loaded {
+            return Ok(());
+        }
+        let record = self.store.load()?.unwrap_or_default();
+        self.runtime_restore = record.runtime_restore;
+        self.runtime = record.runtime.map(|record| {
+            let mismatch = self.grant_mismatch(&record);
+            ArmedRuntime {
+                record,
+                selector: None,
+                phase: if mismatch.is_some() {
+                    RuntimePhase::NeedsReauthorization
+                } else {
+                    RuntimePhase::Armed
+                },
+                last_error: mismatch,
+            }
+        });
+        self.runtime_loaded = true;
+        Ok(())
+    }
+
+    fn grant_mismatch(&mut self, record: &RuntimeRecord) -> Option<String> {
+        let grant = &record.grant;
+        match (
+            self.environment.boot_id(),
+            self.environment.network_namespace(),
+        ) {
+            (Ok(boot), Ok(namespace))
+                if boot == grant.boot_id && namespace == grant.network_namespace => {}
+            (Ok(_), Ok(_)) => {
+                return Some("runtime grant belongs to another boot or network namespace".into())
+            }
+            (Err(error), _) | (_, Err(error)) => return Some(error.to_string()),
+        }
+        (policy_hash(&record.profile, &record.resolutions) != grant.policy_hash)
+            .then(|| "runtime grant does not match its journaled policy".to_owned())
+    }
+
+    fn runtime_status(&self) -> RuntimeStatus {
+        let generation = self.current.as_ref().map_or(0, |state| state.generation);
+        match &self.runtime {
+            None => RuntimeStatus::inactive(generation),
+            Some(runtime) => RuntimeStatus {
+                grant: Some(runtime.record.grant.clone()),
+                generation,
+                decision: Some(runtime.record.decision.clone()),
+                phase: runtime.phase,
+                last_error: runtime.last_error.clone(),
+            },
+        }
+    }
+
+    /// Recovers or adopts the journal for a runtime operation. Returns true
+    /// when the committed state was adopted without kernel verification (a
+    /// restarted helper), so the caller must prove it before relying on it.
+    fn prepare_runtime_operation(&mut self) -> Result<bool, PrivilegedError> {
+        let unverified = !self.initialized;
+        let interrupted = self.store.load()?.is_some_and(|record| {
+            record.pending.is_some()
+                || record.cleanup_pending
+                || record.orphan_cleanup.is_some()
+                || record.legacy_v1.is_some()
+        });
+        if interrupted {
+            self.ensure_reconciled()?;
+            self.runtime_loaded = false;
+            self.load_runtime()?;
+            return Ok(false);
+        }
+        self.ensure_inspection_ready()?;
+        self.load_runtime()?;
+        Ok(unverified && self.current.is_some())
+    }
+
+    fn activate_runtime_inner(
+        &mut self,
+        activation: &RuntimeActivation,
+        uid: u32,
+        topology: &TopologySnapshot,
+        now: Duration,
+    ) -> Result<RuntimeApplyResponse, PrivilegedError> {
+        if activation.protocol_version != RUNTIME_PROTOCOL_VERSION {
+            return Err(PrivilegedError::new(format!(
+                "runtime protocol {} is not supported; expected {RUNTIME_PROTOCOL_VERSION}",
+                activation.protocol_version
+            )));
+        }
+        let encoded = serde_json::to_vec(activation)
+            .map_err(|error| PrivilegedError::new(format!("encode activation: {error}")))?;
+        if encoded.len() > super::MAX_ACTIVATION_JSON_BYTES {
+            return Err(PrivilegedError::new(
+                "runtime activation exceeds the size limit",
+            ));
+        }
+        crate::domain::validate_profile(&activation.profile)
+            .map_err(|error| PrivilegedError::new(format!("invalid profile: {error:?}")))?;
+        if !topology.is_observed() {
+            return Err(PrivilegedError::new(
+                "runtime activation requires observed kernel topology",
+            ));
+        }
+        self.prepare_runtime_operation()?;
+        self.refuse_legacy_activation()?;
+        let generation = self.current.as_ref().map_or(0, |state| state.generation);
+        if activation.expected_generation != generation {
+            return Err(PrivilegedError::new(format!(
+                "runtime activation expected generation {} but {generation} is applied",
+                activation.expected_generation
+            )));
+        }
+        let profile = &activation.profile;
+        let grant = RuntimeGrant {
+            owner_uid: uid,
+            boot_id: self.environment.boot_id()?,
+            network_namespace: self.environment.network_namespace()?,
+            policy_hash: policy_hash(profile, &activation.resolutions),
+            interfaces: profile
+                .lanes
+                .iter()
+                .filter_map(|lane| {
+                    let identity = topology
+                        .interface(lane.interface.as_str())?
+                        .identity
+                        .clone()?;
+                    Some((lane.id.clone(), identity))
+                })
+                .collect(),
+        };
+        let filtered = restrict_to_grant(topology, &grant);
+        let mut selector = PrimarySelector::new(profile, &filtered);
+        let decision = selector.update(&profile.routing, &filtered, now);
+        let plan = compile_runtime_plan(
+            profile,
+            &filtered,
+            &activation.resolutions,
+            &decision,
+            generation + 1,
+        )?;
+        let lost_unicast = self.revalidate_current_ownership_for(&plan)?;
+        let token = self.environment.new_token()?;
+        let restore = RuntimeRestoreReceipt {
+            token_hash: RuntimeRestoreReceipt::token_hash(&token),
+            owner_uid: uid,
+            issued_for_generation: plan.generation,
+            issued_for_plan_hash: plan.content_hash(),
+            previous_plan: self.current.as_ref().map(|state| state.plan().clone()),
+            previous_record: self.runtime.as_ref().map(|runtime| runtime.record.clone()),
+        };
+        let record = RuntimeRecord {
+            grant,
+            profile: profile.clone(),
+            resolutions: activation.resolutions.clone(),
+            decision,
+        };
+        self.transition_with(
+            &plan,
+            None,
+            &lost_unicast,
+            Some(record.clone()),
+            Some(restore),
+        )?;
+        self.runtime = Some(ArmedRuntime {
+            record,
+            selector: Some(selector),
+            phase: RuntimePhase::Armed,
+            last_error: None,
+        });
+        Ok(RuntimeApplyResponse {
+            status: self.runtime_status(),
+            plan,
+            rollback_receipt: token,
+        })
+    }
+
+    fn refresh_runtime_inner(
+        &mut self,
+        topology: &TopologySnapshot,
+        now: Duration,
+    ) -> Result<RuntimeStatus, PrivilegedError> {
+        let unverified = self.prepare_runtime_operation()?;
+        let Some(mut runtime) = self.runtime.take() else {
+            return Ok(self.runtime_status());
+        };
+        let outcome = self.refresh_armed(&mut runtime, topology, now, unverified);
+        if let Err(error) = outcome {
+            runtime.phase = if runtime.phase == RuntimePhase::NeedsReauthorization {
+                RuntimePhase::NeedsReauthorization
+            } else {
+                RuntimePhase::Degraded
+            };
+            runtime.last_error = Some(error.to_string());
+            // Resume from the committed decision; an uncommitted one is not published.
+            runtime.selector = None;
+        }
+        self.runtime = Some(runtime);
+        Ok(self.runtime_status())
+    }
+
+    fn refresh_armed(
+        &mut self,
+        runtime: &mut ArmedRuntime,
+        topology: &TopologySnapshot,
+        now: Duration,
+        unverified: bool,
+    ) -> Result<(), PrivilegedError> {
+        if runtime.phase == RuntimePhase::NeedsReauthorization {
+            return Ok(());
+        }
+        if !topology.is_observed() {
+            return Err(PrivilegedError::new(
+                "runtime refresh requires observed kernel topology",
+            ));
+        }
+        let current = self.current.clone().ok_or_else(|| {
+            PrivilegedError::new("armed runtime has no committed RouteLane generation")
+        })?;
+        let filtered = restrict_to_grant(topology, &runtime.record.grant);
+        let selector = runtime.selector.get_or_insert_with(|| {
+            PrimarySelector::resume(&runtime.record.profile, &filtered, &runtime.record.decision)
+        });
+        let decision = selector.update(&runtime.record.profile.routing, &filtered, now);
+        let candidate = compile_runtime_plan(
+            &runtime.record.profile,
+            &filtered,
+            &runtime.record.resolutions,
+            &decision,
+            current.generation + 1,
+        )?;
+        let lost_unicast = match self.revalidate_current_ownership_for(&candidate) {
+            Ok(lost) => lost,
+            Err(error) if unverified => {
+                runtime.phase = RuntimePhase::NeedsReauthorization;
+                return Err(PrivilegedError::new(format!(
+                    "restarted helper could not prove its runtime state: {error}"
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        if candidate.content_hash() == current.plan_hash && decision == runtime.record.decision {
+            runtime.phase = RuntimePhase::Armed;
+            runtime.last_error = None;
+            return Ok(());
+        }
+        let record = RuntimeRecord {
+            decision,
+            ..runtime.record.clone()
+        };
+        runtime.phase = RuntimePhase::Switching;
+        // Keep the receipt: it now names a superseded commit and is refused
+        // with that reason instead of disappearing.
+        let restore = self.runtime_restore.clone();
+        self.transition_with(
+            &candidate,
+            None,
+            &lost_unicast,
+            Some(record.clone()),
+            restore,
+        )?;
+        runtime.record = record;
+        runtime.phase = RuntimePhase::Armed;
+        runtime.last_error = None;
+        Ok(())
+    }
+
+    fn restore_runtime_inner(
+        &mut self,
+        token: &str,
+        uid: u32,
+    ) -> Result<RuntimeStatus, PrivilegedError> {
+        self.prepare_runtime_operation()?;
+        self.refuse_legacy_activation()?;
+        let receipt = self
+            .runtime_restore
+            .clone()
+            .ok_or_else(|| PrivilegedError::new("no runtime restore receipt is available"))?;
+        if RuntimeRestoreReceipt::token_hash(token) != receipt.token_hash
+            || uid != receipt.owner_uid
+        {
+            return Err(PrivilegedError::new(
+                "runtime restore receipt does not belong to this caller",
+            ));
+        }
+        let current = self.current.clone().ok_or_else(|| {
+            PrivilegedError::new("runtime restore receipt has no committed generation")
+        })?;
+        if current.generation != receipt.issued_for_generation
+            || current.plan_hash != receipt.issued_for_plan_hash
+        {
+            return Err(PrivilegedError::new(
+                "a newer RouteLane transition superseded this runtime restore receipt",
+            ));
+        }
+        let Some(mut previous) = receipt.previous_plan else {
+            self.cleanup_with_receipt(None)?;
+            return Ok(self.runtime_status());
+        };
+        previous.generation = current.generation + 1;
+        let lost_unicast = self.revalidate_current_ownership_for(&previous)?;
+        self.transition_with(
+            &previous,
+            None,
+            &lost_unicast,
+            receipt.previous_record.clone(),
+            None,
+        )?;
+        self.runtime = receipt.previous_record.map(|record| ArmedRuntime {
+            record,
+            selector: None,
+            phase: RuntimePhase::Armed,
+            last_error: None,
+        });
+        Ok(self.runtime_status())
+    }
+}
+
+fn compile_runtime_plan(
+    profile: &crate::domain::Profile,
+    topology: &TopologySnapshot,
+    resolutions: &super::ResolutionSnapshot,
+    decision: &super::PrimaryDecision,
+    generation: u64,
+) -> Result<KernelPlan, PrivilegedError> {
+    let plan = compile_profile_with_primary(profile, topology, resolutions, decision, generation)
+        .map_err(|error| PrivilegedError::new(format!("compile runtime plan: {error:?}")))?;
+    validate_privileged_plan(&plan)
+        .map_err(|error| PrivilegedError::new(format!("runtime plan is invalid: {error}")))?;
+    let encoded = serde_json::to_vec(&plan)
+        .map_err(|error| PrivilegedError::new(format!("encode runtime plan: {error}")))?;
+    if encoded.len() > MAX_PLAN_JSON_BYTES {
+        return Err(PrivilegedError::new("runtime plan exceeds the size limit"));
+    }
+    Ok(plan)
+}
+
 fn validate_pending_expectations(
     active: Option<&KernelPlan>,
     pending: Option<&KernelPlan>,
@@ -1579,7 +2124,8 @@ fn validate_pending_expectations(
     match (pending, expectations) {
         (None, None) => Ok(()),
         (Some(pending), Some(expectations)) => {
-            let expected = build_pending_expectations(active, pending)?;
+            let expected =
+                build_pending_expectations_from(active, &expectations.lost_unicast, pending)?;
             if &expected == expectations {
                 Ok(())
             } else {
@@ -1662,9 +2208,9 @@ fn persist_committed(
     store: &mut impl AppliedStateStore,
     state: Option<&AppliedKernelState>,
     nft_fingerprint: Option<&str>,
-    settings: &[InterfaceSettingReceipt],
+    extras: &CommittedExtras,
 ) -> Result<(), PrivilegedError> {
-    persist_committed_with_receipt(store, state, nft_fingerprint, None, settings)
+    persist_committed_with_receipt(store, state, nft_fingerprint, None, extras)
 }
 
 fn persist_committed_with_receipt(
@@ -1672,16 +2218,18 @@ fn persist_committed_with_receipt(
     state: Option<&AppliedKernelState>,
     nft_fingerprint: Option<&str>,
     restore_receipt: Option<RestoreReceipt>,
-    settings: &[InterfaceSettingReceipt],
+    extras: &CommittedExtras,
 ) -> Result<(), PrivilegedError> {
-    if state.is_none() && !settings.is_empty() {
+    if state.is_none() && !extras.is_empty() {
         return Err(PrivilegedError::new(
-            "interface setting receipts require an active committed plan",
+            "interface setting and runtime receipts require an active committed plan",
         ));
     }
     match (state, nft_fingerprint) {
         (Some(state), Some(fingerprint)) => store.save(&StoredAppliedState {
-            interface_settings: settings.to_vec(),
+            interface_settings: extras.settings.clone(),
+            runtime: extras.runtime.clone(),
+            runtime_restore: extras.runtime_restore.clone(),
             ..StoredAppliedState::committed(
                 Some(state.plan().clone()),
                 Some(fingerprint.to_owned()),
@@ -1703,7 +2251,8 @@ fn repair_committed_journal_after_rollback(
     executor: &mut impl CommandExecutor,
     state: Option<&AppliedKernelState>,
     nft_fingerprint: Option<&str>,
-    settings: &[InterfaceSettingReceipt],
+    lost_unicast: &BTreeSet<(u8, u32)>,
+    extras: &CommittedExtras,
     rollback_succeeded: bool,
 ) -> Result<(), PrivilegedError> {
     if !rollback_succeeded {
@@ -1711,8 +2260,8 @@ fn repair_committed_journal_after_rollback(
             "rollback did not complete; exact pending state is still required for recovery",
         ));
     }
-    verify_exact_kernel_state(executor, state, nft_fingerprint)?;
-    persist_committed(store, state, nft_fingerprint, settings)
+    verify_exact_kernel_basis(executor, state, nft_fingerprint, lost_unicast)?;
+    persist_committed(store, state, nft_fingerprint, extras)
 }
 
 /// Lanes whose IPv4 replies need mark-aware reverse-path filtering.
@@ -1796,6 +2345,13 @@ fn validate_setting_receipts(record: &StoredAppliedState) -> Result<(), Privileg
             "invalid persisted state: pending interface settings without a pending plan",
         ));
     }
+    if (record.runtime.is_some() || record.runtime_restore.is_some()) && record.active.is_none()
+        || record.pending_runtime.is_some() && record.pending.is_none()
+    {
+        return Err(PrivilegedError::new(
+            "invalid persisted state: runtime authority without its plan",
+        ));
+    }
     let receipts = record
         .interface_settings
         .iter()
@@ -1830,9 +2386,19 @@ fn verify_exact_kernel_state(
     state: Option<&AppliedKernelState>,
     nft_fingerprint: Option<&str>,
 ) -> Result<(), PrivilegedError> {
+    verify_exact_kernel_basis(executor, state, nft_fingerprint, &BTreeSet::new())
+}
+
+fn verify_exact_kernel_basis(
+    executor: &mut impl CommandExecutor,
+    state: Option<&AppliedKernelState>,
+    nft_fingerprint: Option<&str>,
+    lost_unicast: &BTreeSet<(u8, u32)>,
+) -> Result<(), PrivilegedError> {
     match (state, nft_fingerprint) {
         (Some(state), Some(fingerprint)) => {
-            if verify_persisted_ownership(executor, state.plan(), fingerprint)? {
+            let basis = routing_basis(state.plan(), lost_unicast);
+            if verify_persisted_ownership_basis(executor, state.plan(), &basis, fingerprint)? {
                 Ok(())
             } else {
                 Err(PrivilegedError::new("exact rollback target is incomplete"))
@@ -1920,6 +2486,8 @@ fn unowned_requested_resource_present(
 struct CommandKernelRunner<'a, E> {
     executor: &'a mut E,
     previous: Option<AppliedKernelState>,
+    /// Routing the previous generation actually has (see `routing_basis`).
+    previous_routing: Option<KernelPlan>,
     next: Option<KernelPlan>,
     table_present: bool,
     guard_installed: bool,
@@ -1927,13 +2495,23 @@ struct CommandKernelRunner<'a, E> {
 
 impl<'a, E> CommandKernelRunner<'a, E> {
     fn new(executor: &'a mut E, previous: Option<AppliedKernelState>) -> Self {
+        let previous_routing = previous.as_ref().map(|state| state.plan().clone());
         Self {
             executor,
             previous,
+            previous_routing,
             next: None,
             table_present: false,
             guard_installed: false,
         }
+    }
+
+    fn with_lost_unicast(mut self, lost_unicast: &BTreeSet<(u8, u32)>) -> Self {
+        self.previous_routing = self
+            .previous
+            .as_ref()
+            .map(|state| routing_basis(state.plan(), lost_unicast));
+        self
     }
 }
 
@@ -1966,8 +2544,7 @@ where
     }
 
     fn prepare_routes(&mut self, next: &KernelPlan) -> Result<(), RunnerError> {
-        let previous = self.previous.as_ref().map(AppliedKernelState::plan);
-        for step in transition_steps(previous, next) {
+        for step in transition_steps(self.previous_routing.as_ref(), next) {
             run_routing_step(
                 self.executor,
                 &step,
@@ -2021,6 +2598,7 @@ where
             .ok_or_else(|| RunnerError::new("next plan is unavailable during cleanup"))?
             .clone();
 
+        let previous = self.previous_routing.clone().unwrap_or(previous);
         for step in retire_steps(&previous, &next) {
             run_routing_step(
                 self.executor,
@@ -2073,7 +2651,13 @@ where
         self.guard_installed = false;
 
         if let Some(state) = state {
-            for step in install_steps(state.plan()) {
+            // Restoring the previous generation must not resurrect a unicast
+            // default the kernel removed on link loss before this transition.
+            let routing = match (&self.previous, &self.previous_routing) {
+                (Some(previous), Some(basis)) if previous == state => basis.clone(),
+                _ => state.plan().clone(),
+            };
+            for step in install_steps(&routing) {
                 run_routing_step(
                     self.executor,
                     &step,
@@ -2087,7 +2671,7 @@ where
                 "restore previous RouteLane nftables ruleset",
             )?;
             self.table_present = true;
-            verify_plan(self.executor, state.plan())?;
+            verify_plan_basis(self.executor, state.plan(), &routing)?;
         }
 
         Ok(())
@@ -2244,8 +2828,16 @@ where
 }
 
 fn verify_plan(executor: &mut impl CommandExecutor, plan: &KernelPlan) -> Result<(), RunnerError> {
+    verify_plan_basis(executor, plan, plan)
+}
+
+fn verify_plan_basis(
+    executor: &mut impl CommandExecutor,
+    plan: &KernelPlan,
+    routing: &KernelPlan,
+) -> Result<(), RunnerError> {
     let captured = capture_snapshot(executor)?;
-    if !captured_plan_present(&captured, plan)? {
+    if !captured_plan_present(&captured, routing)? {
         return Err(RunnerError::new(
             "generated RouteLane route or policy resources are incomplete",
         ));
@@ -2276,15 +2868,26 @@ fn verify_persisted_ownership(
     plan: &KernelPlan,
     expected_nft_fingerprint: &str,
 ) -> Result<bool, PrivilegedError> {
+    verify_persisted_ownership_basis(executor, plan, plan, expected_nft_fingerprint)
+}
+
+/// Exact ownership where `routing` is the routing basis of `plan` (equal to
+/// `plan` unless the kernel dropped unicast defaults on link loss).
+fn verify_persisted_ownership_basis(
+    executor: &mut impl CommandExecutor,
+    plan: &KernelPlan,
+    routing: &KernelPlan,
+    expected_nft_fingerprint: &str,
+) -> Result<bool, PrivilegedError> {
     let captured =
         capture_snapshot(executor).map_err(|error| PrivilegedError::new(error.to_string()))?;
-    detect_resource_conflicts(plan, &captured.snapshot).map_err(|conflict| {
+    detect_resource_conflicts(routing, &captured.snapshot).map_err(|conflict| {
         PrivilegedError::new(format!(
             "persisted plan conflicts with live kernel resources: {conflict:?}"
         ))
     })?;
     let live_routing = live_routing_ownership(&captured)?;
-    let expected_routing = plan_routing_ownership(plan);
+    let expected_routing = plan_routing_ownership(routing);
     if live_routing != expected_routing {
         return Err(PrivilegedError::new(
             "persisted plan does not exactly own all live RouteLane route and policy-rule resources",
@@ -2309,7 +2912,58 @@ fn verify_persisted_ownership(
             ));
         }
     }
-    captured_plan_present(&captured, plan).map_err(|error| PrivilegedError::new(error.to_string()))
+    captured_plan_present(&captured, routing)
+        .map_err(|error| PrivilegedError::new(error.to_string()))
+}
+
+/// Unicast defaults of `plan` the kernel removed that `next` also gives up.
+///
+/// Link or address loss makes the kernel delete a lane's unicast default
+/// while RouteLane's tables, rules and nftables stay exact. That is accepted
+/// only when nothing else differs and the fresh plan no longer uses the route;
+/// a missing route of a lane that is still usable (for example an
+/// administrator's deletion) and any extra or modified resource fail closed.
+fn tolerated_lost_unicast(
+    executor: &mut impl CommandExecutor,
+    plan: &KernelPlan,
+    expected_nft_fingerprint: &str,
+    next: &KernelPlan,
+) -> Result<BTreeSet<(u8, u32)>, PrivilegedError> {
+    let captured =
+        capture_snapshot(executor).map_err(|error| PrivilegedError::new(error.to_string()))?;
+    let live = live_routing_ownership(&captured)?;
+    let expected = plan_routing_ownership(plan);
+    if live.rules != expected.rules || !live.routes.is_subset(&expected.routes) {
+        return Err(PrivilegedError::new(
+            "committed RouteLane kernel resources were modified; refusing apply",
+        ));
+    }
+    let mut lost = BTreeSet::new();
+    for route in expected.routes.difference(&live.routes) {
+        let family = if route.family == 4 {
+            IpFamily::V4
+        } else {
+            IpFamily::V6
+        };
+        let still_used = next
+            .lanes
+            .iter()
+            .find(|lane| lane.table == route.table)
+            .is_some_and(|lane| super::lane_unicast_route(lane, family).is_some());
+        if route.terminal || still_used {
+            return Err(PrivilegedError::new(
+                "committed RouteLane kernel resources are incomplete; refusing apply",
+            ));
+        }
+        lost.insert((route.family, route.table));
+    }
+    let basis = routing_basis(plan, &lost);
+    if !verify_persisted_ownership_basis(executor, plan, &basis, expected_nft_fingerprint)? {
+        return Err(PrivilegedError::new(
+            "committed RouteLane kernel resources are incomplete; refusing apply",
+        ));
+    }
+    Ok(lost)
 }
 
 fn verify_cleanup_table_ownership(
@@ -2389,12 +3043,8 @@ fn verify_pending_table_ownership(
             ));
         }
     };
-    validate_pending_routing_resources(
-        &captured,
-        active.map(AppliedKernelState::plan),
-        pending,
-        phase,
-    )
+    let basis = active.map(|state| routing_basis(state.plan(), &expectations.lost_unicast));
+    validate_pending_routing_resources(&captured, basis.as_ref(), pending, phase)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3371,8 +4021,17 @@ fn nft_document_fingerprint(document: &serde_json::Value) -> Result<String, Runn
     Ok(blake3::hash(&canonical).to_hex().to_string())
 }
 
+#[cfg(test)]
 fn build_pending_expectations(
     active: Option<&KernelPlan>,
+    pending: &KernelPlan,
+) -> Result<PendingExpectations, PrivilegedError> {
+    build_pending_expectations_from(active, &BTreeSet::new(), pending)
+}
+
+fn build_pending_expectations_from(
+    active: Option<&KernelPlan>,
+    lost_unicast: &BTreeSet<(u8, u32)>,
     pending: &KernelPlan,
 ) -> Result<PendingExpectations, PrivilegedError> {
     let guard_nft_fingerprint =
@@ -3389,7 +4048,8 @@ fn build_pending_expectations(
             .map_err(|error| PrivilegedError::new(error.to_string()))?;
     let committed_routing_fingerprint =
         routing_ownership_fingerprint(&plan_routing_ownership(pending))?;
-    let routing_model_fingerprint = routing_model_fingerprint(active, pending)?;
+    let basis = active.map(|plan| routing_basis(plan, lost_unicast));
+    let routing_model_fingerprint = routing_model_fingerprint(basis.as_ref(), pending)?;
     Ok(PendingExpectations {
         guard_nft_fingerprint,
         guardless_transaction_nft_fingerprint,
@@ -3397,7 +4057,23 @@ fn build_pending_expectations(
         committed_nft_fingerprint,
         committed_routing_fingerprint,
         routing_model_fingerprint,
+        lost_unicast: lost_unicast.clone(),
     })
+}
+
+/// The routing state an active generation actually has once the kernel
+/// dropped some of its unicast defaults; nftables still follow `plan`.
+fn routing_basis(plan: &KernelPlan, lost_unicast: &BTreeSet<(u8, u32)>) -> KernelPlan {
+    let mut basis = plan.clone();
+    for lane in &mut basis.lanes {
+        if lost_unicast.contains(&(4, lane.table)) {
+            lane.route_v4 = None;
+        }
+        if lost_unicast.contains(&(6, lane.table)) {
+            lane.route_v6 = None;
+        }
+    }
+    basis
 }
 
 fn routing_model_fingerprint(
@@ -3859,6 +4535,9 @@ pub struct InspectResponse {
     pub routelane_table_present: bool,
     pub snapshot: KernelSnapshot,
     pub diagnostics: Vec<String>,
+    /// Absent from Helper1 responses; such a helper never arms a runtime.
+    #[serde(default)]
+    pub runtime: RuntimeStatus,
 }
 
 impl InspectResponse {
@@ -3870,6 +4549,7 @@ impl InspectResponse {
             routelane_table_present: false,
             snapshot: KernelSnapshot::default(),
             diagnostics: vec![],
+            runtime: RuntimeStatus::default(),
         }
     }
 }
@@ -3917,6 +4597,36 @@ pub trait PrivilegedBackend: Send {
     fn inspect(&mut self) -> Result<InspectResponse, PrivilegedError>;
     fn cleanup(&mut self) -> Result<CleanupResponse, PrivilegedError>;
     fn recover_orphaned(&mut self) -> Result<OrphanRecoveryResponse, PrivilegedError>;
+
+    /// Arms runtime authority for an already-authorized caller `uid`.
+    fn activate_runtime(
+        &mut self,
+        _activation: &RuntimeActivation,
+        _uid: u32,
+        _topology: &TopologySnapshot,
+        _now: Duration,
+    ) -> Result<RuntimeApplyResponse, PrivilegedError> {
+        Err(PrivilegedError::new("runtime authority is not supported"))
+    }
+
+    /// Recompiles only the stored policy against fresh kernel evidence.
+    /// There is no client-callable equivalent.
+    fn refresh_runtime(
+        &mut self,
+        _topology: &TopologySnapshot,
+        _now: Duration,
+    ) -> Result<RuntimeStatus, PrivilegedError> {
+        Err(PrivilegedError::new("runtime authority is not supported"))
+    }
+
+    /// Restores the helper-owned prior record named by a single-use token.
+    fn restore_runtime(
+        &mut self,
+        _token: &str,
+        _uid: u32,
+    ) -> Result<RuntimeStatus, PrivilegedError> {
+        Err(PrivilegedError::new("runtime authority is not supported"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4016,6 +4726,51 @@ where
     ) -> Result<OrphanRecoveryResponse, ServiceError> {
         self.authorize(sender).await?;
         self.run_backend(PrivilegedBackend::recover_orphaned).await
+    }
+
+    /// Interactive authorization arms runtime authority for `uid`, the
+    /// already resolved bus caller of this request.
+    pub async fn activate_runtime(
+        &self,
+        sender: Option<&str>,
+        activation_json: &str,
+        uid: u32,
+        topology: TopologySnapshot,
+        now: Duration,
+    ) -> Result<RuntimeApplyResponse, ServiceError> {
+        self.authorize(sender).await?;
+        if activation_json.len() > super::MAX_ACTIVATION_JSON_BYTES {
+            return Err(ServiceError::PlanTooLarge {
+                actual: activation_json.len(),
+                maximum: super::MAX_ACTIVATION_JSON_BYTES,
+            });
+        }
+        let activation: RuntimeActivation = serde_json::from_str(activation_json)
+            .map_err(|error| ServiceError::InvalidPlanJson(error.to_string()))?;
+        self.run_backend(move |backend| backend.activate_runtime(&activation, uid, &topology, now))
+            .await
+    }
+
+    /// Kernel-event refresh. Deliberately unauthorized and not exposed on the
+    /// bus: it can only recompile the stored, already authorized policy.
+    pub async fn refresh_runtime(
+        &self,
+        topology: TopologySnapshot,
+        now: Duration,
+    ) -> Result<RuntimeStatus, ServiceError> {
+        self.run_backend(move |backend| backend.refresh_runtime(&topology, now))
+            .await
+    }
+
+    pub async fn restore_runtime(
+        &self,
+        sender: Option<&str>,
+        token: String,
+        uid: u32,
+    ) -> Result<RuntimeStatus, ServiceError> {
+        self.authorize(sender).await?;
+        self.run_backend(move |backend| backend.restore_runtime(&token, uid))
+            .await
     }
 
     pub async fn authorize_mutation(&self, sender: Option<&str>) -> Result<(), ServiceError> {
@@ -4697,6 +5452,7 @@ mod tests {
     fn fake_flag_route(spec: &CommandSpec) -> bool {
         spec.family == Some(IpFamily::V4)
             && spec.args.windows(2).any(|pair| pair == ["table", "20000"])
+            && spec.args.windows(2).any(|pair| pair == ["dev", "wg0"])
             && !spec.args.iter().any(|argument| argument == "unreachable")
     }
 
@@ -7664,5 +8420,664 @@ mod tests {
             "pending": null,
         });
         assert!(super::decode_journal(&serde_json::to_vec(&mixed).unwrap()).is_err());
+    }
+
+    // ----- Runtime authority (plan Task 8) -----
+
+    #[derive(Clone)]
+    struct LooseRpf(
+        Arc<Mutex<std::collections::BTreeMap<String, crate::backend::InterfaceIdentity>>>,
+    );
+
+    impl super::MarkAwareRpfBackend for LooseRpf {
+        fn identity(
+            &mut self,
+            name: &str,
+        ) -> Result<crate::backend::InterfaceIdentity, PrivilegedError> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(name)
+                .cloned()
+                .ok_or_else(|| PrivilegedError::new("interface no longer exists"))
+        }
+        fn rp_filter(&mut self, _: &str) -> Result<u8, PrivilegedError> {
+            Ok(0)
+        }
+        fn src_valid_mark(&mut self, _: &str) -> Result<u8, PrivilegedError> {
+            Ok(0)
+        }
+        fn set_src_valid_mark(
+            &mut self,
+            _: &crate::backend::InterfaceIdentity,
+            _: u8,
+        ) -> Result<(), PrivilegedError> {
+            panic!("loose reverse-path filtering needs no interface write")
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeEnvironment(Arc<Mutex<(String, u64, u32)>>);
+
+    impl Default for FakeEnvironment {
+        fn default() -> Self {
+            Self(Arc::new(Mutex::new((
+                "00000000-0000-4000-8000-000000000001".to_owned(),
+                4026531840,
+                0,
+            ))))
+        }
+    }
+
+    impl super::RuntimeEnvironment for FakeEnvironment {
+        fn boot_id(&mut self) -> Result<String, PrivilegedError> {
+            Ok(self.0.lock().unwrap().0.clone())
+        }
+        fn network_namespace(&mut self) -> Result<u64, PrivilegedError> {
+            Ok(self.0.lock().unwrap().1)
+        }
+        fn new_token(&mut self) -> Result<String, PrivilegedError> {
+            let mut state = self.0.lock().unwrap();
+            state.2 += 1;
+            Ok(format!("token-{}", state.2))
+        }
+    }
+
+    /// `eth`/`usb` give the interface index when its link is up and routed.
+    fn runtime_topology(
+        eth: Option<u32>,
+        usb: Option<u32>,
+        eth_index: u32,
+    ) -> crate::backend::TopologySnapshot {
+        let link = |index: u32, name: &str, up: bool| {
+            serde_json::json!({"ifindex": index, "ifname": name,
+                "flags": if up { vec!["UP", "LOWER_UP"] } else { vec!["UP"] },
+                "operstate": if up { "UP" } else { "DOWN" }})
+        };
+        let links = serde_json::json!([
+            link(eth.unwrap_or(eth_index), "eth0", eth.is_some()),
+            link(usb.unwrap_or(3), "usb0", usb.is_some()),
+            link(4, "third0", true),
+        ]);
+        let address = |index: u32, name: &str, v4: &str, v6: &str| {
+            serde_json::json!({"ifindex": index, "ifname": name, "addr_info": [
+                {"family": "inet", "local": v4, "scope": "global"},
+                {"family": "inet6", "local": v6, "scope": "global"}]})
+        };
+        let addresses = serde_json::json!([
+            address(
+                eth.unwrap_or(eth_index),
+                "eth0",
+                "10.0.0.2",
+                "2001:db8:1::2"
+            ),
+            address(usb.unwrap_or(3), "usb0", "192.168.0.2", "2001:db8:2::2"),
+            address(4, "third0", "172.16.0.2", "2001:db8:3::2"),
+        ]);
+        let mut v4 = vec![
+            serde_json::json!({"dst":"default","dev":"third0","gateway":"172.16.0.1","metric":300}),
+        ];
+        let mut v6 = vec![
+            serde_json::json!({"dst":"default","dev":"third0","gateway":"2001:db8:3::1","metric":300}),
+        ];
+        if eth.is_some() {
+            v4.push(
+                serde_json::json!({"dst":"default","dev":"eth0","gateway":"10.0.0.1","metric":100}),
+            );
+            v6.push(serde_json::json!({"dst":"default","dev":"eth0","gateway":"2001:db8:1::1","metric":100}));
+        }
+        if usb.is_some() {
+            v4.push(serde_json::json!({"dst":"default","dev":"usb0","gateway":"192.168.0.1","metric":1}));
+            v6.push(serde_json::json!({"dst":"default","dev":"usb0","gateway":"2001:db8:2::1","metric":1}));
+        }
+        crate::backend::parse_topology(crate::backend::TopologyInput {
+            links: links.to_string().as_bytes(),
+            addresses: addresses.to_string().as_bytes(),
+            routes_v4: serde_json::to_string(&v4).unwrap().as_bytes(),
+            routes_v6: serde_json::to_string(&v6).unwrap().as_bytes(),
+            rules_v4: b"[]",
+            rules_v6: b"[]",
+        })
+        .unwrap()
+    }
+
+    fn up() -> crate::backend::TopologySnapshot {
+        runtime_topology(Some(2), Some(3), 2)
+    }
+
+    fn ethernet_down() -> crate::backend::TopologySnapshot {
+        runtime_topology(None, Some(3), 2)
+    }
+
+    fn runtime_profile() -> crate::domain::Profile {
+        use crate::domain::{InterfaceSelector, Lane, PrimarySelection, Profile, RoutingPolicy};
+        Profile {
+            id: ProfileId::from("office"),
+            name: "Office".into(),
+            enabled: true,
+            rules: vec![],
+            routing: RoutingPolicy {
+                primary: PrimarySelection::Lane("ethernet".into()),
+                backups: vec!["vinn".into()],
+                automatic_failover: true,
+            },
+            lanes: [("ethernet", "eth0"), ("vinn", "usb0")]
+                .into_iter()
+                .map(|(id, interface)| Lane {
+                    id: LaneId::from(id),
+                    name: id.to_owned(),
+                    interface: InterfaceSelector::from(interface),
+                    fallback_lane: None,
+                    failure_policy: LaneFailurePolicy::Block,
+                })
+                .collect(),
+        }
+    }
+
+    fn activation(expected_generation: u64) -> super::RuntimeActivation {
+        super::RuntimeActivation {
+            protocol_version: super::RUNTIME_PROTOCOL_VERSION,
+            profile: runtime_profile(),
+            resolutions: crate::backend::ResolutionSnapshot::empty(),
+            expected_generation,
+        }
+    }
+
+    struct RuntimeFixture {
+        kernel: Arc<Mutex<FakeKernelState>>,
+        store: FakeAppliedStateStore,
+        environment: FakeEnvironment,
+        identities:
+            Arc<Mutex<std::collections::BTreeMap<String, crate::backend::InterfaceIdentity>>>,
+    }
+
+    impl RuntimeFixture {
+        fn new() -> Self {
+            Self {
+                kernel: Arc::new(Mutex::new(FakeKernelState::default())),
+                store: FakeAppliedStateStore::default(),
+                environment: FakeEnvironment::default(),
+                identities: Arc::default(),
+            }
+        }
+
+        fn backend(&self) -> CommandPrivilegedBackend<FakeCommandExecutor, FakeAppliedStateStore> {
+            CommandPrivilegedBackend::with_store(
+                FakeCommandExecutor {
+                    state: Arc::clone(&self.kernel),
+                },
+                self.store.clone(),
+            )
+            .with_interface_settings(LooseRpf(Arc::clone(&self.identities)))
+            .with_runtime_environment(self.environment.clone())
+        }
+
+        /// The kernel as it is when `topology` is observed.
+        fn observe(
+            &self,
+            topology: &crate::backend::TopologySnapshot,
+        ) -> crate::backend::TopologySnapshot {
+            *self.identities.lock().unwrap() = topology.interface_identities();
+            topology.clone()
+        }
+
+        /// The kernel deletes a lane's unicast defaults on link loss.
+        fn drop_unicast(&self, table: u32) {
+            self.kernel
+                .lock()
+                .unwrap()
+                .extra_routes
+                .retain(|(_, route)| route["table"] != table || route.get("type").is_some());
+        }
+
+        fn mutations(&self) -> usize {
+            mutation_count(&self.kernel.lock().unwrap())
+        }
+
+        fn unicast_devices(&self) -> Vec<String> {
+            let kernel = self.kernel.lock().unwrap();
+            let mut devices = kernel
+                .extra_routes
+                .iter()
+                .filter(|(_, route)| route.get("type").is_none())
+                .map(|(_, route)| route["dev"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            devices.sort();
+            devices
+        }
+    }
+
+    fn effective(status: &super::RuntimeStatus) -> crate::backend::FamilyExit {
+        status.decision.as_ref().unwrap().effective.v4.clone()
+    }
+
+    fn lane_exit(id: &str) -> crate::backend::FamilyExit {
+        crate::backend::FamilyExit::Lane(LaneId::from(id))
+    }
+
+    #[tokio::test]
+    async fn expired_polkit_cache_does_not_block_authorized_failover() {
+        let fixture = RuntimeFixture::new();
+        let events = Arc::new(Mutex::new(vec![]));
+        let service = PrivilegedService::new(
+            FakeAuthorizer {
+                result: Ok(()),
+                events: Arc::clone(&events),
+            },
+            fixture.backend(),
+        );
+        let activated = service
+            .activate_runtime(
+                Some(":1.7"),
+                &serde_json::to_string(&activation(0)).unwrap(),
+                1000,
+                fixture.observe(&up()),
+                Duration::from_secs(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(effective(&activated.status), lane_exit("ethernet"));
+        assert_eq!(activated.status.phase, super::RuntimePhase::Armed);
+
+        // Polkit's cache has expired: any further authorization would fail.
+        let failover = service
+            .refresh_runtime(fixture.observe(&ethernet_down()), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(effective(&failover), lane_exit("vinn"));
+        let waiting = service
+            .refresh_runtime(fixture.observe(&up()), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(effective(&waiting), lane_exit("vinn"), "failback waits 5s");
+        let failback = service
+            .refresh_runtime(fixture.observe(&up()), Duration::from_millis(7_100))
+            .await
+            .unwrap();
+        assert_eq!(effective(&failback), lane_exit("ethernet"));
+        let authorization_calls = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| **event == "authorize")
+            .count();
+        assert_eq!(authorization_calls, 1);
+        assert_eq!(failback.grant, activated.status.grant, "policy unchanged");
+    }
+
+    #[test]
+    fn grant_cannot_add_lane_rule_or_uid() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        let armed = backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        // A new OS default and an unknown interface do not widen the grant.
+        let status = backend
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1))
+            .unwrap();
+        let plan = backend.inspect().unwrap().applied_plan.unwrap();
+        assert_eq!(plan.lanes.len(), 2);
+        assert!(plan.rules.is_empty());
+        assert!(!plan.lanes.iter().any(|lane| lane.interface == "third0"));
+        assert_eq!(status.grant, armed.status.grant);
+        assert_eq!(status.grant.as_ref().unwrap().owner_uid, 1000);
+        let error = backend
+            .restore_runtime(&armed.rollback_receipt, 1001)
+            .unwrap_err();
+        assert!(error.to_string().contains("does not belong to this caller"));
+    }
+
+    #[test]
+    fn same_name_new_ifindex_needs_rearm() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.unicast_devices(),
+            vec!["eth0", "eth0", "usb0", "usb0"]
+        );
+        // eth0 was unplugged and a different device now carries the name.
+        fixture.drop_unicast(20_000);
+        let replaced = runtime_topology(Some(9), Some(3), 9);
+        let status = backend
+            .refresh_runtime(&fixture.observe(&replaced), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(status.phase, super::RuntimePhase::Armed);
+        assert_eq!(effective(&status), lane_exit("vinn"));
+        let plan = backend.inspect().unwrap().applied_plan.unwrap();
+        let ethernet = plan
+            .lanes
+            .iter()
+            .find(|lane| lane.id.as_str() == "ethernet")
+            .unwrap();
+        assert_eq!(ethernet.availability, LaneAvailability::Unavailable);
+        assert_eq!(fixture.unicast_devices(), vec!["usb0", "usb0"]);
+        // Time passing does not adopt the replacement device either.
+        let later = backend
+            .refresh_runtime(&fixture.observe(&replaced), Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(effective(&later), lane_exit("vinn"));
+    }
+
+    #[test]
+    fn self_generated_route_events_do_not_reapply() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        let armed = backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        let applies_before = fixture.mutations();
+        for second in 0..100 {
+            let status = backend
+                .refresh_runtime(&fixture.observe(&up()), Duration::from_secs(second))
+                .unwrap();
+            assert_eq!(status.generation, armed.status.generation);
+        }
+        let applies_after = fixture.mutations();
+        assert_eq!(applies_after, applies_before);
+    }
+
+    #[test]
+    fn deactivate_cancels_queued_refresh() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        backend.cleanup().unwrap();
+        let mutations = fixture.mutations();
+        let status = backend
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(status.phase, super::RuntimePhase::Inactive);
+        assert_eq!(fixture.mutations(), mutations);
+        assert!(fixture.store.state.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn restart_requires_exact_grant_journal_and_kernel_match() {
+        let fixture = RuntimeFixture::new();
+        fixture
+            .backend()
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+
+        // Another boot or namespace: frozen, no mutation.
+        fixture.environment.0.lock().unwrap().0 = "00000000-0000-4000-8000-000000000002".into();
+        let mutations = fixture.mutations();
+        let mut restarted = fixture.backend();
+        let frozen = restarted
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(frozen.phase, super::RuntimePhase::NeedsReauthorization);
+        assert_eq!(fixture.mutations(), mutations);
+
+        // Same boot and namespace, but the kernel no longer matches exactly.
+        fixture.environment.0.lock().unwrap().0 = "00000000-0000-4000-8000-000000000001".into();
+        fixture.kernel.lock().unwrap().extra_nft_rule = true;
+        let mut restarted = fixture.backend();
+        let drifted = restarted
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(drifted.phase, super::RuntimePhase::NeedsReauthorization);
+        assert_eq!(fixture.mutations(), mutations);
+
+        // Exact match resumes and keeps failing over without authorization.
+        fixture.kernel.lock().unwrap().extra_nft_rule = false;
+        let mut restarted = fixture.backend();
+        let resumed = restarted
+            .refresh_runtime(&fixture.observe(&up()), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(resumed.phase, super::RuntimePhase::Armed);
+        fixture.drop_unicast(20_000);
+        let failover = restarted
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(effective(&failover), lane_exit("vinn"));
+    }
+
+    #[test]
+    fn journaled_policy_changed_without_its_grant_is_frozen() {
+        let fixture = RuntimeFixture::new();
+        fixture
+            .backend()
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        // A widened profile written into the root journal without re-authorization.
+        {
+            let mut journal = fixture.store.state.lock().unwrap();
+            let runtime = journal.as_mut().unwrap().runtime.as_mut().unwrap();
+            runtime.profile.routing.backups.clear();
+        }
+        let mutations = fixture.mutations();
+        let status = fixture
+            .backend()
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(status.phase, super::RuntimePhase::NeedsReauthorization);
+        assert_eq!(fixture.mutations(), mutations);
+    }
+
+    #[test]
+    fn journal_failure_does_not_publish_new_decision() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        let armed = backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        fixture.drop_unicast(20_000);
+        *fixture.store.fail_commit_generation.lock().unwrap() = Some(2);
+        let failed = backend
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(failed.phase, super::RuntimePhase::Degraded);
+        assert_eq!(failed.generation, armed.status.generation);
+        assert_eq!(failed.decision, armed.status.decision);
+        assert!(failed.last_error.unwrap().contains("state commit failed"));
+        // The rollback did not resurrect the unicast route the kernel removed.
+        assert_eq!(fixture.unicast_devices(), vec!["usb0", "usb0"]);
+
+        let retried = backend
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(retried.phase, super::RuntimePhase::Armed);
+        assert_eq!(effective(&retried), lane_exit("vinn"));
+    }
+
+    #[test]
+    fn restore_receipt_cannot_roll_back_newer_transition_or_expand_scope() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        let first = backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        fixture.drop_unicast(20_000);
+        backend
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1))
+            .unwrap();
+        let error = backend
+            .restore_runtime(&first.rollback_receipt, 1000)
+            .unwrap_err();
+        assert!(error.to_string().contains("superseded"));
+
+        let mut narrower = activation(2);
+        narrower.profile.routing.backups.clear();
+        let second = backend
+            .activate_runtime(
+                &narrower,
+                1000,
+                &fixture.observe(&ethernet_down()),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(backend.restore_runtime("forged", 1000).is_err());
+        assert!(backend
+            .restore_runtime(&second.rollback_receipt, 1001)
+            .is_err());
+        let restored = backend
+            .restore_runtime(&second.rollback_receipt, 1000)
+            .unwrap();
+        assert_eq!(
+            restored.grant, first.status.grant,
+            "previous record, not a new one"
+        );
+        assert!(
+            backend
+                .restore_runtime(&second.rollback_receipt, 1000)
+                .is_err(),
+            "single use"
+        );
+    }
+
+    #[test]
+    fn kernel_removed_route_of_a_ready_lane_is_not_link_loss() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        fixture.drop_unicast(20_000);
+        let mutations = fixture.mutations();
+        // Topology still shows ethernet ready: an administrator deleted it.
+        let status = backend
+            .refresh_runtime(&fixture.observe(&up()), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(status.phase, super::RuntimePhase::Degraded);
+        assert!(status.last_error.unwrap().contains("incomplete"));
+        assert_eq!(fixture.mutations(), mutations);
+    }
+
+    #[test]
+    fn helper1_mutations_are_refused_while_runtime_is_armed() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        let armed = backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        let mut plan = armed.plan.clone();
+        plan.generation += 1;
+        assert!(backend
+            .apply(&plan)
+            .unwrap_err()
+            .to_string()
+            .contains("runtime authority is armed"));
+        assert!(backend.restore(&plan, None).is_err());
+        assert_eq!(
+            backend.inspect().unwrap().runtime.phase,
+            super::RuntimePhase::Armed
+        );
+    }
+
+    #[tokio::test]
+    async fn application_prepare_and_adopt_remain_authorized() {
+        let fixture = RuntimeFixture::new();
+        let events = Arc::new(Mutex::new(vec![]));
+        let service = PrivilegedService::new(
+            FakeAuthorizer {
+                result: Err(AuthorizationError::Denied),
+                events: Arc::clone(&events),
+            },
+            fixture.backend(),
+        );
+        assert!(service.authorize_mutation(Some(":1.9")).await.is_err());
+        assert!(service
+            .activate_runtime(
+                Some(":1.9"),
+                &serde_json::to_string(&activation(0)).unwrap(),
+                1000,
+                up(),
+                Duration::ZERO
+            )
+            .await
+            .is_err());
+        assert!(service
+            .restore_runtime(Some(":1.9"), "token-1".into(), 1000)
+            .await
+            .is_err());
+        assert_eq!(events.lock().unwrap().len(), 3);
+        assert_eq!(fixture.mutations(), 0);
+    }
+
+    #[test]
+    fn runtime_journal_fits_the_bounded_state_file() {
+        use crate::domain::{InterfaceSelector, Lane};
+        let mut profile = runtime_profile();
+        profile.lanes = (0..100)
+            .map(|index| Lane {
+                id: LaneId::from(format!("lane-{index}").as_str()),
+                name: format!("lane {index}"),
+                interface: InterfaceSelector::from(format!("eth{index}").as_str()),
+                fallback_lane: None,
+                failure_policy: LaneFailurePolicy::Block,
+            })
+            .collect();
+        profile.routing.primary = crate::domain::PrimarySelection::FollowSystemDefault;
+        profile.routing.backups = vec![];
+        let activation = super::RuntimeActivation {
+            protocol_version: super::RUNTIME_PROTOCOL_VERSION,
+            profile,
+            resolutions: crate::backend::ResolutionSnapshot::empty(),
+            expected_generation: 0,
+        };
+        let size = serde_json::to_vec(&activation).unwrap().len();
+        assert!(size <= crate::backend::MAX_ACTIVATION_JSON_BYTES);
+        assert!(
+            super::MAX_STATE_BYTES
+                >= 3 * MAX_PLAN_JSON_BYTES as u64 + 3 * super::MAX_RUNTIME_RECORD_BYTES,
+            "a journal holds three bounded plans and three bounded runtime records"
+        );
     }
 }
