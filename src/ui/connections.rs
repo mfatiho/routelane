@@ -312,9 +312,6 @@ fn system_default_interface() -> Option<String> {
 
 /// What the primary controls were last rendered from.
 type PrimaryRenderKey = (RoutingPolicy, Vec<Lane>, Option<String>);
-/// The live profile and save path the backup controls write through.
-type PrimarySave = (Rc<RefCell<Profile>>, Rc<dyn Fn(Profile) -> bool>);
-
 /// Primary connection, ordered backups and automatic failover.
 struct PrimaryControls {
     group: adw::PreferencesGroup,
@@ -327,10 +324,14 @@ struct PrimaryControls {
     system_default: RefCell<Option<String>>,
     change: RefCell<PrimaryChange>,
     feedback: gtk::Label,
+    texts: Texts,
+    /// Every control writes through the live profile and the page's save path.
+    live: Rc<RefCell<Profile>>,
+    on_save: Rc<dyn Fn(Profile) -> bool>,
 }
 
 impl PrimaryControls {
-    fn new(texts: Texts) -> Self {
+    fn new(texts: Texts, live: Rc<RefCell<Profile>>, on_save: Rc<dyn Fn(Profile) -> bool>) -> Self {
         let group = adw::PreferencesGroup::builder()
             .title(texts.primary.title)
             .description(texts.primary.description)
@@ -369,6 +370,9 @@ impl PrimaryControls {
             system_default: RefCell::new(None),
             change: RefCell::new(PrimaryChange::default()),
             feedback,
+            texts,
+            live,
+            on_save,
         }
     }
 
@@ -437,6 +441,11 @@ impl ConnectionsPage {
         profile: Rc<RefCell<Profile>>,
         on_save: Rc<dyn Fn(Profile) -> bool>,
     ) -> Self {
+        let primary = Rc::new(PrimaryControls::new(
+            texts,
+            profile.clone(),
+            on_save.clone(),
+        ));
         let page = Self {
             list: ListPage::new(texts, Section::Connections),
             profile,
@@ -445,7 +454,7 @@ impl ConnectionsPage {
             on_save,
             rows: Rc::new(RefCell::new(vec![])),
             rendered: Rc::new(RefCell::new(None)),
-            primary: Rc::new(PrimaryControls::new(texts)),
+            primary,
         };
         // Below the connection list: Add stays the first control of the page.
         page.list.root.append(&page.primary.group);
@@ -487,12 +496,10 @@ impl ConnectionsPage {
             sender.send_blocking(system_default_interface()).ok();
         });
         let controls = self.primary.clone();
-        let profile = self.profile.clone();
-        let texts = self.texts;
         glib::MainContext::ref_thread_default().spawn_local(async move {
             if let Ok(default) = receiver.recv().await {
                 *controls.system_default.borrow_mut() = default;
-                render_primary(&controls, texts, &profile.borrow());
+                render_primary(&controls);
             }
         });
     }
@@ -556,16 +563,15 @@ impl ConnectionsPage {
                     controls.feedback.set_visible(!saved);
                     // A failed or stale save shows the stored preference again.
                     controls.rendered.borrow_mut().take();
-                    render_primary(&controls, texts, &profile.borrow());
+                    render_primary(&controls);
                 })
             };
             let cancel = {
                 let controls = controls.clone();
-                let profile = profile.clone();
                 Rc::new(move || {
                     controls.change.borrow_mut().cancel();
                     controls.rendered.borrow_mut().take();
-                    render_primary(&controls, texts, &profile.borrow());
+                    render_primary(&controls);
                 })
             };
             confirm_destructive_action_with_label(
@@ -579,18 +585,16 @@ impl ConnectionsPage {
             );
         });
         let controls = self.primary.clone();
-        let profile = self.profile.clone();
-        let on_save = self.on_save.clone();
         self.primary.automatic.connect_state_set(move |_, enabled| {
             if controls.updating.get() {
                 return glib::signal::Inhibit(false);
             }
-            let current = profile.borrow().clone();
+            let current = controls.live.borrow().clone();
             let draft = PrimaryDraft {
                 automatic_failover: enabled,
                 ..PrimaryDraft::of(&current)
             };
-            save_primary_draft(&controls, &current, &draft, on_save.as_ref());
+            save_primary_draft(&controls, &current, &draft);
             glib::signal::Inhibit(false)
         });
     }
@@ -600,13 +604,7 @@ impl ConnectionsPage {
         self.list.group.set_sensitive(editing_enabled);
         self.primary.group.set_sensitive(editing_enabled);
         self.primary.backups.set_sensitive(editing_enabled);
-        render_primary_with(
-            &self.primary,
-            self.texts,
-            &self.profile.borrow(),
-            self.profile.clone(),
-            self.on_save.clone(),
-        );
+        render_primary(&self.primary);
         let profile = self.profile.borrow().clone();
         if self.rendered.borrow().as_ref() == Some(&profile.lanes) {
             return;
@@ -709,40 +707,29 @@ impl ConnectionsPage {
     }
 }
 
-fn save_primary_draft(
-    controls: &PrimaryControls,
-    current: &Profile,
-    draft: &PrimaryDraft,
-    on_save: &dyn Fn(Profile) -> bool,
-) {
+/// Saves a validated policy edit; on failure shows why and re-renders the
+/// stored policy so no control claims a state the configuration lacks.
+fn save_primary_draft(controls: &Rc<PrimaryControls>, current: &Profile, draft: &PrimaryDraft) {
     let saved = validate_primary_draft(current, draft)
         .ok()
-        .is_some_and(on_save);
+        .is_some_and(|candidate| (controls.on_save)(candidate));
+    controls
+        .feedback
+        .set_label(controls.texts.ux.request_failed);
     controls.feedback.set_visible(!saved);
-}
-
-fn render_primary(controls: &Rc<PrimaryControls>, texts: Texts, profile: &Profile) {
-    render_primary_inner(controls, texts, profile, None);
-}
-
-fn render_primary_with(
-    controls: &Rc<PrimaryControls>,
-    texts: Texts,
-    profile: &Profile,
-    live: Rc<RefCell<Profile>>,
-    on_save: Rc<dyn Fn(Profile) -> bool>,
-) {
-    render_primary_inner(controls, texts, profile, Some((live, on_save)));
+    if !saved {
+        controls.rendered.borrow_mut().take();
+        let controls = controls.clone();
+        glib::idle_add_local_once(move || render_primary(&controls));
+    }
 }
 
 /// Rebuilds the controls only when the policy, lanes or OS default changed;
 /// programmatic selection never triggers the change dialog.
-fn render_primary_inner(
-    controls: &Rc<PrimaryControls>,
-    texts: Texts,
-    profile: &Profile,
-    save: Option<PrimarySave>,
-) {
+fn render_primary(controls: &Rc<PrimaryControls>) {
+    let profile = controls.live.borrow().clone();
+    let profile = &profile;
+    let texts = controls.texts;
     let key = (
         profile.routing.clone(),
         profile.lanes.clone(),
@@ -799,6 +786,7 @@ fn render_primary_inner(
             .valign(gtk::Align::Center)
             .build();
         check.update_property(&[gtk::accessible::Property::Label(&lane.name)]);
+        check.set_widget_name(&format!("primary-backup-{}", lane.id.as_str()));
         let row = adw::ActionRow::builder()
             .title(&glib::markup_escape_text(&lane.name))
             .subtitle(lane.interface.as_str())
@@ -828,17 +816,15 @@ fn render_primary_inner(
         }
         row.add_suffix(&up);
         row.add_suffix(&down);
-        if let Some((live, on_save)) = save.clone() {
+        {
             let change = |offset: Option<isize>, toggle: bool| {
                 let controls = controls.clone();
-                let live = live.clone();
-                let on_save = on_save.clone();
                 let id = id.clone();
                 move || {
                     if controls.updating.get() {
                         return;
                     }
-                    let current = live.borrow().clone();
+                    let current = controls.live.borrow().clone();
                     let mut backups = current.routing.backups.clone();
                     let index = backups.iter().position(|other| other == &id);
                     match (toggle, index, offset) {
@@ -858,7 +844,7 @@ fn render_primary_inner(
                         backups,
                         ..PrimaryDraft::of(&current)
                     };
-                    save_primary_draft(&controls, &current, &draft, on_save.as_ref());
+                    save_primary_draft(&controls, &current, &draft);
                 }
             };
             let toggled = change(None, true);

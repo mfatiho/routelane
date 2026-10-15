@@ -1834,6 +1834,30 @@ mod tests {
             requests.try_recv().is_err(),
             "an inactive profile is saved without activating routing"
         );
+        // Backup controls stay live after the primary change re-rendered them.
+        // Editing is disabled while a save is in flight; rows rebuild after it.
+        let settled = |name: &str| {
+            let mut found = None;
+            wait_for(|| {
+                found =
+                    find_named(window.upcast_ref(), name).filter(|widget| widget.is_sensitive());
+                found.is_some()
+            });
+            found.unwrap()
+        };
+        let backup = settled("primary-backup-vinn")
+            .downcast::<gtk::CheckButton>()
+            .unwrap();
+        assert!(backup.is_active());
+        backup.set_active(false);
+        drain();
+        wait_for(|| saved_primary().backups.is_empty());
+        let automatic = settled("primary-automatic")
+            .downcast::<gtk::Switch>()
+            .unwrap();
+        automatic.set_active(false);
+        drain();
+        wait_for(|| !saved_primary().automatic_failover);
         window.destroy();
         drain();
 
