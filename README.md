@@ -86,6 +86,22 @@ RouteLane never asks for or stores a sudo password. Polkit controls the
 authorization lifetime, and a missing desktop Polkit agent yields
 `NeedsAuthorization` rather than silent escalation.
 
+### Primary connection and automatic failover
+
+In Connections, choose which connection carries traffic that no rule assigns,
+or keep following the system default, and order the approved backups.
+Changing the primary asks for confirmation; Cancel and Escape change nothing.
+Enabling the profile requests one Polkit authorization that covers exactly
+that policy, those connections and that user for the current boot. If the
+primary loses carrier, its address or its default route, the helper sends new
+connections through the first available backup without another prompt, and
+returns to the primary once it has been stable for five seconds. Any change
+to the policy, the connections or the user needs a fresh authorization. An
+address family with no available approved connection is blocked instead of
+leaving through another interface. Existing connections are not moved.
+Overview shows the saved preference separately from the verified effective
+connection.
+
 ## Build
 
 Build requirements:
@@ -115,8 +131,9 @@ The four binaries are:
 
 The script builds in a private temporary root, creates a uniquely named
 artifact under `dist/`, and verifies required paths, modes, and root ownership.
-Its runtime dependencies include `nftables`, `iproute2`, `policykit-1`, `dbus`,
-and `systemd`, in addition to GTK/Libadwaita.
+Its runtime dependencies include `nftables`, `iproute2`, `polkitd` (or
+`policykit-1` on Ubuntu 22.04), `dbus`, and `systemd`, in addition to
+GTK/Libadwaita.
 
 This `.deb` is a Phase 1 development-verification artifact. Producing it does
 not by itself establish official Ubuntu, Debian, or Fedora release support, and
@@ -134,6 +151,19 @@ Installed integration files:
 | `/usr/lib/systemd/system/routelane-helper.service` | D-Bus-activated system service |
 | `/usr/share/dbus-1/system-services/io.github.routelane.Helper.service` | D-Bus activation |
 | `/usr/share/polkit-1/actions/io.github.routelane.policy` | Polkit policy |
+
+## Development `.rpm`
+
+```bash
+./packaging/rpm/build-rpm.sh
+```
+
+Run it on Fedora with `rpm-build`, `cargo`, and the GTK4/Libadwaita
+development packages. The rpm installs the same files, modes, and lifecycle
+scripts as the `.deb`, with `polkit`, `nftables`, `iproute`, `dbus`, and
+`systemd` as runtime dependencies, and is written under a unique name in
+`dist/`. Building it is not a Fedora validation result; current evidence and
+NOT VERIFIED rows are in `docs/primary-failover-verification.md`.
 
 ## Phase 1 usage
 

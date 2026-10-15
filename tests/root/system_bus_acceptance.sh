@@ -2,7 +2,8 @@
 # Real system-bus/Polkit acceptance for RouteLane runtime authority
 # (docs/primary-failover-verification.md). ONLY for an authorized disposable
 # VM: it installs the package and adds a test user and Polkit rule.
-# Usage: ROUTELANE_DISPOSABLE_VM=$(hostname) sh system_bus_acceptance.sh PKG.deb
+# Usage: ROUTELANE_DISPOSABLE_VM=$(hostname) sh system_bus_acceptance.sh PKG.deb [NEWER.deb]
+# With NEWER.deb an armed runtime is also upgraded in place.
 # Every change is VM-local and removed by the EXIT trap: test user, Polkit
 # rule and marker, a /run systemd drop-in that confines the real helper
 # service to a run-owned network namespace, the namespaces, and the package.
@@ -10,6 +11,7 @@ set -eu
 [ "$(id -u)" = 0 ]
 [ "${ROUTELANE_DISPOSABLE_VM:-}" = "$(hostname)" ] || { echo "refusing: set ROUTELANE_DISPOSABLE_VM to this disposable VM hostname" >&2; exit 2; }
 DEB=$1
+UPGRADE_DEB=${2:-}
 TOK=sb$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')
 NS_C=routelane-test-$TOK-client
 NS_GA=routelane-test-$TOK-gwa
@@ -21,6 +23,8 @@ CC=rl${TOK}cc; GCC=rl${TOK}gcc; GCS=rl${TOK}gcs; SC=rl${TOK}sc
 DROPIN=/run/systemd/system/routelane-helper.service.d
 RULE=/etc/polkit-1/rules.d/49-routelane-test.rules
 MARKER=/run/routelane-test-allow
+# polkit 0.105 (Ubuntu 22.04) reads .pkla files instead of JavaScript rules.
+PKLA=/etc/polkit-1/localauthority/50-local.d/49-routelane-test.pkla
 TESTUSER=rltest
 OTHERUSER=rlother
 BUS="busctl --system --json=short"
@@ -35,7 +39,7 @@ teardown() {
     set +e
     for pid in $PIDS; do kill "$pid" 2>/dev/null; done
     systemctl stop routelane-helper.service 2>/dev/null
-    rm -rf "$DROPIN"; rm -f "$RULE" "$MARKER"
+    rm -rf "$DROPIN"; rm -f "$RULE" "$MARKER" "$PKLA"
     systemctl daemon-reload
     for ns in $NS_C $NS_GA $NS_GC $NS_SA $NS_SC; do ip netns del "$ns" 2>/dev/null; done
     for user in $TESTUSER $OTHERUSER; do
@@ -50,7 +54,7 @@ teardown() {
 trap teardown EXIT
 
 DEBIAN_FRONTEND=noninteractive apt-get install -y "$DEB" >/tmp/routelane-apt.log 2>&1 || { tail /tmp/routelane-apt.log; fail "package install"; }
-say "installed $(dpkg-query -W -f='${Package} ${Version}' routelane); systemd $(systemctl --version | head -1 | cut -d' ' -f2); polkit $(dpkg-query -W -f='${Version}' polkitd 2>/dev/null || echo ?); nft $(nft --version | cut -d' ' -f2); kernel $(uname -r)"
+say "installed $(dpkg-query -W -f='${Package} ${Version}' routelane); systemd $(systemctl --version | head -1 | cut -d' ' -f2); polkit $(pkaction --version | awk '{print $NF}'); nft $(nft --version | cut -d' ' -f2); kernel $(uname -r)"
 
 # --- topology: client with lanes A (primary) and C (backup) -------------------
 for ns in $NS_C $NS_GA $NS_GC $NS_SA $NS_SC; do ip netns add "$ns"; ip -n "$ns" link set lo up; done
@@ -89,7 +93,14 @@ printf '[Service]\nNetworkNamespacePath=/run/netns/%s\n' "$NS_C" > "$DROPIN/50-t
 systemctl daemon-reload
 useradd -m "$TESTUSER"
 useradd -m "$OTHERUSER"
-cat > "$RULE" <<EOF
+if pkaction --version | grep -q ' 0\.105'; then
+    allow() {
+        printf '[routelane test]\nIdentity=unix-user:%s\nAction=io.github.routelane.apply\nResultAny=yes\nResultInactive=yes\nResultActive=yes\n' "$TESTUSER" > "$PKLA"
+        sleep 2
+    }
+    withdraw() { rm -f "$PKLA"; sleep 2; }
+else
+    cat > "$RULE" <<EOF
 polkit.addRule(function(action, subject) {
     if (action.id == "io.github.routelane.apply" && subject.user == "$TESTUSER") {
         try { polkit.spawn(["/usr/bin/test", "-e", "$MARKER"]); return polkit.Result.YES; }
@@ -97,6 +108,9 @@ polkit.addRule(function(action, subject) {
     }
 });
 EOF
+    allow() { touch "$MARKER"; }
+    withdraw() { rm -f "$MARKER"; }
+fi
 sleep 1
 as_user() { sudo -u "$TESTUSER" "$@"; }
 activation() { # backups-json [extra-interface]
@@ -116,7 +130,7 @@ d=json.loads(json.loads(sys.stdin.read())["data"][0])
 for k in sys.argv[1].split("."): d=d[k] if not isinstance(d,list) else d[int(k)]
 print(json.dumps(d))' "$1"; }
 
-touch "$MARKER"
+allow
 ARMED=$(as_user $BUS call $DEST ActivateRuntime s "$(activation '["lane-c"]')") || fail "authorized activation"
 [ "$(echo "$ARMED" | field status.phase)" = '"Armed"' ] || fail "activation not armed: $ARMED"
 say "activation as $TESTUSER armed: effective $(echo "$ARMED" | field status.decision.effective.v4)"
@@ -126,7 +140,7 @@ say "real service pid $HELPER runs in run-owned netns $NS_C; sandbox wrote src_v
 [ "$(probe)" = "peer=10.10.1.2" ] || fail "primary probe"
 
 # --- authorization expires; the outage must still fail over -----------------
-rm -f "$MARKER"
+withdraw
 if OUT=$(as_user $BUS call $DEST Cleanup 2>&1); then fail "cleanup allowed without authorization"; fi
 echo "$OUT" | grep -q "Access denied" || fail "cleanup failed for another reason: $OUT"
 say "authorization withdrawn: Cleanup by $TESTUSER is denied"
@@ -178,8 +192,27 @@ done
 [ "$(probe)" = "peer=10.10.1.2" ] || fail "new flow did not return to the primary"
 say "carrier returned: failback to lane-a; new flow source 10.10.1.2"
 
+# --- package upgrade while armed: journal and private config survive --------
+if [ -n "$UPGRADE_DEB" ]; then
+    as_user sh -c 'mkdir -p ~/.config/routelane && echo "{\"sentinel\":1}" > ~/.config/routelane/config.json'
+    CONFIG_SUM=$(as_user sh -c 'sha256sum < ~/.config/routelane/config.json')
+    OLD_VERSION=$(dpkg-query -W -f='${Version}' routelane)
+    OLD_PID=$(systemctl show -p MainPID --value routelane-helper.service)
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$UPGRADE_DEB" >/tmp/routelane-apt.log 2>&1 || { tail /tmp/routelane-apt.log; fail "package upgrade"; }
+    NEW_VERSION=$(dpkg-query -W -f='${Version}' routelane)
+    dpkg --compare-versions "$NEW_VERSION" gt "$OLD_VERSION" || fail "not an upgrade: $OLD_VERSION -> $NEW_VERSION"
+    NEW_PID=$(systemctl show -p MainPID --value routelane-helper.service)
+    [ "$NEW_PID" != "$OLD_PID" ] || fail "postinst did not try-restart the running helper"
+    [ -f /run/routelane/applied-plan.json ] || fail "upgrade removed the ownership journal"
+    PHASE=$(as_user $BUS call $DEST Inspect | field runtime.phase)
+    [ "$PHASE" = '"Armed"' ] || fail "upgraded helper did not resume: $PHASE"
+    [ "$(probe)" = "peer=10.10.1.2" ] || fail "primary flow broken after upgrade"
+    [ "$(as_user sh -c 'sha256sum < ~/.config/routelane/config.json')" = "$CONFIG_SUM" ] || fail "upgrade changed private config"
+    say "upgrade $OLD_VERSION -> $NEW_VERSION while armed: helper $OLD_PID -> $NEW_PID resumed Armed, journal and private config unchanged"
+fi
+
 # --- authorized cleanup restores the interface setting -----------------------
-touch "$MARKER"
+allow
 as_user $BUS call $DEST Cleanup >/dev/null || fail "authorized cleanup"
 [ "$(ip netns exec "$NS_C" cat /proc/sys/net/ipv4/conf/$CA/src_valid_mark)" = 0 ] || fail "src_valid_mark not restored"
 ip netns exec "$NS_C" nft list table inet routelane >/dev/null 2>&1 && fail "routelane table left behind"

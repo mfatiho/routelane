@@ -100,7 +100,7 @@ Section: net
 Priority: optional
 Architecture: ${DEB_ARCH}
 Maintainer: ${MAINTAINER}
-Depends: libgtk-4-1, libadwaita-1-0, nftables, iproute2, policykit-1, dbus, systemd
+Depends: libgtk-4-1, libadwaita-1-0, nftables, iproute2, polkitd | policykit-1, dbus, systemd
 Description: Policy-based routing desktop application
  RouteLane routes selected domains or IP/CIDR targets through a chosen network interface.
 CONTROL
