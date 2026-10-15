@@ -2957,6 +2957,24 @@ fn tolerated_lost_unicast(
         capture_snapshot(executor).map_err(|error| PrivilegedError::new(error.to_string()))?;
     let live = live_routing_ownership(&captured)?;
     let expected = plan_routing_ownership(plan);
+    // A carrier-less route is ours, but only a plan that gives it up may keep going.
+    for (family, table) in linkdown_unicast(&captured) {
+        let family_kind = if family == 4 {
+            IpFamily::V4
+        } else {
+            IpFamily::V6
+        };
+        if next
+            .lanes
+            .iter()
+            .find(|lane| lane.table == table)
+            .is_some_and(|lane| super::lane_unicast_route(lane, family_kind).is_some())
+        {
+            return Err(PrivilegedError::new(
+                "a lane without carrier is still used by the fresh plan; refusing apply",
+            ));
+        }
+    }
     if live.rules != expected.rules || !live.routes.is_subset(&expected.routes) {
         return Err(PrivilegedError::new(
             "committed RouteLane kernel resources were modified; refusing apply",
@@ -3864,6 +3882,37 @@ fn live_terminal_route(
     })
 }
 
+/// Owned unicast defaults carry no flags, or exactly `linkdown`: carrier
+/// loss keeps the kernel route and only flags it (unlike admin down or
+/// address removal, which delete it).
+fn unicast_flags_are_owned(flags: Option<&serde_json::Value>) -> bool {
+    flags.is_none_or(|flags| {
+        flags
+            .as_array()
+            .is_some_and(|flags| flags.is_empty() || flags == &[serde_json::json!("linkdown")])
+    })
+}
+
+/// Owned unicast defaults (family number, table) whose link has no carrier.
+fn linkdown_unicast(captured: &CapturedSnapshot) -> BTreeSet<(u8, u32)> {
+    let mut linkdown = BTreeSet::new();
+    for (family, json) in [(4, &captured.ipv4_routes), (6, &captured.ipv6_routes)] {
+        let routes: Vec<serde_json::Value> = serde_json::from_slice(json).unwrap_or_default();
+        for route in routes {
+            let flagged = route
+                .get("flags")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|flags| flags == &[serde_json::json!("linkdown")]);
+            if let Some(table) = json_u32(route.get("table"))
+                .filter(|table| flagged && (TABLE_BASE..=TABLE_MAX).contains(table))
+            {
+                linkdown.insert((family, table));
+            }
+        }
+    }
+    linkdown
+}
+
 fn live_unicast_route(
     route: &serde_json::Value,
     family: u8,
@@ -3881,7 +3930,7 @@ fn live_unicast_route(
                 .is_none(),
         )
         || route.get("prefsrc").is_some()
-        || !absent_or_empty_array(route.get("flags"))
+        || !unicast_flags_are_owned(route.get("flags"))
         || (family == 4 && route.get("pref").is_some())
         || (family == 6 && !absent_or_exact_string(route.get("pref"), "medium"))
     {
@@ -8938,6 +8987,316 @@ mod tests {
             .unwrap();
         assert_eq!(status.phase, super::RuntimePhase::NeedsReauthorization);
         assert_eq!(fixture.mutations(), mutations);
+    }
+
+    #[test]
+    fn carrier_loss_keeps_linkdown_routes_and_still_fails_over() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        // A pulled cable: routes stay, flagged linkdown; the link loses carrier.
+        for (_, route) in fixture.kernel.lock().unwrap().extra_routes.iter_mut() {
+            if route["table"] == 20_000 && route.get("type").is_none() {
+                route["flags"] = serde_json::json!(["linkdown"]);
+            }
+        }
+        let status = backend
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            status.phase,
+            super::RuntimePhase::Armed,
+            "{:?}",
+            status.last_error
+        );
+        assert_eq!(effective(&status), lane_exit("vinn"));
+        assert_eq!(fixture.unicast_devices(), vec!["usb0", "usb0"]);
+    }
+
+    #[test]
+    fn linkdown_route_of_a_lane_that_is_still_used_is_refused() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        for (_, route) in fixture.kernel.lock().unwrap().extra_routes.iter_mut() {
+            if route["table"] == 20_000 && route.get("type").is_none() {
+                route["flags"] = serde_json::json!(["linkdown"]);
+            }
+        }
+        let mutations = fixture.mutations();
+        // Topology still claims carrier: kernel and topology disagree.
+        let status = backend
+            .refresh_runtime(&fixture.observe(&up()), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(status.phase, super::RuntimePhase::Degraded);
+        assert!(status.last_error.unwrap().contains("without carrier"));
+        assert_eq!(fixture.mutations(), mutations);
+    }
+
+    #[test]
+    fn only_an_exact_linkdown_flag_is_owned() {
+        let route = |flags: serde_json::Value| {
+            serde_json::to_vec(&serde_json::json!([{
+                "dst": "default", "gateway": "10.0.0.1", "dev": "eth0",
+                "table": 20_000, "flags": flags,
+            }]))
+            .unwrap()
+        };
+        let mut ownership = super::RoutingOwnership::default();
+        super::collect_live_routes(&route(serde_json::json!(["linkdown"])), 4, &mut ownership)
+            .unwrap();
+        assert_eq!(ownership.routes.len(), 1);
+        for foreign in [
+            serde_json::json!(["onlink"]),
+            serde_json::json!(["linkdown", "onlink"]),
+        ] {
+            let mut ownership = super::RoutingOwnership::default();
+            assert!(super::collect_live_routes(&route(foreign), 4, &mut ownership).is_err());
+        }
+    }
+
+    fn all_down() -> crate::backend::TopologySnapshot {
+        runtime_topology(None, None, 2)
+    }
+
+    fn v6_exit(status: &super::RuntimeStatus) -> crate::backend::FamilyExit {
+        status.decision.as_ref().unwrap().effective.v6.clone()
+    }
+
+    #[test]
+    fn runtime_rejects_replayed_generation_and_foreign_caller() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        let armed = backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        let applied_generation_before_replay = armed.status.generation;
+        let mutations = fixture.mutations();
+        let replay = backend.activate_runtime(
+            &activation(0),
+            1000,
+            &fixture.observe(&up()),
+            Duration::ZERO,
+        );
+        assert!(replay
+            .unwrap_err()
+            .to_string()
+            .contains("expected generation 0"));
+        assert!(backend
+            .restore_runtime(&armed.rollback_receipt, 1001)
+            .is_err());
+        let applied_generation_after_replay = backend.inspect().unwrap().runtime.generation;
+        assert_eq!(
+            applied_generation_after_replay,
+            applied_generation_before_replay
+        );
+        assert_eq!(fixture.mutations(), mutations);
+    }
+
+    #[test]
+    fn partial_transaction_never_reports_armed() {
+        // Candidate apply fails during activation.
+        let fixture = RuntimeFixture::new();
+        fixture.kernel.lock().unwrap().fail_activation = true;
+        let mut backend = fixture.backend();
+        assert!(backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO
+            )
+            .is_err());
+        assert_eq!(
+            backend.inspect().unwrap().runtime.phase,
+            super::RuntimePhase::Inactive
+        );
+        assert!(fixture
+            .store
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|journal| journal.runtime.is_none()));
+
+        // The grant journal cannot be written: nothing is armed.
+        let fixture = RuntimeFixture::new();
+        *fixture.store.fail_commit_generation.lock().unwrap() = Some(1);
+        let mut backend = fixture.backend();
+        assert!(backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO
+            )
+            .is_err());
+        assert_eq!(
+            backend.inspect().unwrap().runtime.phase,
+            super::RuntimePhase::Inactive
+        );
+        assert!(
+            !fixture.kernel.lock().unwrap().has_table,
+            "candidate rolled back"
+        );
+
+        // Exact fingerprint verification fails on a refresh: previous record stays.
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        let armed = backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        fixture.drop_unicast(20_000);
+        fixture.kernel.lock().unwrap().tamper_json_result = true;
+        let refreshed = backend
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1))
+            .unwrap();
+        assert_ne!(refreshed.phase, super::RuntimePhase::Armed);
+        assert_eq!(refreshed.decision, armed.status.decision);
+
+        // Rollback itself fails: the pending journal is kept and nothing is Armed.
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        fixture.drop_unicast(20_000);
+        {
+            let mut kernel = fixture.kernel.lock().unwrap();
+            kernel.fail_activation = true;
+            kernel.fail_rollback = true;
+        }
+        let failed = backend
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1))
+            .unwrap();
+        assert_ne!(failed.phase, super::RuntimePhase::Armed);
+        assert!(fixture
+            .store
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .pending
+            .is_some());
+        // A restarted helper recovers or refuses; it never reports the candidate Armed.
+        {
+            let mut kernel = fixture.kernel.lock().unwrap();
+            kernel.fail_activation = false;
+            kernel.fail_rollback = false;
+        }
+        let mut restarted = fixture.backend();
+        let resumed =
+            restarted.refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(2));
+        if let Some(status) = resumed
+            .ok()
+            .filter(|status| status.phase == super::RuntimePhase::Armed)
+        {
+            // Armed only for the exact committed plan, never the failed candidate.
+            let plan = restarted.inspect().unwrap().applied_plan.unwrap();
+            assert_eq!(plan.generation, status.generation);
+        }
+    }
+
+    #[test]
+    fn all_links_down_then_recovery_is_family_safe() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        fixture.drop_unicast(20_000);
+        fixture.drop_unicast(20_001);
+        let down = backend
+            .refresh_runtime(&fixture.observe(&all_down()), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            down.phase,
+            super::RuntimePhase::Armed,
+            "{:?}",
+            down.last_error
+        );
+        assert_eq!(effective(&down), crate::backend::FamilyExit::Blocked);
+        assert_eq!(v6_exit(&down), crate::backend::FamilyExit::Blocked);
+        assert!(fixture.unicast_devices().is_empty(), "no exit, no escape");
+        // The primary returns with no exit to fail back from: immediate, per family.
+        let back = backend
+            .refresh_runtime(
+                &fixture.observe(&runtime_topology(Some(2), None, 2)),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        assert_eq!(effective(&back), lane_exit("ethernet"));
+        assert_eq!(v6_exit(&back), lane_exit("ethernet"));
+    }
+
+    #[test]
+    fn interface_flap_resets_the_failback_deadline() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        let mut at = |topology: crate::backend::TopologySnapshot, millis: u64| {
+            if topology
+                .interface("eth0")
+                .is_some_and(|eth| !eth.link_ready)
+            {
+                fixture.drop_unicast(20_000);
+            }
+            backend
+                .refresh_runtime(&fixture.observe(&topology), Duration::from_millis(millis))
+                .unwrap()
+        };
+        assert_eq!(effective(&at(ethernet_down(), 1_000)), lane_exit("vinn"));
+        assert_eq!(effective(&at(up(), 2_000)), lane_exit("vinn"));
+        assert_eq!(effective(&at(ethernet_down(), 4_000)), lane_exit("vinn"));
+        assert_eq!(effective(&at(up(), 5_000)), lane_exit("vinn"));
+        assert_eq!(
+            effective(&at(up(), 7_100)),
+            lane_exit("vinn"),
+            "the flap restarted the wait"
+        );
+        assert_eq!(effective(&at(up(), 10_100)), lane_exit("ethernet"));
     }
 
     #[test]
