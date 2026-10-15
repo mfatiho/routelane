@@ -221,3 +221,26 @@ gidip “Network is unreachable” aldı, IPv6 OS default’tan kaçtı, adres k
 paket gateway B’ye ulaştı. Yerel kontroller senaryosu bir regresyon korumasıdır
 ve eski semantikte de geçer. Bu kanıtlar otomatik runtime (Task 8), Polkit ve
 Debian/Fedora kapılarını kapatmaz.
+
+## Task 8 runtime refresh kapısı (15 Ekim 2026)
+
+Gerçek helper, yalnız feature’lı stdio taşımasında (üretimde çağrılabilir
+refresh yok) tek bir aktivasyon ve ardından çekirdek kanıtıyla yenilemeler
+aldı. Lane A birincil (IPv4 + global IPv6 gateway), lane C yedek:
+
+- Lane A’nın linki kapanınca kernel A’nın unicast default’larını kendisi sildi;
+  yenileme bunu yalnız taze aday plan A’yı artık kullanmadığı için kabul etti,
+  IPv4’ü C’ye geçirdi, IPv6’yı (onaylı yedek IPv6’sı yok) engelledi.
+- Link döndüğünde (testte DHCP/SLAAC’ın yapacağı gibi IPv6 adresi ve default
+  route’lar yeniden eklendi) IPv4 5 saniye bekledi, IPv6 çıkışı olmadığı için
+  hemen döndü; IPv6 global gateway’li unicast yalnız terminal bulunan tabloya
+  terminal geçici kaldırılarak girdi. 7,1. saniyede IPv4 de A’ya döndü.
+- Bu iki geçiş boyunca C üzerindeki uzun TCP oturumu ve bağlı UDP soketi her
+  20 ms’de alışverişe devam etti: standart modda 32, strict-RPF modunda 30
+  alışveriş, 0 UDP yanıt kaybı. Daha yoğun trafikte transaction guard
+  penceresinde kayıp olmayacağının kanıtı değildir.
+- Tam root süiti iki modda 17/17. `ip monitor` bir pipe’a ilk satırı link
+  değişiminden ~3 ms sonra verdi.
+
+Kurulu system-bus politikasıyla root olmayan istemciye `RuntimeChanged`
+sinyali teslimi ve gerçek Polkit akışı burada doğrulanmadı (Task 11/12).

@@ -41,6 +41,8 @@ const RULE_TARGET: &str = "192.0.2.10";
 /// Reachable through both sink A and sink C: primary and backup.
 const SHARED_TARGET: &str = "198.51.100.77";
 const V6_TARGET: &str = "2001:db8:ffff::10";
+/// Reachable through sink A over IPv6 with a global gateway.
+const V6_A_TARGET: &str = "2001:db8:fffa::10";
 const LANE_IDS: [&str; 3] = ["lane-a", "lane-b", "lane-c"];
 const LANE_GATEWAYS: [&str; 3] = ["10.10.1.1", "10.10.2.1", "10.10.3.1"];
 const LANE_SOURCES: [&str; 3] = ["10.10.1.2", "10.10.2.2", "10.10.3.2"];
@@ -86,6 +88,23 @@ fn ipv6_only_lane_carries_its_family_with_its_source() {
         vec![
             EchoServer::spawn(&names.sinks[0], &["203.0.113.10:7000"]),
             EchoServer::spawn(&names.sinks[1], &["[2001:db8:ffff::10]:7000"]),
+        ]
+    });
+}
+
+#[test]
+fn runtime_refresh_fails_over_and_back_without_breaking_backup_sessions() {
+    run_scenario("runtime_refresh", |names| {
+        for lane in [0, 2] {
+            add_sink_target(names, lane, SHARED_TARGET);
+        }
+        provision_lane_a_ipv6(names);
+        vec![
+            EchoServer::spawn(
+                &names.sinks[0],
+                &["198.51.100.77:7000", "[2001:db8:fffa::10]:7000"],
+            ),
+            EchoServer::spawn(&names.sinks[2], &["198.51.100.77:7000"]),
         ]
     });
 }
@@ -156,6 +175,12 @@ fn run_scenario(scenario: &str, setup: impl FnOnce(&RunNames) -> Vec<EchoServer>
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    for evidence in String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| line.starts_with("evidence:"))
+    {
+        eprintln!("{scenario} {evidence}");
+    }
 }
 
 #[test]
@@ -171,6 +196,7 @@ fn client_worker() {
         "ipv6_no_escape" => ipv6_no_escape(&names, &mut routing),
         "ipv6_lane" => ipv6_lane(&names, &mut routing),
         "rpf" => reverse_path_filtering(&names, &mut routing),
+        "runtime_refresh" => runtime_refresh(&names, &mut routing),
         "local_controls" => local_controls(&names, &mut routing),
         "loss_signals" => loss_signals(&names, &mut routing),
         other => panic!("unknown root scenario {other}"),
@@ -267,6 +293,184 @@ fn ipv6_lane(names: &RunNames, routing: &mut Routing) {
     assert_echo(&tcp_exchange(&mut v4, "v4-tcp"), 0, "v4-tcp");
     drop((v6, v4));
     routing.cleanup();
+}
+
+/// The helper's own runtime: one activation, then kernel-evidence refreshes.
+/// Lane A (primary, dual-stack with a global IPv6 gateway) fails and returns
+/// while long-lived TCP and UDP flows keep running on backup lane C.
+fn runtime_refresh(names: &RunNames, routing: &mut Routing) {
+    let Routing::Helper { helper, .. } = routing else {
+        panic!("runtime refresh needs the real helper");
+    };
+    let primary = names.client_interfaces[0].clone();
+    // What DHCP/SLAAC would restore after the link returns: the kernel drops
+    // global IPv6 addresses and every route through the interface on down.
+    let restore_lane_a_defaults = || {
+        run_ip([
+            "-6",
+            "addr",
+            "replace",
+            "2001:db8:1::2/64",
+            "dev",
+            &primary,
+            "nodad",
+        ]);
+        run_ip([
+            "route",
+            "replace",
+            "default",
+            "via",
+            "10.10.1.1",
+            "dev",
+            &primary,
+            "metric",
+            "100",
+        ]);
+        run_ip([
+            "-6",
+            "route",
+            "replace",
+            "default",
+            "via",
+            "2001:db8:1::1",
+            "dev",
+            &primary,
+            "metric",
+            "100",
+        ]);
+    };
+    restore_lane_a_defaults();
+    run_ip([
+        "route",
+        "add",
+        "default",
+        "via",
+        "10.10.3.1",
+        "dev",
+        &names.client_interfaces[2],
+        "metric",
+        "200",
+    ]);
+    let activation = runtime_activation(names);
+    let armed = helper.ok(json!({
+        "method": "activate_runtime",
+        "activation_json": serde_json::to_string(&activation).unwrap(),
+        "uid": 0,
+        "now_ms": 0,
+    }));
+    assert_eq!(armed["status"]["phase"], "Armed");
+    assert_effective(&armed["status"], "lane-a", Some("lane-a"));
+    let mut session = tcp_connect(SHARED_TARGET).expect("primary before outage");
+    assert_echo(&tcp_exchange(&mut session, "armed"), 0, "armed");
+    let mut v6 = tcp_connect(V6_A_TARGET).expect("IPv6 over the primary");
+    assert_eq!(tcp_exchange(&mut v6, "v6"), "peer=2001:db8:1::2 v6");
+    drop((session, v6));
+
+    // Link loss: the kernel drops lane A's unicast defaults on its own.
+    run_ip(["link", "set", &primary, "down"]);
+    let failover = helper.ok(json!({"method": "refresh_runtime", "now_ms": 1_000}));
+    assert_eq!(failover["phase"], "Armed", "{failover}");
+    assert_effective(&failover, "lane-c", None);
+
+    let backup = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let traffic = {
+        let running = std::sync::Arc::clone(&backup);
+        std::thread::spawn(move || {
+            let mut stream = tcp_connect(SHARED_TARGET).expect("backup session");
+            let datagrams = UdpSocket::bind("0.0.0.0:0").unwrap();
+            datagrams
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            datagrams
+                .connect(format!("{SHARED_TARGET}:{ECHO_PORT}"))
+                .unwrap();
+            let (mut exchanges, mut lost) = (0, 0);
+            let mut buffer = [0; 128];
+            while running.load(std::sync::atomic::Ordering::SeqCst) {
+                let payload = format!("tick-{exchanges}");
+                assert_echo(&tcp_exchange(&mut stream, &payload), 2, &payload);
+                datagrams.send(payload.as_bytes()).unwrap();
+                match datagrams.recv(&mut buffer) {
+                    Ok(length) => {
+                        assert_echo(std::str::from_utf8(&buffer[..length]).unwrap(), 2, &payload)
+                    }
+                    Err(_) => lost += 1,
+                }
+                exchanges += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            (exchanges, lost)
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The link returns; failback waits for five seconds of readiness.
+    run_ip(["link", "set", &primary, "up"]);
+    wait_for_connected_route(&primary);
+    restore_lane_a_defaults();
+    let waiting = helper.ok(json!({"method": "refresh_runtime", "now_ms": 2_000}));
+    // IPv4 still has a working backup and waits; IPv6 had no exit at all and
+    // returns at once (its global gateway re-enters a terminal-only table).
+    assert_effective(&waiting, "lane-c", Some("lane-a"));
+    assert_eq!(waiting["failback_in_ms"], 5_000);
+    std::thread::sleep(Duration::from_millis(300));
+    let failback = helper.ok(json!({"method": "refresh_runtime", "now_ms": 7_100}));
+    assert_effective(&failback, "lane-a", Some("lane-a"));
+    std::thread::sleep(Duration::from_millis(300));
+    backup.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (exchanges, lost) = traffic.join().expect("backup TCP and UDP kept working");
+    eprintln!("evidence: backup flows {exchanges} exchanges, {lost} UDP replies lost");
+    assert!(exchanges > 20);
+
+    let mut fresh = tcp_connect(SHARED_TARGET).expect("new flow after failback");
+    assert_echo(&tcp_exchange(&mut fresh, "fresh"), 0, "fresh");
+    let mut v6 = tcp_connect(V6_A_TARGET).expect("IPv6 global gateway restored");
+    assert_eq!(
+        tcp_exchange(&mut v6, "v6-back"),
+        "peer=2001:db8:1::2 v6-back"
+    );
+    drop((fresh, v6));
+    routing.cleanup();
+}
+
+fn assert_effective(status: &Value, v4: &str, v6: Option<&str>) {
+    let effective = &status["decision"]["effective"];
+    assert_eq!(effective["v4"], json!({"Lane": v4}), "{status}");
+    match v6 {
+        Some(lane) => assert_eq!(effective["v6"], json!({"Lane": lane}), "{status}"),
+        None => assert_eq!(effective["v6"], json!("Blocked"), "{status}"),
+    }
+}
+
+fn runtime_activation(names: &RunNames) -> routelane::backend::RuntimeActivation {
+    use routelane::domain::{
+        InterfaceSelector, Lane, LaneFailurePolicy, PrimarySelection, Profile, RoutingPolicy,
+    };
+    routelane::backend::RuntimeActivation {
+        protocol_version: routelane::backend::RUNTIME_PROTOCOL_VERSION,
+        profile: Profile {
+            id: ProfileId::from("runtime"),
+            name: "Runtime".into(),
+            enabled: true,
+            rules: vec![],
+            routing: RoutingPolicy {
+                primary: PrimarySelection::Lane(LANE_IDS[0].into()),
+                backups: vec![LANE_IDS[2].into()],
+                automatic_failover: true,
+            },
+            lanes: (0..3)
+                .map(|index| Lane {
+                    id: LANE_IDS[index].into(),
+                    name: LANE_IDS[index].to_owned(),
+                    interface: InterfaceSelector::from(names.client_interfaces[index].as_str()),
+                    fallback_lane: None,
+                    failure_policy: LaneFailurePolicy::Block,
+                })
+                .collect(),
+        },
+        resolutions: routelane::backend::ResolutionSnapshot::empty(),
+        expected_generation: 0,
+    }
 }
 
 fn reverse_path_filtering(names: &RunNames, routing: &mut Routing) {
@@ -783,6 +987,75 @@ fn provision_lane_b_ipv6(names: &RunNames) {
         &names.client_interfaces[1],
     ]);
     install_observer(gateway, &format!("ip6 daddr {V6_TARGET}"), "v6_target");
+}
+
+/// Dual-stack lane A with a global (not link-local) IPv6 gateway.
+fn provision_lane_a_ipv6(names: &RunNames) {
+    let gateway = &names.gateways[0];
+    let sink = &names.sinks[0];
+    let address = |namespace: &str, address: &str, interface: &str| {
+        run_ip([
+            "-n", namespace, "-6", "addr", "add", address, "dev", interface, "nodad",
+        ]);
+    };
+    address(
+        &names.client,
+        "2001:db8:1::2/64",
+        &names.client_interfaces[0],
+    );
+    address(
+        gateway,
+        "2001:db8:1::1/64",
+        &names.gateway_client_interfaces[0],
+    );
+    address(
+        gateway,
+        "2001:db8:11::1/64",
+        &names.gateway_sink_interfaces[0],
+    );
+    address(sink, "2001:db8:11::2/64", &names.sink_interfaces[0]);
+    run_ip([
+        "-n",
+        sink,
+        "-6",
+        "addr",
+        "add",
+        &format!("{V6_A_TARGET}/128"),
+        "dev",
+        "lo",
+    ]);
+    checked_output(
+        Command::new("/usr/sbin/ip").args([
+            "netns",
+            "exec",
+            gateway,
+            "/usr/sbin/sysctl",
+            "-q",
+            "-w",
+            "net.ipv6.conf.all.forwarding=1",
+        ]),
+        "enable IPv6 forwarding in gateway A",
+    );
+    run_ip([
+        "-n",
+        gateway,
+        "-6",
+        "route",
+        "add",
+        &format!("{V6_A_TARGET}/128"),
+        "via",
+        "2001:db8:11::2",
+    ]);
+    run_ip([
+        "-n",
+        sink,
+        "-6",
+        "route",
+        "add",
+        "2001:db8:1::/64",
+        "via",
+        "2001:db8:11::1",
+    ]);
 }
 
 /// Counts matching packets as they arrive at a run-owned gateway.
