@@ -26,7 +26,8 @@ use serde_json::{json, Value};
 
 use super::namespace_routing::{
     assert_managed_resources_absent, checked_output, command_output, lane,
-    require_root_capabilities, rule, run_ip, HelperProcess, NamespaceHarness, RunNames, WORKER_ENV,
+    planned_client_main_routes, require_root_capabilities, rule, run_ip, HelperProcess,
+    NamespaceHarness, RunNames, WORKER_ENV,
 };
 
 const ECHO_PORT: u16 = 7000;
@@ -104,6 +105,26 @@ fn runtime_refresh_fails_over_and_back_without_breaking_backup_sessions() {
                 &names.sinks[0],
                 &["198.51.100.77:7000", "[2001:db8:fffa::10]:7000"],
             ),
+            EchoServer::spawn(&names.sinks[2], &["198.51.100.77:7000"]),
+        ]
+    });
+}
+
+#[test]
+fn gui_closed_link_loss_fails_over_without_authorization_prompt() {
+    run_scenario("loss_through_refresh", |names| {
+        for lane in [0, 2] {
+            add_sink_target(names, lane, SHARED_TARGET);
+        }
+        for lane in [1, 2] {
+            install_observer(
+                &names.gateways[lane],
+                &format!("ip daddr {SHARED_TARGET}"),
+                "escape",
+            );
+        }
+        vec![
+            EchoServer::spawn(&names.sinks[0], &["198.51.100.77:7000"]),
             EchoServer::spawn(&names.sinks[2], &["198.51.100.77:7000"]),
         ]
     });
@@ -197,6 +218,7 @@ fn client_worker() {
         "ipv6_lane" => ipv6_lane(&names, &mut routing),
         "rpf" => reverse_path_filtering(&names, &mut routing),
         "runtime_refresh" => runtime_refresh(&names, &mut routing),
+        "loss_through_refresh" => loss_through_refresh(&names, &mut routing),
         "local_controls" => local_controls(&names, &mut routing),
         "loss_signals" => loss_signals(&names, &mut routing),
         other => panic!("unknown root scenario {other}"),
@@ -433,9 +455,205 @@ fn runtime_refresh(names: &RunNames, routing: &mut Routing) {
     routing.cleanup();
 }
 
+/// After one activation only kernel-evidence refreshes run (no further
+/// activation or authorization): carrier, address and main-default-route loss
+/// each fail over independently and fail back after five seconds; all links
+/// down blocks without escape; a restarted helper resumes the exact state.
+fn loss_through_refresh(names: &RunNames, routing: &mut Routing) {
+    let Routing::Helper { helper, _state } = routing else {
+        panic!("loss through refresh needs the real helper");
+    };
+    let primary = names.client_interfaces[0].clone();
+    let backup = names.client_interfaces[2].clone();
+    let lane_a_default = || {
+        run_ip([
+            "route",
+            "replace",
+            "default",
+            "via",
+            "10.10.1.1",
+            "dev",
+            &primary,
+            "metric",
+            "100",
+        ]);
+    };
+    lane_a_default();
+    run_ip([
+        "route",
+        "replace",
+        "default",
+        "via",
+        "10.10.3.1",
+        "dev",
+        &backup,
+        "metric",
+        "200",
+    ]);
+    let foreign_before = install_foreign_sentinels();
+    let armed = helper.ok(json!({
+        "method": "activate_runtime",
+        "activation_json": serde_json::to_string(&runtime_activation(names)).unwrap(),
+        "uid": 0,
+        "now_ms": 0,
+    }));
+    assert_effective(&armed["status"], "lane-a", None);
+    let mut clock = 0;
+    let mut refresh = |helper: &mut HelperProcess, advance: u64| {
+        clock += advance;
+        let status = helper.ok(json!({"method": "refresh_runtime", "now_ms": clock}));
+        assert_eq!(status["phase"], "Armed", "{status}");
+        status
+    };
+    let exit_source = |lane: usize| {
+        let mut stream = tcp_connect(SHARED_TARGET).expect("a new flow has an exit");
+        assert_echo(&tcp_exchange(&mut stream, "probe"), lane, "probe");
+    };
+    let fail_back =
+        |helper: &mut HelperProcess, refresh: &mut dyn FnMut(&mut HelperProcess, u64) -> Value| {
+            assert_effective(&refresh(helper, 1_000), "lane-c", None);
+            exit_source(2);
+            assert_effective(&refresh(helper, 5_100), "lane-a", None);
+            exit_source(0);
+        };
+    exit_source(0);
+
+    // Carrier loss: the peer goes away; the kernel keeps linkdown routes.
+    run_ip([
+        "-n",
+        &names.gateways[0],
+        "link",
+        "set",
+        &names.gateway_client_interfaces[0],
+        "down",
+    ]);
+    assert_effective(&refresh(helper, 1_000), "lane-c", None);
+    exit_source(2);
+    run_ip([
+        "-n",
+        &names.gateways[0],
+        "link",
+        "set",
+        &names.gateway_client_interfaces[0],
+        "up",
+    ]);
+    wait_for_connected_route(&primary);
+    fail_back(helper, &mut refresh);
+
+    // Address removal deletes every route through the interface.
+    run_ip(["addr", "del", "10.10.1.2/24", "dev", &primary]);
+    assert_effective(&refresh(helper, 1_000), "lane-c", None);
+    exit_source(2);
+    run_ip(["addr", "add", "10.10.1.2/24", "dev", &primary]);
+    wait_for_connected_route(&primary);
+    lane_a_default();
+    fail_back(helper, &mut refresh);
+
+    // The OS loses lane A's default route (lease expiry); the owned table
+    // route is still there and is retired by the refresh.
+    run_ip([
+        "route",
+        "del",
+        "default",
+        "via",
+        "10.10.1.1",
+        "dev",
+        &primary,
+        "metric",
+        "100",
+    ]);
+    assert_effective(&refresh(helper, 1_000), "lane-c", None);
+    exit_source(2);
+    lane_a_default();
+    fail_back(helper, &mut refresh);
+
+    // A restarted helper resumes exactly and keeps failing over.
+    let state = _state.path().to_owned();
+    drop(std::mem::replace(helper, HelperProcess::spawn(&state)));
+    assert_effective(&refresh(helper, 1_000), "lane-a", None);
+
+    // All links down: nothing leaves through any uplink.
+    let escaped = || [1, 2].map(|lane| gateway_counter(names, lane, "escape"));
+    let before = escaped();
+    for interface in &names.client_interfaces {
+        run_ip(["link", "set", interface, "down"]);
+    }
+    let down = refresh(helper, 1_000);
+    assert_effective(&down, "", None);
+    assert!(tcp_connect(SHARED_TARGET).is_err());
+    assert_eq!(
+        escaped(),
+        before,
+        "no packet escaped while all links were down"
+    );
+    for interface in &names.client_interfaces {
+        run_ip(["link", "set", interface, "up"]);
+        wait_for_connected_route(interface);
+    }
+    lane_a_default();
+    run_ip([
+        "route",
+        "replace",
+        "default",
+        "via",
+        "10.10.3.1",
+        "dev",
+        &backup,
+        "metric",
+        "200",
+    ]);
+    // Links coming back up do not restore routes the kernel deleted; put
+    // back exactly what this test's own link changes removed.
+    run_ip([
+        "route",
+        "replace",
+        "default",
+        "via",
+        "10.10.2.1",
+        "dev",
+        &names.client_interfaces[1],
+    ]);
+    for route in planned_client_main_routes(names) {
+        run_ip([
+            "route",
+            "replace",
+            route.prefix,
+            "via",
+            route.gateway,
+            "dev",
+            &route.interface,
+        ]);
+    }
+    run_ip([
+        "route",
+        "replace",
+        "default",
+        "via",
+        "10.10.2.1",
+        "table",
+        "100",
+    ]);
+    // No exit to fail back from: the primary returns at once.
+    assert_effective(&refresh(helper, 1_000), "lane-a", None);
+    exit_source(0);
+
+    routing.cleanup();
+    assert_eq!(
+        foreign_sentinels(),
+        foreign_before,
+        "foreign rules, routes, tables and tunables are unchanged"
+    );
+}
+
+/// `v4 == ""` expects IPv4 to be blocked.
 fn assert_effective(status: &Value, v4: &str, v6: Option<&str>) {
     let effective = &status["decision"]["effective"];
-    assert_eq!(effective["v4"], json!({"Lane": v4}), "{status}");
+    let expected_v4 = if v4.is_empty() {
+        json!("Blocked")
+    } else {
+        json!({"Lane": v4})
+    };
+    assert_eq!(effective["v4"], expected_v4, "{status}");
     match v6 {
         Some(lane) => assert_eq!(effective["v6"], json!({"Lane": lane}), "{status}"),
         None => assert_eq!(effective["v6"], json!("Blocked"), "{status}"),

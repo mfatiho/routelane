@@ -102,13 +102,13 @@ impl RunNames {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct MainRouteSpec {
-    prefix: &'static str,
-    gateway: &'static str,
-    interface: String,
+pub(super) struct MainRouteSpec {
+    pub(super) prefix: &'static str,
+    pub(super) gateway: &'static str,
+    pub(super) interface: String,
 }
 
-fn planned_client_main_routes(names: &RunNames) -> Vec<MainRouteSpec> {
+pub(super) fn planned_client_main_routes(names: &RunNames) -> Vec<MainRouteSpec> {
     vec![
         MainRouteSpec {
             prefix: "198.18.0.10/32",
