@@ -2027,13 +2027,16 @@ where
             Ok(unverified) => unverified,
             Err(error) => {
                 let wait = self.hold_back_recovery(now);
-                if let Some(runtime) = self.runtime.as_mut() {
-                    runtime.phase = RuntimePhase::Degraded;
-                    runtime.last_error = Some(error.to_string());
-                    runtime.selector = None;
-                    runtime.failback_in_ms = Some(wait.as_millis() as u64);
-                }
-                return Err(error);
+                let Some(runtime) = self.runtime.as_mut() else {
+                    return Err(error);
+                };
+                // Report it: an Err is dropped by the monitor, which would
+                // then neither announce Degraded nor wake for the retry.
+                runtime.phase = RuntimePhase::Degraded;
+                runtime.last_error = Some(error.to_string());
+                runtime.selector = None;
+                runtime.failback_in_ms = Some(wait.as_millis() as u64);
+                return Ok(self.runtime_status_snapshot());
             }
         };
         let Some(mut runtime) = self.runtime.take() else {
@@ -9465,17 +9468,35 @@ mod tests {
             kernel.fail_activation = true;
             kernel.fail_rollback = true;
         }
-        let _ = backend.refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1));
+        let first = backend
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(first.failback_in_ms, Some(2_000));
         let after_failure = fixture.mutations();
-        let _ = backend.refresh_runtime(
-            &fixture.observe(&ethernet_down()),
-            Duration::from_millis(1_200),
-        );
+        let echoed = backend
+            .refresh_runtime(
+                &fixture.observe(&ethernet_down()),
+                Duration::from_millis(1_200),
+            )
+            .unwrap();
         assert_eq!(
             fixture.mutations(),
             after_failure,
             "no replay loop of a retained pending journal"
         );
+        assert_eq!(echoed.phase, super::RuntimePhase::Degraded);
+        assert!(echoed.failback_in_ms.is_some());
+        // The replay after the wait fails again: still reported (so the
+        // monitor and daemon see it) with a doubled wait, never dropped.
+        let replayed = backend
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(3))
+            .unwrap();
+        assert!(
+            fixture.mutations() > after_failure,
+            "replayed after the wait"
+        );
+        assert_eq!(replayed.phase, super::RuntimePhase::Degraded);
+        assert_eq!(replayed.failback_in_ms, Some(4_000));
     }
 
     #[test]
