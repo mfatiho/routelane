@@ -187,64 +187,42 @@ fn local_flow_proof_includes_os_socket_sources_outside_profile_lanes() {
 
 #[test]
 fn unavailable_family_produces_terminal_owned_route_and_rule_commands() {
-    use routelane::backend::build_terminal_policy_commands;
+    use routelane::backend::build_policy_commands;
     let p = fixtures::profile();
     let plan = compile(
         &p,
         &fixtures::topology_case(true, true, false, false, "usb0", 3),
         1,
     );
-    let commands = build_terminal_policy_commands(&plan);
-    assert_eq!(commands.len(), 4);
-    assert_eq!(commands[0].family, Some(IpFamily::V6));
-    assert_eq!(
-        commands[0].args,
-        vec![
-            "route",
-            "replace",
-            "unreachable",
-            "default",
-            "table",
-            "20000"
-        ]
+    let commands = build_policy_commands(&plan);
+    let args = |family: IpFamily| {
+        commands
+            .iter()
+            .filter(|command| command.family == Some(family))
+            .map(|command| command.args.join(" "))
+            .collect::<Vec<_>>()
+    };
+    for table in ["20000", "20001"] {
+        for family in [IpFamily::V4, IpFamily::V6] {
+            assert!(args(family).contains(&format!(
+                "route replace unreachable default table {table} metric 4294967294"
+            )));
+        }
+    }
+    assert!(
+        !args(IpFamily::V6)
+            .iter()
+            .any(|command| command.starts_with("route replace default")),
+        "a missing family must never receive a unicast escape route"
     );
-    assert_eq!(
-        commands[1].args,
-        vec![
-            "route",
-            "replace",
-            "unreachable",
-            "default",
-            "table",
-            "20001"
-        ]
-    );
-    assert_eq!(
-        commands[2].args,
-        vec![
-            "rule",
-            "add",
-            "fwmark",
-            "0x524c0001",
-            "lookup",
-            "20000",
-            "priority",
-            "10000"
-        ]
-    );
-    assert_eq!(
-        commands[3].args,
-        vec![
-            "rule",
-            "add",
-            "fwmark",
-            "0x524c0002",
-            "lookup",
-            "20001",
-            "priority",
-            "10001"
-        ]
-    );
+    for (mark, table, priority) in [
+        ("0x524c0001", "20000", "10000"),
+        ("0x524c0002", "20001", "10001"),
+    ] {
+        assert!(args(IpFamily::V6).contains(&format!(
+            "rule add fwmark {mark} lookup {table} priority {priority}"
+        )));
+    }
 }
 
 #[test]

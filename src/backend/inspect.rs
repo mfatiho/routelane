@@ -5,8 +5,8 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CommandSpec, IpFamily, KernelPlan, LaneAvailability, PlanHash, Program, RouteMode,
-    TopologySnapshot,
+    lane_unicast_route, CommandSpec, IpFamily, KernelPlan, LanePlan, OwnedRoute, PlanHash, Program,
+    RouteMode, TopologySnapshot, TERMINAL_ROUTE_METRIC,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -207,10 +207,10 @@ impl KernelSnapshot {
         gateway: Option<IpAddr>,
         interface: &str,
     ) -> ResourceState {
-        let mut entries = self
-            .routes
-            .iter()
-            .filter(|route| route.family == family && route.table == table);
+        // The owned terminal route is a separate fail-closed resource.
+        let mut entries = self.routes.iter().filter(|route| {
+            route.family == family && route.table == table && !route.matches_terminal(family, table)
+        });
         match (entries.next(), entries.next()) {
             (None, None) => ResourceState::Missing,
             (Some(route), None) if route.matches_default(family, table, gateway, interface) => {
@@ -259,6 +259,34 @@ struct RouteEntry {
 }
 
 impl RouteEntry {
+    /// RouteLane's lowest-preference fail-closed default for a lane table.
+    fn matches_terminal(&self, family: IpFamily, table: u32) -> bool {
+        self.family == family
+            && self.table == table
+            && self.destination.as_deref() == Some("default")
+            // iproute2 prints enums symbolically, or numerically with `-N`.
+            && matches!(self.route_type.as_deref(), Some("unreachable" | "7"))
+            && self.gateway.is_none()
+            && match family {
+                IpFamily::V4 => self.interface.is_none() && self.preference.is_none(),
+                IpFamily::V6 => {
+                    self.interface
+                        .as_deref()
+                        .is_none_or(|device| device == "lo")
+                        && self
+                            .preference
+                            .as_deref()
+                            .is_none_or(|preference| preference == "medium")
+                }
+            }
+            && self.metric == Some(TERMINAL_ROUTE_METRIC)
+            && matches!(self.protocol.as_deref(), None | Some("boot" | "3"))
+            && matches!(self.scope.as_deref(), None | Some("global" | "0"))
+            && self.preferred_source.is_none()
+            && self.flags.is_empty()
+            && self.extra.is_empty()
+    }
+
     fn matches_default(
         &self,
         family: IpFamily,
@@ -655,49 +683,18 @@ fn detect_resource_conflicts_with_owner(
     current: Option<&KernelPlan>,
     snapshot: &KernelSnapshot,
 ) -> Result<(), ResourceConflict> {
-    let lanes = plan
-        .lanes
-        .iter()
-        .filter(|lane| lane.availability == LaneAvailability::Available);
-
-    for lane in lanes.clone() {
-        if let Some(route) = lane.route_v4 {
-            check_route(
-                snapshot,
-                IpFamily::V4,
-                lane.table,
-                route.gateway().copied().map(IpAddr::V4),
-                &lane.interface,
-                current,
-            )?;
-        }
-        if let Some(route) = lane.route_v6 {
-            check_route(
-                snapshot,
-                IpFamily::V6,
-                lane.table,
-                route.gateway().copied().map(IpAddr::V6),
-                &lane.interface,
-                current,
-            )?;
+    // Every lane×family owns a terminal route and a rule, whether or not its
+    // unicast exit is currently usable.
+    for lane in &plan.lanes {
+        for family in [IpFamily::V4, IpFamily::V6] {
+            check_route(snapshot, family, lane, current)?;
         }
     }
-
-    for lane in lanes {
-        if lane.route_v4.is_some() {
+    for lane in &plan.lanes {
+        for family in [IpFamily::V4, IpFamily::V6] {
             check_rule(
                 snapshot,
-                IpFamily::V4,
-                lane.rule_priority,
-                lane.table,
-                lane.mark,
-                current,
-            )?;
-        }
-        if lane.route_v6.is_some() {
-            check_rule(
-                snapshot,
-                IpFamily::V6,
+                family,
                 lane.rule_priority,
                 lane.table,
                 lane.mark,
@@ -705,47 +702,50 @@ fn detect_resource_conflicts_with_owner(
             )?;
         }
     }
-
     Ok(())
 }
 
 fn check_route(
     snapshot: &KernelSnapshot,
     family: IpFamily,
-    table: u32,
-    gateway: Option<IpAddr>,
-    interface: &str,
+    lane: &LanePlan,
     current: Option<&KernelPlan>,
 ) -> Result<(), ResourceConflict> {
-    if let Some(current) = current {
-        if let Some((owned_gateway, owned_interface)) = owned_route(current, family, table)
-            .map_err(|()| ResourceConflict::RoutingTableInUse(table))?
-        {
-            let mut entries = snapshot
-                .routes
-                .iter()
-                .filter(|route| route.family == family && route.table == table);
-            return match (entries.next(), entries.next()) {
-                (None, None) => Ok(()),
-                (Some(route), None)
-                    if route.matches_default(family, table, owned_gateway, &owned_interface) =>
-                {
-                    Ok(())
-                }
-                _ => Err(ResourceConflict::RoutingTableInUse(table)),
-            };
-        }
-    }
-
-    let mut entries = snapshot
+    let table = lane.table;
+    let allowed_unicast = match current
+        .map(|current| owned_route(current, family, table))
+        .transpose()
+        .map_err(|()| ResourceConflict::RoutingTableInUse(table))?
+    {
+        Some(Some(owned)) => owned,
+        _ => lane_unicast_route(lane, family),
+    };
+    let mut unicast = 0;
+    let mut terminal = 0;
+    for route in snapshot
         .routes
         .iter()
-        .filter(|route| route.family == family && route.table == table);
-    match (entries.next(), entries.next()) {
-        (None, None) => Ok(()),
-        (Some(route), None) if route.matches_default(family, table, gateway, interface) => Ok(()),
-        _ => Err(ResourceConflict::RoutingTableInUse(table)),
+        .filter(|route| route.family == family && route.table == table)
+    {
+        if route.matches_terminal(family, table) {
+            terminal += 1;
+            continue;
+        }
+        let exact = match &allowed_unicast {
+            Some(OwnedRoute::Unicast { gateway, interface }) => {
+                route.matches_default(family, table, *gateway, interface)
+            }
+            _ => false,
+        };
+        if !exact {
+            return Err(ResourceConflict::RoutingTableInUse(table));
+        }
+        unicast += 1;
     }
+    if unicast > 1 || terminal > 1 {
+        return Err(ResourceConflict::RoutingTableInUse(table));
+    }
+    Ok(())
 }
 
 fn check_rule(
@@ -757,7 +757,7 @@ fn check_rule(
     current: Option<&KernelPlan>,
 ) -> Result<(), ResourceConflict> {
     if let Some(current) = current {
-        if let Some((owned_table, owned_mark)) = owned_rule(current, family, priority)
+        if let Some((owned_table, owned_mark)) = owned_rule(current, priority)
             .map_err(|()| ResourceConflict::RulePriorityInUse(priority))?
         {
             let mut entries = snapshot
@@ -787,38 +787,30 @@ fn check_rule(
     }
 }
 
+/// The unicast default the current plan owns in `table`: `Some(None)` when the
+/// table is owned but holds only its terminal route, `None` when not owned.
 fn owned_route(
     current: &KernelPlan,
     family: IpFamily,
     table: u32,
-) -> Result<Option<(Option<IpAddr>, String)>, ()> {
-    exactly_one(current.lanes.iter().filter_map(|lane| {
-        if lane.availability != LaneAvailability::Available || lane.table != table {
-            return None;
-        }
-        let gateway = match family {
-            IpFamily::V4 => lane.route_v4?.gateway().copied().map(IpAddr::V4),
-            IpFamily::V6 => lane.route_v6?.gateway().copied().map(IpAddr::V6),
-        };
-        Some((gateway, lane.interface.clone()))
-    }))
+) -> Result<Option<Option<OwnedRoute>>, ()> {
+    exactly_one(
+        current
+            .lanes
+            .iter()
+            .filter(|lane| lane.table == table)
+            .map(|lane| lane_unicast_route(lane, family)),
+    )
 }
 
-fn owned_rule(
-    current: &KernelPlan,
-    family: IpFamily,
-    priority: u32,
-) -> Result<Option<(u32, u32)>, ()> {
-    exactly_one(current.lanes.iter().filter_map(|lane| {
-        if lane.availability != LaneAvailability::Available || lane.rule_priority != priority {
-            return None;
-        }
-        let family_is_installed = match family {
-            IpFamily::V4 => lane.route_v4.is_some(),
-            IpFamily::V6 => lane.route_v6.is_some(),
-        };
-        family_is_installed.then_some((lane.table, lane.mark))
-    }))
+fn owned_rule(current: &KernelPlan, priority: u32) -> Result<Option<(u32, u32)>, ()> {
+    exactly_one(
+        current
+            .lanes
+            .iter()
+            .filter(|lane| lane.rule_priority == priority)
+            .map(|lane| (lane.table, lane.mark)),
+    )
 }
 
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Result<Option<T>, ()> {

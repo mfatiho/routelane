@@ -592,6 +592,38 @@ mod affinity {
                 .any(|expr| expr["match"]["right"]
                     == json!({"prefix":{"addr":"203.0.113.0","len":24}}))));
     }
+
+    #[test]
+    fn interface_predicates_use_frozen_indices_not_runtime_name_lookup() {
+        let document = render_nft_document(Some(&plan()), None, false);
+        let nat = rules(&document, "source_nat");
+        assert!(nat[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |expr| expr["match"]["left"] == json!({"meta":{"key":"oif"}})
+                    && expr["match"]["right"] == 2
+            ));
+        assert!(nat[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |expr| expr["match"]["left"] == json!({"meta":{"key":"iif"}})
+                    && expr["match"]["right"] == 0
+            ));
+        let mut reused_name = Packet {
+            mark: 0x524c0001,
+            ct_mark: 0x524c0001,
+            oif: 9,
+            oifname: "eth0",
+            ..Default::default()
+        };
+        execute(&document, "source_nat", &mut reused_name);
+        assert!(!reused_name.translated);
+        assert_eq!(execute(&document, "egress_guard", &mut reused_name), "drop");
+    }
 }
 
 fn fixture_kernel_plan_with_all_actions() -> KernelPlan {

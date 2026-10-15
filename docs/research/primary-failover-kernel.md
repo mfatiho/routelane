@@ -121,3 +121,68 @@ ama journal’ın guarded/pending exact fingerprint’i bütün guard ifadelerin
 doğrulamaya devam eder. Journal yoksa modern guarded tablo otomatik orphan
 cleanup ile silinmez; doğrulanamayan bir geçiş durumunda temizlik reddedilir.
 [Ownership ve regression testleri](../../src/backend/privileged.rs).
+
+## Arayüz kaybı / aynı adla yeni cihaz: ek doğrulama
+
+VM’de nftables 1.0.9, `meta oif 2` ifadesini cihaz varken `eth0`, silinince
+`2` string’iyle dump ediyor. Ayrıca adı `0`, index’i `9` olan bir dummy cihaz
+oluşturulduğunda native `iif 0` ile `iif 9` dump’ta aynı `"0"` string’iyle
+göründü. Sayısal-only adlar bu ABI’de exact kimlik kanıtı için belirsizdir;
+güvenlik kontrolü bunları tahminle eşleştirmek yerine reddeder.
+[nft meta ifindex printer/parser kaynak kodu](https://sources.debian.org/src/nftables/1.1.3-1/src/meta.c/#L1185),
+[literal-index regression testi](../../tests/nftables_contract.rs).
+
+Üretici artık ifindex’i doğrudan sayı olarak yüklüyor; eski plan yeniden
+yüklendiğinde adın yeni cihaz üzerinde çözülmesi mümkün olmuyor. Canlı dump’ın
+yalnız ifindex-typed match operand’ları, iki read-only link kimlik snapshot’ı
+aynı kalmışsa güncel gözlenen map ile sayıya çevriliyor. Eski name→index
+varsayımları, name predicate’leri veya başka semboller bu dönüşümde kullanılmaz.
+[Canlı exact proof sınırı](../../src/backend/privileged.rs),
+[ortak üretici](../../src/backend/nft_document.rs).
+
+VM kapısı 86 nesnede hem JSON hem TEXT için tekrar exact geçti; cihaz `2`
+silinip `eth0` adı index `9` ile oluşturulduğunda da eski programın numeric
+kimlik kanıtı değişmedi. Bu codec/scope kanıtıdır; otomatik runtime ve Polkit
+kabul kapılarını tamamlamış sayılmaz.
+
+## Terminal route ve dar arayüz ayarı (15 Ekim 2026, Task 6)
+
+Onaylı Ubuntu 24.04 VM’de (kernel 6.8.0-142, iproute2 6.1.0, nft 1.0.9),
+yalnız bu iş için açılıp kapatılan geçici netns içinde ölçüldü:
+
+- IPv4’te `ip route replace` unreachable ile unicast default’u birbirine
+  çevirir. Arayüz kapanınca veya adres silinince kernel lane tablosundaki
+  unicast default’u siler; tablo boş kalırsa mark’lı trafik sonraki kurallara,
+  dolayısıyla main tabloya düşer.
+- Unicast (metric 0/1024) ile düşük öncelikli unreachable default aynı tabloda
+  birlikte durur; link kaybında yalnız unreachable kalır ve lookup reddedilir.
+- IPv6’da tabloda yalnız unreachable varken global adresli `via` gateway ile
+  unicast eklemek `No route to host` ile başarısız olur (gateway önce bu
+  tabloda doğrulanır). Link-local gateway, device route ve mevcut bir
+  unicast’in değiştirilmesi çalışır.
+- iproute2 6.1 `ip -6 route flush`, metric 4294967295 olan IPv6 unreachable
+  default’u tablonun null entry’si sayıp atlar; 4294967294 ve daha düşükleri
+  iki ailede de flush eder.
+
+Karar: her lane×aile, unicast çıkışından bağımsız olarak metric 4294967294
+unreachable default ve kendi policy rule’una sahip olur. IPv6 global gateway’li
+unicast, yalnız terminal bulunan bir tabloya girerken transaction guard’ı
+altında terminal geçici kaldırılıp unicast’ten sonra yeniden eklenir.
+Komutlar ve crash-prefix durumları aynı tipli adım modelinden türetilir.
+[Adım modeli](../../src/backend/policy_route.rs),
+[ownership ve crash modeli](../../src/backend/privileged.rs).
+
+`ProtectKernelTunables=yes` + `ReadWritePaths=/proc/sys/net/ipv4/conf`
+(systemd 255) yalnız `conf` alt ağacını yazılabilir yapar; `ip_forward` salt
+okunur kalır. Ölçüm değerleri değiştirmeden aynı değeri geri yazarak yapıldı.
+Helper kodu yalnız seçili arayüzün `src_valid_mark` değerini yazar; all/default
+yazılmaz. Gerçek kurulu servisle doğrulama Task 12 kapsamındadır.
+
+Gerçek helper root süiti (standart ve run-owned client netns’te strict RPF)
+6/6 geçti: strict modda üç lane arayüzünde `src_valid_mark=1` yazılıp temizlikte
+0’a döndü, global değer hiç yazılmadı; lane C kapatıldığında tablo 20002’de
+iki ailede yalnız terminal route kaldı ve mark’lı lookup reddedildi. Aynı test
+Task 6 öncesi helper ile terminal route kontrolünde başarısız oldu. Journal
+kaybolursa makbuz da kaybolur; orphan recovery önceki değeri kanıtlayamadığı
+için ayara dokunmaz. Bu kanıtlar TCP/UDP/IPv6 trafik, failback, Polkit veya
+Debian/Fedora kapılarını kapatmaz.

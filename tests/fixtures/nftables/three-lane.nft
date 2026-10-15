@@ -1,5 +1,5 @@
 add table inet routelane
-add chain inet routelane rules_v2_8db9dac0f5685fdd12e9cba0e3fd9f687e66878a78755663fac7fe59629c2657
+add chain inet routelane rules_v2_4bb248a9e1d422c54c83e7143dfccade2d1e46f4a1253e7e2a78e1976565be18
 add chain inet routelane state_g1_bba4ad40ece98600
 add chain inet routelane restore4
 add chain inet routelane select4_524c0002
@@ -43,9 +43,9 @@ add rule inet routelane output ct mark 0 ct state { "established", "related" } r
 add rule inet routelane output ct mark 0 ct direction "reply" return
 add rule inet routelane output meta nfproto "ipv4" counter goto select4_524c0002
 add rule inet routelane output meta nfproto "ipv6" counter goto select6_524c0002
-add rule inet routelane prerouting meta nfproto "ipv4" meta iif "wg-privacy" meta iifname "wg-privacy" ct direction "reply" ct original ip saddr "10.0.0.2" ct mark 1380712450 meta mark set ct mark return
-add rule inet routelane prerouting meta nfproto "ipv6" meta iif "wg-privacy" meta iifname "wg-privacy" ct direction "reply" ct original ip6 saddr "2001:db8::2" ct mark 1380712450 meta mark set ct mark return
-add rule inet routelane egress_guard meta iif != "0" return
+add rule inet routelane prerouting meta nfproto "ipv4" meta iif 2 meta iifname "wg-privacy" ct direction "reply" ct original ip saddr "10.0.0.2" ct mark 1380712450 meta mark set ct mark return
+add rule inet routelane prerouting meta nfproto "ipv6" meta iif 2 meta iifname "wg-privacy" ct direction "reply" ct original ip6 saddr "2001:db8::2" ct mark 1380712450 meta mark set ct mark return
+add rule inet routelane egress_guard meta iif != 0 return
 add rule inet routelane egress_guard meta oifname "lo" return
 add rule inet routelane egress_guard fib daddr type "local" return
 add rule inet routelane egress_guard udp sport 68 udp dport 67 ip daddr "255.255.255.255" return
@@ -53,8 +53,8 @@ add rule inet routelane egress_guard ip daddr 224.0.0.0/24 return
 add rule inet routelane egress_guard ip6 daddr ff02::/16 return
 add rule inet routelane egress_guard ip6 hoplimit 255 icmpv6 type { "nd-router-solicit", "nd-router-advert", "nd-neighbor-solicit", "nd-neighbor-advert", "nd-redirect" } return
 add rule inet routelane egress_guard udp sport 546 udp dport 547 ip6 daddr fe80::/10 return
-add rule inet routelane egress_guard meta nfproto "ipv4" meta iif "0" meta oif "wg-privacy" meta oifname "wg-privacy" ct direction "original" ct original ip saddr "10.0.0.2" ct mark 1380712450 meta mark 1380712450 return
-add rule inet routelane egress_guard meta nfproto "ipv6" meta iif "0" meta oif "wg-privacy" meta oifname "wg-privacy" ct direction "original" ct original ip6 saddr "2001:db8::2" ct mark 1380712450 meta mark 1380712450 return
+add rule inet routelane egress_guard meta nfproto "ipv4" meta iif 0 meta oif 2 meta oifname "wg-privacy" ct direction "original" ct original ip saddr "10.0.0.2" ct mark 1380712450 meta mark 1380712450 return
+add rule inet routelane egress_guard meta nfproto "ipv6" meta iif 0 meta oif 2 meta oifname "wg-privacy" ct direction "original" ct original ip6 saddr "2001:db8::2" ct mark 1380712450 meta mark 1380712450 return
 add rule inet routelane egress_guard meta mark 1380712449-1380712548 drop
-add rule inet routelane source_nat meta nfproto "ipv4" meta iif "0" meta oif "wg-privacy" meta oifname "wg-privacy" ct direction "original" ct original ip saddr "10.0.0.2" ct mark 1380712450 meta mark 1380712450 counter masquerade
-add rule inet routelane source_nat meta nfproto "ipv6" meta iif "0" meta oif "wg-privacy" meta oifname "wg-privacy" ct direction "original" ct original ip6 saddr "2001:db8::2" ct mark 1380712450 meta mark 1380712450 counter masquerade
+add rule inet routelane source_nat meta nfproto "ipv4" meta iif 0 meta oif 2 meta oifname "wg-privacy" ct direction "original" ct original ip saddr "10.0.0.2" ct mark 1380712450 meta mark 1380712450 counter masquerade
+add rule inet routelane source_nat meta nfproto "ipv6" meta iif 0 meta oif 2 meta oifname "wg-privacy" ct direction "original" ct original ip6 saddr "2001:db8::2" ct mark 1380712450 meta mark 1380712450 counter masquerade

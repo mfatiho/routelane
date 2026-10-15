@@ -91,6 +91,18 @@ impl TopologySnapshot {
     pub fn interface(&self, name: &str) -> Option<&InterfaceTopology> {
         self.interfaces.get(name)
     }
+
+    pub(crate) fn interface_identities(&self) -> BTreeMap<String, InterfaceIdentity> {
+        self.interfaces
+            .iter()
+            .filter_map(|(name, entry)| {
+                entry
+                    .identity
+                    .clone()
+                    .map(|identity| (name.clone(), identity))
+            })
+            .collect()
+    }
     pub fn is_observed(&self) -> bool {
         self.observed
     }
