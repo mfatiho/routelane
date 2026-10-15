@@ -291,6 +291,8 @@ where
         profile_id: ProfileId,
         rule_id: RuleId,
     ) -> Result<ApplicationLaunchResult, DaemonError> {
+        let _mutation = self.mutation.lock().await;
+        self.ensure_reconciled().await.result?;
         let selector = self.application_selector(&profile_id, &rule_id).await?;
         let program = selector
             .launch
@@ -311,12 +313,17 @@ where
                 Ok(())
             });
         }
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|error| DaemonError::helper(format!("start application: {error}")))?;
         let pid = child
             .id()
             .ok_or_else(|| DaemonError::helper("started application has no PID"))?;
+        tokio::spawn(async move {
+            if let Err(error) = child.wait().await {
+                log::warn!("wait for launched application {pid}: {error}");
+            }
+        });
         Ok(ApplicationLaunchResult { pid })
     }
 
@@ -325,6 +332,8 @@ where
         profile_id: ProfileId,
         rule_id: RuleId,
     ) -> Result<ApplicationAdoptionResult, DaemonError> {
+        let _mutation = self.mutation.lock().await;
+        self.ensure_reconciled().await.result?;
         let selector = self.application_selector(&profile_id, &rule_id).await?;
         let processes = matching_processes(&selector);
         let mut adopted_count = 0;
@@ -336,6 +345,7 @@ where
                 .await
             {
                 Ok(()) => adopted_count += 1,
+                Err(error) if error.code() == "DAEMON_NEEDS_AUTHORIZATION" => return Err(error),
                 Err(_) => skipped_count += 1,
             }
         }
@@ -351,8 +361,15 @@ where
         rule_id: &RuleId,
     ) -> Result<crate::domain::ApplicationSelector, DaemonError> {
         let state = self.state.lock().await;
+        if state
+            .applied
+            .as_ref()
+            .is_none_or(|applied| &applied.plan().profile_id != profile_id)
+        {
+            return Err(DaemonError::new("DAEMON_APPLICATION_INACTIVE", "Enable the application's routing profile before launching or adopting its processes."));
+        }
         let profile = state
-            .desired
+            .applied_profile
             .as_ref()
             .filter(|profile| &profile.id == profile_id)
             .ok_or_else(|| DaemonError::validation("application profile is unavailable"))?;
@@ -361,10 +378,32 @@ where
             .iter()
             .find(|rule| &rule.id == rule_id && rule.enabled)
             .ok_or_else(|| DaemonError::validation("application rule is unavailable"))?;
-        match &rule.source {
-            RuleSource::Application(selector) => Ok(selector.clone()),
-            RuleSource::Any => Err(DaemonError::validation("rule is not an application rule")),
+        let selector = match &rule.source {
+            RuleSource::Application(selector) => selector.clone(),
+            RuleSource::Any => {
+                return Err(DaemonError::validation("rule is not an application rule"));
+            }
+        };
+        drop(state);
+        // Both launch and adoption must reject shared sandbox launchers. Matching
+        // /usr/bin/snap or flatpak could otherwise select unrelated applications.
+        for program in std::iter::once(&selector.executable_path)
+            .chain(selector.launch.as_ref().map(|launch| &launch.executable))
+        {
+            let resolved = fs::canonicalize(program).map_err(|error| {
+                DaemonError::validation(format!("application executable is unavailable: {error}"))
+            })?;
+            if matches!(
+                resolved.file_name().and_then(|name| name.to_str()),
+                Some("snap" | "flatpak")
+            ) {
+                return Err(DaemonError::new(
+                    "DAEMON_APPLICATION_SANDBOX_UNSUPPORTED",
+                    "Snap/Flatpak application routing is not supported. Select an application installed directly on the host.",
+                ));
+            }
         }
+        Ok(selector)
     }
 
     pub async fn apply_profile(&self, profile: Profile) -> Result<ApplyProfileResult, DaemonError> {
@@ -672,11 +711,24 @@ where
     }
 
     pub async fn deactivate(&self) -> Result<(), DaemonError> {
-        self.ensure_reconciled().await.result?;
         let _mutation = self.mutation.lock().await;
+        if let Err(error) = self.ensure_reconciled().await.result {
+            // A validated plan with missing live resources must remain removable.
+            // The authorized helper still checks exact ownership before deleting.
+            if error.code() != "DAEMON_RECONCILIATION_FAILED"
+                || self.state.lock().await.applied.is_none()
+            {
+                return Err(error);
+            }
+        }
         if let Err(error) = self.helper.cleanup().await {
             self.record_failure(error.clone()).await;
             return Err(error);
+        }
+        {
+            let mut gate = self.reconciliation.lock().await;
+            gate.completed = true;
+            gate.last_result = Some(Ok(()));
         }
         {
             let mut state = self.state.lock().await;

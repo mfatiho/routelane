@@ -21,4 +21,5 @@ target
 #.idea/
 dist/*.deb
 .worktrees/
-docs/
+docs/*
+!docs/reliability-audit.md

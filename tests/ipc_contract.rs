@@ -786,6 +786,100 @@ async fn restart_live_drift_is_failed_without_claiming_inactive_or_mutating() {
 }
 
 #[tokio::test]
+async fn application_launch_rejects_inactive_policy_before_cgroup_mutation() {
+    let mut profile = fixture_profile();
+    profile.rules.push(Rule {
+        id: RuleId::from("browser"),
+        enabled: true,
+        priority: 1,
+        source: RuleSource::Application(routelane::domain::ApplicationSelector {
+            desktop_id: None,
+            executable_path: "/usr/bin/true".into(),
+            include_children: true,
+            launch: None,
+        }),
+        target: RuleTarget::Any,
+        action: RuleAction::Direct,
+    });
+    let config = MemoryConfig::default();
+    *config.desired.lock().unwrap() = Some(profile);
+    let service = restarted_service(FakeHelper::default(), config);
+    let error = service
+        .launch_application(ProfileId::from("default"), RuleId::from("browser"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "DAEMON_APPLICATION_INACTIVE");
+}
+
+#[tokio::test]
+async fn deactivation_remains_available_after_restart_detects_kernel_drift() {
+    let helper = FakeHelper::default();
+    helper.seed_live_plan(applied_fixture_plan(7));
+    helper.drift();
+    let service = restarted_service(helper.clone(), MemoryConfig::default());
+    service.deactivate().await.unwrap();
+    assert!(helper.live_plan().is_none());
+    assert_eq!(*helper.cleanup_calls.lock().unwrap(), 1);
+    let response = service
+        .handle(DaemonEnvelope::new(
+            "after-cleanup",
+            DaemonRequest::GetStatus,
+        ))
+        .await;
+    assert!(
+        matches!(response.result, Some(DaemonResult::Status(ref status)) if status.applied_profile_id.is_none() && status.health.state == HealthState::Inactive)
+    );
+}
+
+#[tokio::test]
+async fn sandbox_launchers_are_rejected_for_launch_and_process_adoption() {
+    let directory = TempDir::new().unwrap();
+    for name in ["snap", "flatpak"] {
+        let launcher = directory.path().join(name);
+        fs::write(&launcher, "").unwrap();
+        let mut profile = fixture_profile();
+        profile.lanes.push(routelane::domain::Lane {
+            id: "browser-lane".into(),
+            name: "Browser".to_owned(),
+            interface: "unavailable-test-interface".into(),
+            fallback_lane: None,
+            failure_policy: routelane::domain::LaneFailurePolicy::Direct,
+        });
+        profile.rules.push(Rule {
+            id: "browser".into(),
+            enabled: true,
+            priority: 1,
+            source: RuleSource::Application(routelane::domain::ApplicationSelector {
+                desktop_id: None,
+                executable_path: launcher,
+                include_children: true,
+                launch: None,
+            }),
+            target: RuleTarget::Any,
+            action: RuleAction::Route("browser-lane".into()),
+        });
+        let (service, _, _) = service();
+        service.apply_profile(profile).await.unwrap();
+        let launch_error = service
+            .launch_application("default".into(), "browser".into())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            launch_error.code(),
+            "DAEMON_APPLICATION_SANDBOX_UNSUPPORTED"
+        );
+        let adoption_error = service
+            .adopt_application_processes("default".into(), "browser".into())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            adoption_error.code(),
+            "DAEMON_APPLICATION_SANDBOX_UNSUPPORTED"
+        );
+    }
+}
+
+#[tokio::test]
 async fn orphan_recovery_resets_failed_reconciliation_and_allows_apply() {
     let helper = FakeHelper::default();
     helper.seed_orphaned_resources();

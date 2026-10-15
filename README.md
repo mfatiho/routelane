@@ -46,6 +46,12 @@ generation. State journals are private root-owned files under `/run/routelane`.
 The helper is activated through system D-Bus; it has no enable/install target
 and is not intended to be started directly.
 
+Inspection never replays a journal or changes kernel resources, even after an
+interrupted transaction. Recovery is deferred to an authorized mutating call.
+The runtime journal survives a helper service restart, but not a reboot.
+Application cgroup writes are confined to `/sys/fs/cgroup/routelane.apps`;
+the rest of the cgroup filesystem remains protected in the helper service.
+
 RouteLane does not use an external “what is my IP” service for health checks.
 Connection Health compares the desired plan with lossless local interface,
 route, rule, nftables, ownership, and conflict evidence.
@@ -76,6 +82,15 @@ Application routing applies to every new connection from the selected process
 tree, including CDN, authentication, and browser verification endpoints. For a
 browser this also means other tabs in the same browser process use that lane.
 RouteLane does not decrypt HTTPS or infer third-party domains.
+
+Domain rules currently use the system resolver's IP snapshot when a profile is
+applied. Continuous DNS/TTL refresh is not implemented; a later IP change or a
+browser using a different DNS resolver can therefore miss that snapshot.
+Reapplying the profile refreshes it, but does not guarantee that a browser's
+independent DNS answers will match. Application affinity avoids depending on
+domain IP snapshots for new connections from supported host processes.
+Connection Health verifies local routing resources, not successful loading of
+an arbitrary website.
 
 Host `.desktop` applications with a resolvable executable are supported.
 Flatpak and Snap applications are detected as sandboxed integration cases and
@@ -149,6 +164,7 @@ Installed integration files:
 | `/usr/lib/routelane/routelane-helper` | fixed, root-managed helper path |
 | `/usr/lib/systemd/user/routelane-daemon.service` | user service |
 | `/usr/lib/systemd/system/routelane-helper.service` | D-Bus-activated system service |
+| `/usr/lib/tmpfiles.d/routelane.conf` | create the helper's isolated application cgroup subtree |
 | `/usr/share/dbus-1/system-services/io.github.routelane.Helper.service` | D-Bus activation |
 | `/usr/share/polkit-1/actions/io.github.routelane.policy` | Polkit policy |
 
@@ -182,8 +198,9 @@ routelanectl deactivate
 `routelanectl` uses the same canonical daemon IPC client as the GUI. Its Phase
 1 surface is intentionally limited to the commands above.
 
-`apply-profile` reads the same schema-version-2 configuration document as the
-desktop application. When the document has one profile, no selector is needed.
+`apply-profile` reads the same schema-version-3 configuration document as the
+desktop application. Schema-version-2 and legacy documents are migrated to
+version 3 on load, and every migrated profile is inactive. When the document has one profile, no selector is needed.
 For multiple profiles, `--profile <id-or-name>` is required; missing, duplicate,
 ambiguous, or unknown selectors fail locally before daemon contact. Bare
 profile JSON is not accepted. Input must be a current-user-owned regular file
@@ -192,7 +209,7 @@ devices, and oversized files are rejected.
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "language": "en",
   "profiles": [
     {
@@ -208,13 +225,22 @@ devices, and oversized files are rejected.
           "failure_policy": "Inactive"
         }
       ],
-      "rules": []
+      "rules": [],
+      "routing": {
+        "primary": "FollowSystemDefault",
+        "backups": [],
+        "automatic_failover": true
+      }
     }
   ]
 }
 ```
 
-The desktop configuration is schema version 2 and is stored at
+Every version-3 profile requires a `routing` object. `primary` is either
+`"FollowSystemDefault"` or `{"Lane": "<lane-id>"}`, and `backups` lists the
+lane IDs the user approved for failover.
+
+The desktop configuration is schema version 3 and is stored at
 `~/.config/routelane/config.json`. Stored profiles are inactive on load; a user
 must explicitly apply one.
 
@@ -274,6 +300,9 @@ rollback/health scenarios must pass for every listed distribution and
 architecture.
 
 ## Testing
+
+See [the reliability audit](docs/reliability-audit.md) for the current fixes,
+verification evidence, and remaining runtime/release gates.
 
 Rootless checks:
 
