@@ -23,3 +23,7 @@ RestrictAddressFamilies=AF_UNIX AF_NETLINK
 # interface's src_valid_mark below this path (never all/default); every other
 # kernel tunable stays read-only under ProtectKernelTunables=yes.
 ReadWritePaths=/proc/sys/net/ipv4/conf
+# An armed runtime needs the helper alive. A crash restarts it, and the
+# journaled runtime resumes only after exact grant and kernel verification.
+Restart=on-failure
+RestartSec=1s

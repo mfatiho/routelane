@@ -10,6 +10,7 @@ mod policy_route;
 mod primary;
 mod privileged;
 mod runtime;
+mod runtime_monitor;
 mod topology;
 mod transaction;
 
@@ -49,6 +50,9 @@ pub use runtime::{
     policy_hash, restrict_to_grant, RuntimeActivation, RuntimeApplyResponse, RuntimeEnvironment,
     RuntimeGrant, RuntimePhase, RuntimeRecord, RuntimeRestoreReceipt, RuntimeStatus,
     SystemRuntimeEnvironment, MAX_ACTIVATION_JSON_BYTES, RUNTIME_PROTOCOL_VERSION,
+};
+pub use runtime_monitor::{
+    drive_runtime, forward_kernel_notifications, MonitorEvent, MonitorTiming, RuntimeRefresher,
 };
 pub use topology::{
     capture_system_topology, parse_topology, InterfaceIdentity, InterfaceTopology, TopologyError,

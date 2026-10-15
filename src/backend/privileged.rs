@@ -799,6 +799,7 @@ struct ArmedRuntime {
     selector: Option<PrimarySelector>,
     phase: RuntimePhase,
     last_error: Option<String>,
+    failback_in_ms: Option<u64>,
 }
 
 /// Used until a backend is given the kernel's boot/netns facts; a runtime
@@ -1013,7 +1014,7 @@ where
             _ => captured.snapshot,
         };
         self.load_runtime()?;
-        let runtime = self.runtime_status();
+        let runtime = self.runtime_status_snapshot();
         let diagnostics = if self.legacy.is_some() {
             vec![
                 "a schema-1 RouteLane journal is cleanup-only; run cleanup before activating"
@@ -1082,6 +1083,22 @@ where
 
     fn restore_runtime(&mut self, token: &str, uid: u32) -> Result<RuntimeStatus, PrivilegedError> {
         self.restore_runtime_inner(token, uid)
+    }
+
+    fn runtime_status(&mut self) -> Result<RuntimeStatus, PrivilegedError> {
+        self.prepare_runtime_operation()?;
+        Ok(self.runtime_status_snapshot())
+    }
+
+    fn degrade_runtime(&mut self, reason: String) -> Result<RuntimeStatus, PrivilegedError> {
+        self.prepare_runtime_operation()?;
+        if let Some(runtime) = self.runtime.as_mut() {
+            if runtime.phase != RuntimePhase::NeedsReauthorization {
+                runtime.phase = RuntimePhase::Degraded;
+                runtime.last_error = Some(reason);
+            }
+        }
+        Ok(self.runtime_status_snapshot())
     }
 }
 
@@ -1797,6 +1814,7 @@ where
                     RuntimePhase::Armed
                 },
                 last_error: mismatch,
+                failback_in_ms: None,
             }
         });
         self.runtime_loaded = true;
@@ -1820,7 +1838,7 @@ where
             .then(|| "runtime grant does not match its journaled policy".to_owned())
     }
 
-    fn runtime_status(&self) -> RuntimeStatus {
+    fn runtime_status_snapshot(&self) -> RuntimeStatus {
         let generation = self.current.as_ref().map_or(0, |state| state.generation);
         match &self.runtime {
             None => RuntimeStatus::inactive(generation),
@@ -1830,6 +1848,7 @@ where
                 decision: Some(runtime.record.decision.clone()),
                 phase: runtime.phase,
                 last_error: runtime.last_error.clone(),
+                failback_in_ms: runtime.failback_in_ms,
             },
         }
     }
@@ -1948,9 +1967,10 @@ where
             selector: Some(selector),
             phase: RuntimePhase::Armed,
             last_error: None,
+            failback_in_ms: None,
         });
         Ok(RuntimeApplyResponse {
-            status: self.runtime_status(),
+            status: self.runtime_status_snapshot(),
             plan,
             rollback_receipt: token,
         })
@@ -1963,7 +1983,7 @@ where
     ) -> Result<RuntimeStatus, PrivilegedError> {
         let unverified = self.prepare_runtime_operation()?;
         let Some(mut runtime) = self.runtime.take() else {
-            return Ok(self.runtime_status());
+            return Ok(self.runtime_status_snapshot());
         };
         let outcome = self.refresh_armed(&mut runtime, topology, now, unverified);
         if let Err(error) = outcome {
@@ -1977,7 +1997,7 @@ where
             runtime.selector = None;
         }
         self.runtime = Some(runtime);
-        Ok(self.runtime_status())
+        Ok(self.runtime_status_snapshot())
     }
 
     fn refresh_armed(
@@ -2003,6 +2023,9 @@ where
             PrimarySelector::resume(&runtime.record.profile, &filtered, &runtime.record.decision)
         });
         let decision = selector.update(&runtime.record.profile.routing, &filtered, now);
+        runtime.failback_in_ms = selector
+            .next_deadline()
+            .map(|deadline| deadline.saturating_sub(now).as_millis().max(1) as u64);
         let candidate = compile_runtime_plan(
             &runtime.record.profile,
             &filtered,
@@ -2076,7 +2099,7 @@ where
         }
         let Some(mut previous) = receipt.previous_plan else {
             self.cleanup_with_receipt(None)?;
-            return Ok(self.runtime_status());
+            return Ok(self.runtime_status_snapshot());
         };
         previous.generation = current.generation + 1;
         let lost_unicast = self.revalidate_current_ownership_for(&previous)?;
@@ -2092,8 +2115,9 @@ where
             selector: None,
             phase: RuntimePhase::Armed,
             last_error: None,
+            failback_in_ms: None,
         });
-        Ok(self.runtime_status())
+        Ok(self.runtime_status_snapshot())
     }
 }
 
@@ -4627,6 +4651,17 @@ pub trait PrivilegedBackend: Send {
     ) -> Result<RuntimeStatus, PrivilegedError> {
         Err(PrivilegedError::new("runtime authority is not supported"))
     }
+
+    /// Current runtime status without a kernel snapshot.
+    fn runtime_status(&mut self) -> Result<RuntimeStatus, PrivilegedError> {
+        Ok(RuntimeStatus::default())
+    }
+
+    /// Records that kernel evidence is currently unavailable (for example a
+    /// closed monitor); the next successful refresh clears it.
+    fn degrade_runtime(&mut self, _reason: String) -> Result<RuntimeStatus, PrivilegedError> {
+        Ok(RuntimeStatus::default())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4729,7 +4764,8 @@ where
     }
 
     /// Interactive authorization arms runtime authority for `uid`, the
-    /// already resolved bus caller of this request.
+    /// already resolved bus caller of this request. `prepare` runs after
+    /// authorization and before any kernel change (application cgroups).
     pub async fn activate_runtime(
         &self,
         sender: Option<&str>,
@@ -4737,6 +4773,7 @@ where
         uid: u32,
         topology: TopologySnapshot,
         now: Duration,
+        prepare: impl FnOnce(&RuntimeActivation) -> Result<(), ServiceError>,
     ) -> Result<RuntimeApplyResponse, ServiceError> {
         self.authorize(sender).await?;
         if activation_json.len() > super::MAX_ACTIVATION_JSON_BYTES {
@@ -4747,6 +4784,7 @@ where
         }
         let activation: RuntimeActivation = serde_json::from_str(activation_json)
             .map_err(|error| ServiceError::InvalidPlanJson(error.to_string()))?;
+        prepare(&activation)?;
         self.run_backend(move |backend| backend.activate_runtime(&activation, uid, &topology, now))
             .await
     }
@@ -4770,6 +4808,16 @@ where
     ) -> Result<RuntimeStatus, ServiceError> {
         self.authorize(sender).await?;
         self.run_backend(move |backend| backend.restore_runtime(&token, uid))
+            .await
+    }
+
+    /// Internal monitor queries; not exposed on the bus.
+    pub async fn runtime_status(&self) -> Result<RuntimeStatus, ServiceError> {
+        self.run_backend(PrivilegedBackend::runtime_status).await
+    }
+
+    pub async fn degrade_runtime(&self, reason: String) -> Result<RuntimeStatus, ServiceError> {
+        self.run_backend(move |backend| backend.degrade_runtime(reason))
             .await
     }
 
@@ -8673,6 +8721,7 @@ mod tests {
                 1000,
                 fixture.observe(&up()),
                 Duration::from_secs(0),
+                |_| Ok(()),
             )
             .await
             .unwrap();
@@ -9039,7 +9088,8 @@ mod tests {
                 &serde_json::to_string(&activation(0)).unwrap(),
                 1000,
                 up(),
-                Duration::ZERO
+                Duration::ZERO,
+                |_| Ok(()),
             )
             .await
             .is_err());
