@@ -199,6 +199,7 @@ mod tests {
         KernelPlan {
             primary: Default::default(),
             local_networks: vec![],
+            local_addresses: vec![],
             generation: 1,
             profile_id: ProfileId::from("default"),
             lanes,

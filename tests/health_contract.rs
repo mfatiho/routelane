@@ -87,6 +87,7 @@ fn gatewayless_plan() -> KernelPlan {
     KernelPlan {
         primary: Default::default(),
         local_networks: vec![],
+        local_addresses: vec![],
         generation: 9,
         profile_id: ProfileId::from("wireguard"),
         lanes: vec![LanePlan {

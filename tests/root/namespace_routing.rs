@@ -639,6 +639,8 @@ fn plan(
     names: &RunNames,
     generation_two_resources: bool,
 ) -> KernelPlan {
+    let topology = routelane::backend::capture_system_topology()
+        .expect("capture real client namespace interface evidence");
     let lane_a_offset = if generation_two_resources { 10 } else { 0 };
     let lane_a_gateway = if generation_two_resources {
         "10.10.1.254"
@@ -646,8 +648,18 @@ fn plan(
         "10.10.1.1"
     };
     KernelPlan {
-        primary: Default::default(),
-        local_networks: vec![],
+        primary: routelane::backend::PrimaryDecision {
+            preferred: routelane::backend::FamilyPair {
+                v4: Some("lane-b".into()),
+                v6: None,
+            },
+            effective: routelane::backend::FamilyPair {
+                v4: routelane::backend::FamilyExit::Lane("lane-b".into()),
+                v6: routelane::backend::FamilyExit::Blocked,
+            },
+        },
+        local_networks: topology.connected_networks(),
+        local_addresses: topology.assigned_addresses(),
         generation,
         profile_id: ProfileId::from("root-integration"),
         lanes: vec![
@@ -656,9 +668,22 @@ fn plan(
                 &names.client_interfaces[0],
                 lane_a_gateway,
                 lane_a_offset,
+                &topology,
             ),
-            lane("lane-b", &names.client_interfaces[1], "10.10.2.1", 1),
-            lane("lane-c", &names.client_interfaces[2], "10.10.3.1", 2),
+            lane(
+                "lane-b",
+                &names.client_interfaces[1],
+                "10.10.2.1",
+                1,
+                &topology,
+            ),
+            lane(
+                "lane-c",
+                &names.client_interfaces[2],
+                "10.10.3.1",
+                2,
+                &topology,
+            ),
         ],
         rules: vec![
             rule(
@@ -692,11 +717,20 @@ fn plan(
     }
 }
 
-fn lane(id: &str, interface: &str, gateway: &str, offset: u32) -> LanePlan {
+fn lane(
+    id: &str,
+    interface: &str,
+    gateway: &str,
+    offset: u32,
+    topology: &routelane::backend::TopologySnapshot,
+) -> LanePlan {
+    let observed = topology
+        .interface(interface)
+        .expect("fixture interface must exist in client namespace");
     LanePlan {
-        identity: None,
-        source_v4: vec![],
-        source_v6: vec![],
+        identity: observed.identity.clone(),
+        source_v4: observed.source_v4.clone(),
+        source_v6: observed.source_v6.clone(),
         id: LaneId::from(id),
         interface: interface.to_owned(),
         route_v4: Some(RouteMode::Via(gateway.parse().unwrap())),
@@ -734,7 +768,8 @@ fn assert_probe_reaches_only(
     let output = command_output(command.arg(target));
     assert!(
         output.status.success(),
-        "probe to {target} failed: {}",
+        "probe to {target} failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let after = sink_rx_packets(names);

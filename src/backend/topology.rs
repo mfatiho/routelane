@@ -54,6 +54,7 @@ pub struct TopologySnapshot {
     defaults: [DefaultSelection; 2],
     observed: bool,
     conflicts: Vec<String>,
+    assigned_addresses: Vec<IpAddr>,
 }
 
 impl TopologySnapshot {
@@ -95,6 +96,10 @@ impl TopologySnapshot {
     }
     pub fn routing_conflicts(&self) -> &[String] {
         &self.conflicts
+    }
+
+    pub fn assigned_addresses(&self) -> Vec<IpAddr> {
+        self.assigned_addresses.clone()
     }
 
     pub fn connected_networks(&self) -> Vec<IpNet> {
@@ -261,16 +266,42 @@ pub fn parse_topology(input: TopologyInput<'_>) -> Result<TopologySnapshot, Topo
         for address in list.addr_info {
             let invalid = address.tentative
                 || address.dadfailed
-                || address.deprecated
                 || address
                     .flags
                     .iter()
-                    .any(|f| matches!(f.as_str(), "tentative" | "dadfailed" | "deprecated"))
-                || address.preferred_life_time.as_ref().and_then(number) == Some(0)
+                    .any(|f| matches!(f.as_str(), "tentative" | "dadfailed"))
                 || address.valid_life_time.as_ref().and_then(number) == Some(0);
             if invalid
                 || !matches!(address.scope.as_str(), Some("global" | "0"))
                     && number(&address.scope) != Some(0)
+            {
+                continue;
+            }
+            let usable_kind = match address.local {
+                IpAddr::V4(ip) => {
+                    address.family == "inet"
+                        && !ip.is_unspecified()
+                        && !ip.is_loopback()
+                        && !ip.is_multicast()
+                        && !ip.is_link_local()
+                }
+                IpAddr::V6(ip) => {
+                    address.family == "inet6"
+                        && !ip.is_unspecified()
+                        && !ip.is_loopback()
+                        && !ip.is_multicast()
+                        && !ip.is_unicast_link_local()
+                }
+            };
+            if !usable_kind {
+                continue;
+            }
+            // A deprecated but valid socket source still proves a locally
+            // originated existing flow; it must not authorize a new exit.
+            snapshot.assigned_addresses.push(address.local);
+            if address.deprecated
+                || address.flags.iter().any(|f| f == "deprecated")
+                || address.preferred_life_time.as_ref().and_then(number) == Some(0)
             {
                 continue;
             }
@@ -301,6 +332,8 @@ pub fn parse_topology(input: TopologyInput<'_>) -> Result<TopologySnapshot, Topo
         interface.source_v6.sort();
         interface.source_v6.dedup();
     }
+    snapshot.assigned_addresses.sort();
+    snapshot.assigned_addresses.dedup();
     for (family, route_bytes, rule_bytes) in [
         (IpFamily::V4, input.routes_v4, input.rules_v4),
         (IpFamily::V6, input.routes_v6, input.rules_v6),

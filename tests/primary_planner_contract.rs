@@ -172,6 +172,20 @@ fn hash_changes_with_primary_not_generation() {
 }
 
 #[test]
+fn local_flow_proof_includes_os_socket_sources_outside_profile_lanes() {
+    let plan = compile(&fixtures::profile(), &fixtures::topology(true, true), 1);
+    assert!(plan
+        .local_addresses
+        .contains(&"172.16.0.2".parse().unwrap()));
+    assert!(plan
+        .local_addresses
+        .contains(&"2001:db8:3::2".parse().unwrap()));
+    let mut missing_proof = plan.clone();
+    missing_proof.local_addresses.clear();
+    assert_ne!(plan.content_hash(), missing_proof.content_hash());
+}
+
+#[test]
 fn unavailable_family_produces_terminal_owned_route_and_rule_commands() {
     use routelane::backend::build_terminal_policy_commands;
     let p = fixtures::profile();

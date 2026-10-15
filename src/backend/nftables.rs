@@ -1,12 +1,6 @@
+use super::{render_nft_document, KernelPlan};
+use serde_json::Value;
 use std::fmt::Write;
-
-use ipnet::IpNet;
-
-use super::{CompiledAction, CompiledTarget, KernelPlan};
-
-const TABLE_FAMILY: &str = "inet";
-const TABLE_NAME: &str = "routelane";
-const CHAIN_NAME: &str = "output";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableMode {
@@ -17,88 +11,157 @@ pub enum TableMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NftRenderError {
     InvalidInterfaceName,
+    UnsupportedPolicyExpression,
 }
 
 impl std::fmt::Display for NftRenderError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidInterfaceName => formatter.write_str("invalid kernel interface name"),
-        }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidInterfaceName => "invalid kernel interface name",
+            Self::UnsupportedPolicyExpression => "unsupported internal nftables policy expression",
+        })
     }
 }
-
 impl std::error::Error for NftRenderError {}
 
 pub fn render_ruleset(plan: &KernelPlan, mode: TableMode) -> Result<String, NftRenderError> {
     if plan
         .lanes
         .iter()
-        .any(|lane| !is_kernel_interface_name(&lane.interface))
+        .any(|l| !is_kernel_interface_name(&l.interface))
     {
         return Err(NftRenderError::InvalidInterfaceName);
     }
-
-    let mut batch = String::new();
+    let document = render_nft_document(Some(plan), None, false);
+    let mut text = String::new();
     if mode == TableMode::Replace {
-        writeln!(batch, "delete table {TABLE_FAMILY} {TABLE_NAME}").unwrap();
+        text.push_str("delete table inet routelane\n");
     }
-    writeln!(batch, "add table {TABLE_FAMILY} {TABLE_NAME}").unwrap();
-    writeln!(
-        batch,
-        "add chain {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME} {{ type route hook output priority mangle; policy accept; }}"
-    )
-    .unwrap();
-
-    for rule in &plan.rules {
-        write!(batch, "add rule {TABLE_FAMILY} {TABLE_NAME} {CHAIN_NAME}").unwrap();
-        render_target(&mut batch, &rule.target);
-        match rule.action {
-            CompiledAction::Mark(mark) => {
-                writeln!(batch, " meta mark set 0x{mark:08x} counter return").unwrap();
+    text.push_str("add table inet routelane\n");
+    for object in document["nftables"]
+        .as_array()
+        .ok_or(NftRenderError::UnsupportedPolicyExpression)?
+    {
+        if let Some(chain) = object.get("chain") {
+            write!(text, "add chain inet routelane {}", string(&chain["name"])?).unwrap();
+            if chain.get("hook").is_some() {
+                write!(
+                    text,
+                    " {{ type {} hook {} priority {}; policy accept; }}",
+                    string(&chain["type"])?,
+                    string(&chain["hook"])?,
+                    chain["prio"]
+                )
+                .unwrap();
             }
-            CompiledAction::Direct => {
-                writeln!(batch, " meta mark set 0x00000000 counter return").unwrap();
+            text.push('\n');
+        } else if let Some(rule) = object.get("rule") {
+            write!(text, "add rule inet routelane {}", string(&rule["chain"])?).unwrap();
+            for expression in rule["expr"]
+                .as_array()
+                .ok_or(NftRenderError::UnsupportedPolicyExpression)?
+            {
+                write!(text, " {}", statement(expression)?).unwrap();
             }
-            CompiledAction::Block => {
-                writeln!(batch, " counter reject").unwrap();
-            }
+            text.push('\n');
         }
     }
-
-    Ok(batch)
+    Ok(text)
 }
 
-fn render_target(batch: &mut String, target: &CompiledTarget) {
-    match target {
-        CompiledTarget::Any => {}
-        CompiledTarget::Cgroup(path) => {
-            write!(batch, " socket cgroupv2 level 2 \"{path}\"").unwrap();
+fn string(v: &Value) -> Result<&str, NftRenderError> {
+    v.as_str()
+        .ok_or(NftRenderError::UnsupportedPolicyExpression)
+}
+fn value(v: &Value) -> Result<String, NftRenderError> {
+    if v.is_string() || v.is_number() {
+        return Ok(v.to_string());
+    }
+    if let Some(m) = v.get("meta") {
+        return Ok(format!("meta {}", string(&m["key"])?));
+    }
+    if let Some(c) = v.get("ct") {
+        return Ok(format!(
+            "ct {}{}",
+            c.get("dir")
+                .map(|d| format!("{} ", d.as_str().unwrap_or_default()))
+                .unwrap_or_default(),
+            string(&c["key"])?
+        ));
+    }
+    if let Some(p) = v.get("payload") {
+        return Ok(format!(
+            "{} {}",
+            string(&p["protocol"])?,
+            string(&p["field"])?
+        ));
+    }
+    if let Some(s) = v.get("socket") {
+        return Ok(format!(
+            "socket {} level {}",
+            string(&s["key"])?,
+            s["level"]
+        ));
+    }
+    if let Some(p) = v.get("prefix") {
+        return Ok(format!("{}/{}", string(&p["addr"])?, p["len"]));
+    }
+    if let Some(r) = v.get("range").and_then(Value::as_array) {
+        if r.len() == 2 {
+            return Ok(format!("{}-{}", value(&r[0])?, value(&r[1])?));
         }
-        CompiledTarget::Network(network) => match network {
-            IpNet::V4(network) => {
-                write!(batch, " ip daddr {}", render_v4_network(*network)).unwrap()
-            }
-            IpNet::V6(network) => {
-                write!(batch, " ip6 daddr {}", render_v6_network(*network)).unwrap()
-            }
-        },
     }
+    if let Some(set) = v.get("set") {
+        return Ok(format!(
+            "{{ {} }}",
+            set.as_array()
+                .ok_or(NftRenderError::UnsupportedPolicyExpression)?
+                .iter()
+                .map(value)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ")
+        ));
+    }
+    if v.get("fib").is_some() {
+        return Ok("fib daddr type".to_owned());
+    }
+    Err(NftRenderError::UnsupportedPolicyExpression)
 }
-
-fn render_v4_network(network: ipnet::Ipv4Net) -> String {
-    if network.prefix_len() == 32 {
-        network.addr().to_string()
-    } else {
-        network.to_string()
+fn statement(v: &Value) -> Result<String, NftRenderError> {
+    if let Some(m) = v.get("match") {
+        let operator = string(&m["op"])?;
+        return Ok(format!(
+            "{} {}{}",
+            value(&m["left"])?,
+            if matches!(operator, "==" | "in") {
+                String::new()
+            } else {
+                format!("{operator} ")
+            },
+            value(&m["right"])?
+        ));
     }
-}
-
-fn render_v6_network(network: ipnet::Ipv6Net) -> String {
-    if network.prefix_len() == 128 {
-        network.addr().to_string()
-    } else {
-        network.to_string()
+    if let Some(m) = v.get("mangle") {
+        return Ok(format!("{} set {}", value(&m["key"])?, value(&m["value"])?));
     }
+    for name in ["goto", "jump"] {
+        if let Some(g) = v.get(name) {
+            return Ok(format!("{name} {}", string(&g["target"])?));
+        }
+    }
+    if let Some(r) = v.get("reject") {
+        return Ok(format!(
+            "reject with {} type {}",
+            string(&r["type"])?,
+            string(&r["expr"])?
+        ));
+    }
+    for name in ["counter", "return", "drop", "masquerade"] {
+        if v.get(name).is_some() {
+            return Ok(name.to_owned());
+        }
+    }
+    Err(NftRenderError::UnsupportedPolicyExpression)
 }
 
 fn is_kernel_interface_name(interface: &str) -> bool {
@@ -106,5 +169,5 @@ fn is_kernel_interface_name(interface: &str) -> bool {
         && interface.len() <= 15
         && interface
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }

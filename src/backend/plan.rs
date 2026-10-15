@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ pub const RULE_PRIORITY_MAX: u32 = 10_099;
 pub struct KernelPlan {
     pub primary: PrimaryDecision,
     pub local_networks: Vec<IpNet>,
+    pub local_addresses: Vec<IpAddr>,
     pub generation: u64,
     pub profile_id: ProfileId,
     pub lanes: Vec<LanePlan>,
@@ -30,6 +31,7 @@ impl KernelPlan {
         struct PolicyContent<'a> {
             primary: &'a PrimaryDecision,
             local_networks: &'a [IpNet],
+            local_addresses: &'a [IpAddr],
             profile_id: &'a ProfileId,
             lanes: &'a [LanePlan],
             rules: &'a [CompiledRule],
@@ -38,6 +40,7 @@ impl KernelPlan {
         let content = PolicyContent {
             primary: &self.primary,
             local_networks: &self.local_networks,
+            local_addresses: &self.local_addresses,
             profile_id: &self.profile_id,
             lanes: &self.lanes,
             rules: &self.rules,
