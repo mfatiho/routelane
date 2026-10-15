@@ -790,6 +790,10 @@ pub struct CommandPrivilegedBackend<E, S = InMemoryAppliedStateStore> {
     runtime: Option<ArmedRuntime>,
     runtime_restore: Option<RuntimeRestoreReceipt>,
     runtime_loaded: bool,
+    /// Process-local backoff for automatic recovery of an interrupted
+    /// journal: each failed replay writes, and those writes come back as
+    /// kernel notifications. Authorized calls are never held back.
+    recovery_held_back: Option<(Duration, Duration)>,
 }
 
 /// The armed runtime: the journaled record plus process-local selector state
@@ -800,7 +804,21 @@ struct ArmedRuntime {
     phase: RuntimePhase,
     last_error: Option<String>,
     failback_in_ms: Option<u64>,
+    /// Process-local: the last candidate that failed to commit. Its own
+    /// rollback writes come back as kernel notifications; the same candidate
+    /// is retried only after an exponential wait, new evidence at once.
+    held_back: Option<HeldBackCandidate>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldBackCandidate {
+    plan_hash: PlanHash,
+    retry_at: Duration,
+    wait: Duration,
+}
+
+const FIRST_RETRY_WAIT: Duration = Duration::from_secs(2);
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 
 /// Used until a backend is given the kernel's boot/netns facts; a runtime
 /// cannot be armed without them.
@@ -877,6 +895,7 @@ impl<E, S> CommandPrivilegedBackend<E, S> {
             runtime: None,
             runtime_restore: None,
             runtime_loaded: false,
+            recovery_held_back: None,
         }
     }
 
@@ -1815,6 +1834,7 @@ where
                 },
                 last_error: mismatch,
                 failback_in_ms: None,
+                held_back: None,
             }
         });
         self.runtime_loaded = true;
@@ -1856,16 +1876,30 @@ where
     /// Recovers or adopts the journal for a runtime operation. Returns true
     /// when the committed state was adopted without kernel verification (a
     /// restarted helper), so the caller must prove it before relying on it.
-    fn prepare_runtime_operation(&mut self) -> Result<bool, PrivilegedError> {
-        let unverified = !self.initialized;
-        let interrupted = self.store.load()?.is_some_and(|record| {
+    fn journal_interrupted(&mut self) -> Result<bool, PrivilegedError> {
+        Ok(self.store.load()?.is_some_and(|record| {
             record.pending.is_some()
                 || record.cleanup_pending
                 || record.orphan_cleanup.is_some()
                 || record.legacy_v1.is_some()
-        });
+        }))
+    }
+
+    /// Starts or doubles the automatic-recovery wait.
+    fn hold_back_recovery(&mut self, now: Duration) -> Duration {
+        let wait = self
+            .recovery_held_back
+            .map_or(FIRST_RETRY_WAIT, |(_, wait)| (wait * 2).min(MAX_RETRY_WAIT));
+        self.recovery_held_back = Some((now + wait, wait));
+        wait
+    }
+
+    fn prepare_runtime_operation(&mut self) -> Result<bool, PrivilegedError> {
+        let unverified = !self.initialized;
+        let interrupted = self.journal_interrupted()?;
         if interrupted {
             self.ensure_reconciled()?;
+            self.recovery_held_back = None;
             self.runtime_loaded = false;
             self.load_runtime()?;
             return Ok(false);
@@ -1968,6 +2002,7 @@ where
             phase: RuntimePhase::Armed,
             last_error: None,
             failback_in_ms: None,
+            held_back: None,
         });
         Ok(RuntimeApplyResponse {
             status: self.runtime_status_snapshot(),
@@ -1981,11 +2016,36 @@ where
         topology: &TopologySnapshot,
         now: Duration,
     ) -> Result<RuntimeStatus, PrivilegedError> {
-        let unverified = self.prepare_runtime_operation()?;
+        let held = self.recovery_held_back.filter(|(at, _)| now < *at);
+        if let Some((retry_at, _)) = held.filter(|_| self.journal_interrupted().unwrap_or(true)) {
+            if let Some(runtime) = self.runtime.as_mut() {
+                runtime.failback_in_ms = Some((retry_at - now).as_millis().max(1) as u64);
+            }
+            return Ok(self.runtime_status_snapshot());
+        }
+        let unverified = match self.prepare_runtime_operation() {
+            Ok(unverified) => unverified,
+            Err(error) => {
+                let wait = self.hold_back_recovery(now);
+                if let Some(runtime) = self.runtime.as_mut() {
+                    runtime.phase = RuntimePhase::Degraded;
+                    runtime.last_error = Some(error.to_string());
+                    runtime.selector = None;
+                    runtime.failback_in_ms = Some(wait.as_millis() as u64);
+                }
+                return Err(error);
+            }
+        };
         let Some(mut runtime) = self.runtime.take() else {
             return Ok(self.runtime_status_snapshot());
         };
         let outcome = self.refresh_armed(&mut runtime, topology, now, unverified);
+        if outcome.is_err() && self.journal_interrupted().unwrap_or(true) {
+            // The rollback did not complete: its retained journal is not
+            // replayed again until the wait has passed.
+            let wait = self.hold_back_recovery(now).as_millis() as u64;
+            runtime.failback_in_ms = Some(runtime.failback_in_ms.map_or(wait, |ms| ms.min(wait)));
+        }
         if let Err(error) = outcome {
             runtime.phase = if runtime.phase == RuntimePhase::NeedsReauthorization {
                 RuntimePhase::NeedsReauthorization
@@ -2046,6 +2106,22 @@ where
         if candidate.content_hash() == current.plan_hash && decision == runtime.record.decision {
             runtime.phase = RuntimePhase::Armed;
             runtime.last_error = None;
+            runtime.held_back = None;
+            return Ok(());
+        }
+        let candidate_hash = candidate.content_hash();
+        let held_back = runtime
+            .held_back
+            .filter(|held| held.plan_hash == candidate_hash);
+        if let Some(held) = held_back.filter(|held| now < held.retry_at) {
+            // The same failed candidate, typically echoed back by its own
+            // rollback: stay Degraded on the committed plan and wait.
+            let retry_in = (held.retry_at - now).as_millis().max(1) as u64;
+            runtime.failback_in_ms = Some(
+                runtime
+                    .failback_in_ms
+                    .map_or(retry_in, |ms| ms.min(retry_in)),
+            );
             return Ok(());
         }
         let record = RuntimeRecord {
@@ -2056,16 +2132,32 @@ where
         // Keep the receipt: it now names a superseded commit and is refused
         // with that reason instead of disappearing.
         let restore = self.runtime_restore.clone();
-        self.transition_with(
+        if let Err(error) = self.transition_with(
             &candidate,
             None,
             &lost_unicast,
             Some(record.clone()),
             restore,
-        )?;
+        ) {
+            let wait =
+                held_back.map_or(FIRST_RETRY_WAIT, |held| (held.wait * 2).min(MAX_RETRY_WAIT));
+            runtime.held_back = Some(HeldBackCandidate {
+                plan_hash: candidate_hash,
+                retry_at: now + wait,
+                wait,
+            });
+            let retry_in = wait.as_millis() as u64;
+            runtime.failback_in_ms = Some(
+                runtime
+                    .failback_in_ms
+                    .map_or(retry_in, |ms| ms.min(retry_in)),
+            );
+            return Err(error);
+        }
         runtime.record = record;
         runtime.phase = RuntimePhase::Armed;
         runtime.last_error = None;
+        runtime.held_back = None;
         Ok(())
     }
 
@@ -2116,6 +2208,7 @@ where
             phase: RuntimePhase::Armed,
             last_error: None,
             failback_in_ms: None,
+            held_back: None,
         });
         Ok(self.runtime_status_snapshot())
     }
@@ -5586,6 +5679,8 @@ mod tests {
         output_tampered: bool,
         extra_nft_rule: bool,
         fail_activation: bool,
+        /// Fails only nft batches containing this text (one candidate).
+        fail_activation_containing: Option<String>,
         fail_rollback: bool,
         fail_route_flush: bool,
         tamper_json_result: bool,
@@ -5970,6 +6065,16 @@ mod tests {
                     });
                     if state.fail_activation && activates_output {
                         return Ok(CommandOutput::failure("injected nft activation failure"));
+                    }
+                    let input = String::from_utf8_lossy(spec.stdin.as_deref().unwrap());
+                    if state
+                        .fail_activation_containing
+                        .as_deref()
+                        .is_some_and(|marker| input.contains(marker))
+                    {
+                        return Ok(CommandOutput::failure(
+                            "injected candidate activation failure",
+                        ));
                     }
                     let mut objects = Vec::new();
                     for command in commands {
@@ -9277,6 +9382,103 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_transition_is_not_retried_by_its_own_rollback_notifications() {
+        let armed_then_failed = || {
+            let fixture = RuntimeFixture::new();
+            let mut backend = fixture.backend();
+            backend
+                .activate_runtime(
+                    &activation(0),
+                    1000,
+                    &fixture.observe(&up()),
+                    Duration::ZERO,
+                )
+                .unwrap();
+            fixture.drop_unicast(20_000);
+            // Every attempt at the generation-2 candidate keeps failing while
+            // the previous plan stays provable (as when only the new rules'
+            // nft dump cannot be proven); each attempt rolls back, which
+            // writes routes.
+            fixture.kernel.lock().unwrap().fail_activation_containing = Some("state_g2_".into());
+            let failed = backend
+                .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(failed.phase, super::RuntimePhase::Degraded);
+            (fixture, backend)
+        };
+
+        // Those writes come back as kernel notifications with unchanged
+        // evidence: no repeated transaction, but a bounded retry is scheduled.
+        let (fixture, mut backend) = armed_then_failed();
+        let after_failure = fixture.mutations();
+        let echoed = backend
+            .refresh_runtime(
+                &fixture.observe(&ethernet_down()),
+                Duration::from_millis(1_200),
+            )
+            .unwrap();
+        assert_eq!(fixture.mutations(), after_failure, "no busy retry loop");
+        assert_eq!(echoed.phase, super::RuntimePhase::Degraded);
+        let retry_in = echoed.failback_in_ms.expect("bounded retry is scheduled");
+        assert!(retry_in > 1_000, "{retry_in}");
+        // The retry happens once that wait has passed.
+        backend
+            .refresh_runtime(
+                &fixture.observe(&ethernet_down()),
+                Duration::from_millis(1_200 + retry_in),
+            )
+            .unwrap();
+        assert!(
+            fixture.mutations() > after_failure,
+            "retried after the wait"
+        );
+
+        // New kernel evidence is acted on at once.
+        let (fixture, mut backend) = armed_then_failed();
+        let after_failure = fixture.mutations();
+        backend
+            .refresh_runtime(
+                &fixture.observe(&runtime_topology(None, None, 2)),
+                Duration::from_millis(1_200),
+            )
+            .unwrap();
+        assert!(
+            fixture.mutations() > after_failure,
+            "new evidence is not delayed"
+        );
+
+        // Rollback itself keeps failing: the retained pending journal is not
+        // replayed again by every echoed notification either.
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap();
+        fixture.drop_unicast(20_000);
+        {
+            let mut kernel = fixture.kernel.lock().unwrap();
+            kernel.fail_activation = true;
+            kernel.fail_rollback = true;
+        }
+        let _ = backend.refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(1));
+        let after_failure = fixture.mutations();
+        let _ = backend.refresh_runtime(
+            &fixture.observe(&ethernet_down()),
+            Duration::from_millis(1_200),
+        );
+        assert_eq!(
+            fixture.mutations(),
+            after_failure,
+            "no replay loop of a retained pending journal"
+        );
+    }
+
+    #[test]
     fn all_links_down_then_recovery_is_family_safe() {
         let fixture = RuntimeFixture::new();
         let mut backend = fixture.backend();
@@ -9371,9 +9573,12 @@ mod tests {
         assert!(failed.last_error.unwrap().contains("state commit failed"));
         // The rollback did not resurrect the unicast route the kernel removed.
         assert_eq!(fixture.unicast_devices(), vec!["usb0", "usb0"]);
+        // The same candidate is retried once its wait has passed; the
+        // monitor wakes for it through failback_in_ms.
+        assert_eq!(failed.failback_in_ms, Some(2_000));
 
         let retried = backend
-            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(2))
+            .refresh_runtime(&fixture.observe(&ethernet_down()), Duration::from_secs(3))
             .unwrap();
         assert_eq!(retried.phase, super::RuntimePhase::Armed);
         assert_eq!(effective(&retried), lane_exit("vinn"));

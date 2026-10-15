@@ -71,7 +71,8 @@ pub struct RuntimeStatus {
     pub decision: Option<PrimaryDecision>,
     pub phase: RuntimePhase,
     pub last_error: Option<String>,
-    /// Time until a pending failback is re-evaluated, from the last refresh.
+    /// Time until the runtime must be re-evaluated (a pending failback, or a
+    /// held-back retry of a failed transition), from the last refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failback_in_ms: Option<u64>,
 }
