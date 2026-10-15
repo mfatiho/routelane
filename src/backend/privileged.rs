@@ -1058,6 +1058,10 @@ where
     }
 
     fn recover_orphaned(&mut self) -> Result<OrphanRecoveryResponse, PrivilegedError> {
+        let resumed_orphan_cleanup = self
+            .store
+            .load()?
+            .is_some_and(|record| record.orphan_cleanup.is_some());
         self.ensure_reconciled()?;
         if self.current.is_some() || self.legacy.is_some() {
             return Err(PrivilegedError::new(
@@ -1067,7 +1071,7 @@ where
         let ownership = capture_verified_orphaned_ownership(&mut self.executor)?;
         if ownership.nft_fingerprint.is_none() && ownership.routing == RoutingOwnership::default() {
             return Ok(OrphanRecoveryResponse {
-                cleaned: false,
+                cleaned: resumed_orphan_cleanup,
                 diagnostics: vec![],
             });
         }
@@ -1130,6 +1134,9 @@ where
         &mut self,
         restore_receipt: Option<RestoreReceipt>,
     ) -> Result<CleanupResponse, PrivilegedError> {
+        self.ensure_inspection_ready()?;
+        // Cleanup is authorized by the service. Inspection is not, and must never
+        // replay a journal or change kernel state on its own.
         self.ensure_reconciled()?;
         if self.legacy.is_some() {
             return self.cleanup_legacy();
@@ -1347,9 +1354,6 @@ where
     }
 
     fn ensure_inspection_ready(&mut self) -> Result<(), PrivilegedError> {
-        if self.initialized {
-            return self.ensure_reconciled();
-        }
         let Some(record) = self.store.load()? else {
             self.initialized = true;
             return Ok(());
@@ -1364,16 +1368,22 @@ where
             self.initialized = true;
             return Ok(());
         }
-        if record.pending.is_some() || record.cleanup_pending {
-            return self.ensure_reconciled();
-        }
         validate_stored_plan(record.active.as_ref(), "active")?;
+        validate_stored_plan(record.pending.as_ref(), "pending")?;
         validate_stored_fingerprint_pair(
             record.active.as_ref(),
             record.active_nft_fingerprint.as_deref(),
         )?;
+        validate_pending_expectations(
+            record.active.as_ref(),
+            record.pending.as_ref(),
+            record.pending_expectations.as_ref(),
+        )?;
         validate_restore_receipt(&record)?;
         validate_setting_receipts(&record)?;
+        if record.orphan_cleanup.is_some() {
+            validate_orphan_journal(&record)?;
+        }
         self.current = record.active.as_ref().map(AppliedKernelState::from_plan);
         self.current_nft_fingerprint = record.active_nft_fingerprint;
         self.interface_settings = record.interface_settings;
@@ -3798,6 +3808,27 @@ fn resume_orphan_cleanup(
     let captured =
         capture_snapshot(executor).map_err(|error| PrivilegedError::new(error.to_string()))?;
     let live = live_routing_ownership(&captured)?;
+    // Validate the table before any routing mutation, including resumed cleanup.
+    if captured.snapshot.has_nft_table("inet", "routelane") {
+        let expected = ownership.nft_fingerprint.as_deref().ok_or_else(|| {
+            PrivilegedError::new("orphan cleanup journal does not own the live nftables table")
+        })?;
+        if live_nft_fingerprint(executor)
+            .map_err(|error| PrivilegedError::new(error.to_string()))?
+            != expected
+        {
+            return Err(PrivilegedError::new(
+                "orphan cleanup journal does not exactly own the live inet/routelane table",
+            ));
+        }
+    } else if live != RoutingOwnership::default() {
+        return Err(PrivilegedError::new(
+            "orphan cleanup table is missing while routing resources remain",
+        ));
+    } else {
+        // The table deletion may have succeeded just before a journal write failed.
+        ownership.nft_fingerprint = None;
+    }
     if !live.routes.is_subset(&ownership.routing.routes)
         || !live.rules.is_subset(&ownership.routing.rules)
     {
@@ -4015,9 +4046,9 @@ fn live_unicast_route(
     table: u32,
 ) -> Result<RouteOwnership, PrivilegedError> {
     if route.get("dst").and_then(serde_json::Value::as_str) != Some("default")
-        || !absent_or_exact_string(route.get("type"), "unicast")
+        || !absent_or_exact_route_enum(route.get("type"), "unicast", 1)
         || !absent_or_exact_u32(route.get("metric"), if family == 4 { 0 } else { 1024 })
-        || !absent_or_exact_string(route.get("protocol"), "boot")
+        || !absent_or_exact_route_enum(route.get("protocol"), "boot", 3)
         || !route_scope_is_exact(
             route.get("scope"),
             route
@@ -4105,7 +4136,17 @@ fn absent_or_exact_string(value: Option<&serde_json::Value>, expected: &str) -> 
 
 fn route_scope_is_exact(value: Option<&serde_json::Value>, gatewayless: bool) -> bool {
     value.is_none_or(|value| {
-        value.as_str() == Some("global") || (gatewayless && value.as_str() == Some("link"))
+        absent_or_exact_route_enum(Some(value), "global", 0)
+            || (gatewayless && absent_or_exact_route_enum(Some(value), "link", 253))
+    })
+}
+
+fn absent_or_exact_route_enum(value: Option<&serde_json::Value>, name: &str, number: u32) -> bool {
+    value.is_none_or(|value| {
+        value
+            .as_str()
+            .is_some_and(|text| super::inspect::route_enum_matches(text, name, number))
+            || value.as_u64() == Some(u64::from(number))
     })
 }
 
@@ -6317,6 +6358,86 @@ mod tests {
     }
 
     #[test]
+    fn numeric_iproute_route_enums_pass_exact_ownership() {
+        let mut ownership = super::RoutingOwnership::default();
+        super::collect_live_routes(br#"[{"type":"1","dst":"default","gateway":"10.0.0.1","dev":"wg0","table":"20000","protocol":"3","scope":"0","flags":[]}]"#, 4, &mut ownership).unwrap();
+        assert_eq!(ownership.routes.len(), 1);
+    }
+
+    #[test]
+    fn resumed_orphan_cleanup_checks_nft_before_deleting_routes() {
+        let state = Arc::new(Mutex::new(FakeKernelState::default()));
+        let executor = FakeCommandExecutor {
+            state: Arc::clone(&state),
+        };
+        CommandPrivilegedBackend::new(executor.clone())
+            .apply(&fixture_valid_plan())
+            .unwrap();
+        let store = FakeAppliedStateStore::default();
+        let mut capture = executor.clone();
+        let ownership = super::capture_verified_orphaned_ownership(&mut capture).unwrap();
+        let mut journal = store.clone();
+        journal.save(&super::orphan_journal(ownership)).unwrap();
+        state.lock().unwrap().extra_nft_rule = true;
+        let mut restarted = CommandPrivilegedBackend::with_store(executor, store);
+        assert!(restarted.recover_orphaned().is_err());
+        let state = state.lock().unwrap();
+        assert!(
+            state.has_rule,
+            "ownership failure must precede every deletion"
+        );
+        assert!(state.has_route);
+    }
+
+    #[test]
+    fn repeated_inspection_never_resumes_orphan_cleanup() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let executor = FakeCommandExecutor {
+            state: Arc::clone(&kernel),
+        };
+        CommandPrivilegedBackend::new(executor.clone())
+            .apply(&fixture_valid_plan())
+            .unwrap();
+        let store = FakeAppliedStateStore::default();
+        let ownership = super::capture_verified_orphaned_ownership(&mut executor.clone()).unwrap();
+        store
+            .clone()
+            .save(&super::orphan_journal(ownership))
+            .unwrap();
+        let journal_before = store.state.lock().unwrap().clone();
+        let mutations_before = mutation_count(&kernel.lock().unwrap());
+        let mut restarted = CommandPrivilegedBackend::with_store(executor, store.clone());
+
+        for _ in 0..2 {
+            let inspection = restarted.inspect().unwrap();
+            assert_eq!(inspection.generation, None);
+            assert!(inspection.routelane_table_present);
+            assert_eq!(*store.state.lock().unwrap(), journal_before);
+            assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
+        }
+
+        assert!(restarted.recover_orphaned().unwrap().cleaned);
+        assert!(store.state.lock().unwrap().is_none());
+        assert!(!kernel.lock().unwrap().has_table);
+    }
+
+    #[test]
+    fn restarted_backend_can_cleanup_a_partial_committed_plan() {
+        let state = Arc::new(Mutex::new(FakeKernelState::default()));
+        let executor = FakeCommandExecutor {
+            state: Arc::clone(&state),
+        };
+        let store = FakeAppliedStateStore::default();
+        CommandPrivilegedBackend::with_store(executor.clone(), store.clone())
+            .apply(&fixture_valid_plan())
+            .unwrap();
+        state.lock().unwrap().has_route = false;
+        let mut restarted = CommandPrivilegedBackend::with_store(executor, store);
+        assert!(restarted.cleanup().unwrap().cleaned);
+        assert!(!state.lock().unwrap().has_table);
+    }
+
+    #[test]
     fn cleanup_accepts_exact_rules_after_routes_were_already_removed() {
         let state = Arc::new(Mutex::new(FakeKernelState::default()));
         let executor = FakeCommandExecutor {
@@ -6621,6 +6742,7 @@ mod tests {
             store.clone(),
         );
 
+        restarted.ensure_reconciled().unwrap();
         let inspection = restarted.inspect().unwrap();
 
         assert_eq!(inspection.generation, Some(failed_candidate.generation));
@@ -6674,6 +6796,7 @@ mod tests {
             store.clone(),
         );
 
+        restarted.ensure_reconciled().unwrap();
         assert_eq!(restarted.inspect().unwrap().generation, None);
         let journal_after_recovery = store.state.lock().unwrap().clone();
         let mutations_after_recovery = mutation_count(&kernel.lock().unwrap());
@@ -6842,6 +6965,13 @@ mod tests {
             },
             store.clone(),
         );
+        let journal_before = store.state.lock().unwrap().clone();
+        let mutations_before = mutation_count(&kernel.lock().unwrap());
+        assert!(restarted.inspect().unwrap().routelane_table_present);
+        assert!(restarted.inspect().unwrap().routelane_table_present);
+        assert_eq!(*store.state.lock().unwrap(), journal_before);
+        assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
+        restarted.cleanup().unwrap();
         let inspection = restarted.inspect().unwrap();
 
         assert_eq!(inspection.generation, None);
@@ -6953,7 +7083,7 @@ mod tests {
     }
 
     #[test]
-    fn same_process_inspect_rejects_inexact_pending_journal_without_mutation() {
+    fn same_process_reconciliation_rejects_inexact_pending_journal_without_mutation() {
         let kernel = Arc::new(Mutex::new(FakeKernelState {
             fail_activation: true,
             fail_rollback: true,
@@ -6976,7 +7106,7 @@ mod tests {
         let journal_before = store.state.lock().unwrap().clone();
         let mutations_before = mutation_count(&kernel.lock().unwrap());
 
-        let error = backend.inspect().unwrap_err();
+        let error = backend.ensure_reconciled().unwrap_err();
 
         assert!(error.to_string().contains("pending"));
         assert_eq!(*store.state.lock().unwrap(), journal_before);
@@ -7498,6 +7628,7 @@ mod tests {
             },
             store.clone(),
         );
+        restarted.ensure_reconciled().unwrap();
         let inspection = restarted.inspect().unwrap();
 
         assert_eq!(inspection.generation, Some(active.generation));
@@ -7562,7 +7693,7 @@ mod tests {
             },
             store.clone(),
         );
-        let error = restarted.inspect().unwrap_err();
+        let error = restarted.ensure_reconciled().unwrap_err();
 
         assert!(error.to_string().contains("exact rollback target"));
         assert_eq!(*store.state.lock().unwrap(), journal_before);
@@ -7638,7 +7769,12 @@ mod tests {
                 },
                 store.clone(),
             );
+            let journal_before = store.state.lock().unwrap().clone();
+            let mutations_before = mutation_count(&kernel.lock().unwrap());
             assert_eq!(restarted.inspect().unwrap().generation, Some(1));
+            assert_eq!(*store.state.lock().unwrap(), journal_before);
+            assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
+            restarted.ensure_reconciled().unwrap();
             let persisted = store.state.lock().unwrap();
             let persisted = persisted.as_ref().unwrap();
             assert_eq!(persisted.active.as_ref(), Some(&active));
@@ -7698,7 +7834,7 @@ mod tests {
             },
             store.clone(),
         );
-        let error = restarted.inspect().unwrap_err();
+        let error = restarted.ensure_reconciled().unwrap_err();
 
         assert!(error.to_string().contains("route or policy-rule"));
         assert_eq!(*store.state.lock().unwrap(), journal_before);
@@ -7756,7 +7892,7 @@ mod tests {
             },
             store.clone(),
         );
-        let error = restarted.inspect().unwrap_err();
+        let error = restarted.ensure_reconciled().unwrap_err();
 
         assert!(error.to_string().contains("pending"));
         assert_eq!(*store.state.lock().unwrap(), journal_before);
@@ -7817,7 +7953,7 @@ mod tests {
             },
             store.clone(),
         );
-        let error = restarted.inspect().unwrap_err();
+        let error = restarted.ensure_reconciled().unwrap_err();
 
         assert!(error.to_string().contains("pending"));
         assert_eq!(*store.state.lock().unwrap(), journal_before);
@@ -8062,6 +8198,15 @@ mod tests {
             },
             store.clone(),
         );
+        let journal_before = store.state.lock().unwrap().clone();
+        let mutations_before = mutation_count(&kernel.lock().unwrap());
+        let inspection = restarted.inspect().unwrap();
+        assert_eq!(inspection.generation, Some(1));
+        assert_eq!(*store.state.lock().unwrap(), journal_before);
+        assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
+
+        // Only an authorized mutating entry point may resume the interrupted cleanup.
+        restarted.cleanup().unwrap();
         let response = restarted.inspect().unwrap();
 
         assert_eq!(response.generation, None);

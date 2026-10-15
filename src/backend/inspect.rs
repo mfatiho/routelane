@@ -302,7 +302,7 @@ impl RouteEntry {
             && self
                 .route_type
                 .as_deref()
-                .is_none_or(|route_type| route_type == "unicast")
+                .is_none_or(|route_type| route_enum_matches(route_type, "unicast", 1))
             && self.metric.unwrap_or_default()
                 == match family {
                     IpFamily::V4 => 0,
@@ -311,9 +311,10 @@ impl RouteEntry {
             && self
                 .protocol
                 .as_deref()
-                .is_none_or(|protocol| protocol == "boot")
+                .is_none_or(|protocol| route_enum_matches(protocol, "boot", 3))
             && self.scope.as_deref().is_none_or(|scope| {
-                scope == "global" || (self.gateway.is_none() && scope == "link")
+                route_enum_matches(scope, "global", 0)
+                    || (self.gateway.is_none() && route_enum_matches(scope, "link", 253))
             })
             && self.preferred_source.is_none()
             // Carrier loss keeps the route and flags it `linkdown`.
@@ -327,6 +328,10 @@ impl RouteEntry {
             }
             && self.extra.is_empty()
     }
+}
+
+pub(super) fn route_enum_matches(value: &str, name: &str, number: u32) -> bool {
+    value == name || value.parse::<u32>().ok() == Some(number)
 }
 
 fn topology_from_routes(routes: &[RouteEntry]) -> TopologySnapshot {
@@ -877,6 +882,28 @@ mod tests {
             nft,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn numeric_iproute_route_enums_match_owned_defaults() {
+        let snapshot = parse(
+            br#"[{"type":"1","dst":"default","gateway":"10.0.0.1","dev":"wg0","table":"20000","protocol":"3","scope":"0","flags":[]}]"#,
+            br#"[{"type":"1","dst":"default","dev":"wg0","table":"20000","protocol":"3","scope":"253","metric":1024,"pref":"medium","flags":[]}]"#,
+            EMPTY, EMPTY, EMPTY_NFT,
+        );
+        assert_eq!(
+            snapshot.route_state(
+                IpFamily::V4,
+                20000,
+                Some("10.0.0.1".parse().unwrap()),
+                "wg0"
+            ),
+            super::ResourceState::Exact
+        );
+        assert_eq!(
+            snapshot.route_state(IpFamily::V6, 20000, None, "wg0"),
+            super::ResourceState::Exact
+        );
     }
 
     #[test]
