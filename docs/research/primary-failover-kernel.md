@@ -244,3 +244,17 @@ aldı. Lane A birincil (IPv4 + global IPv6 gateway), lane C yedek:
 
 Kurulu system-bus politikasıyla root olmayan istemciye `RuntimeChanged`
 sinyali teslimi ve gerçek Polkit akışı burada doğrulanmadı (Task 11/12).
+
+## Task 11 uçtan uca kabul (15 Ekim 2026)
+
+- Carrier kaybı (veth eşinin düşmesi) adresleri ve IPv4/IPv6 unicast
+  default’ları silmez; kernel bunları `linkdown` bayrağıyla tutar
+  (`ignore_routes_with_linkdown=0`). Yönetimsel `down` ve adres kaldırma ise
+  route’ları siler. Eski helper `linkdown`’ı yabancı semantik saydığı için
+  carrier kaybında yedeğe geçmeden `Degraded` oldu (VM’de RED); 33aa274 yalnız
+  tam `["linkdown"]` bayrağını ve taze planın artık kullanmadığı hat×aileyi
+  tolere eder.
+- Kurulu paketle gerçek system bus: root olmayan istemci `RuntimeChanged`
+  sinyalini aldı; yetki geri çekildikten sonra kesinti yine yedeğe geçirdi,
+  genişleme istekleri `AccessDenied` aldı. Kanıt ve sınırlar:
+  `docs/primary-failover-verification.md`.
