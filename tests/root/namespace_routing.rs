@@ -12,24 +12,24 @@ use routelane::backend::{
 use routelane::domain::{LaneFailurePolicy, LaneId, ProfileId, RuleId};
 use serde_json::{json, Value};
 
-const WORKER_ENV: &str = "ROUTELANE_ROOT_INTEGRATION_WORKER";
-const HELPER: &str = env!("CARGO_BIN_EXE_routelane-helper");
+pub(super) const WORKER_ENV: &str = "ROUTELANE_ROOT_INTEGRATION_WORKER";
+pub(super) const HELPER: &str = env!("CARGO_BIN_EXE_routelane-helper");
 const O_NOFOLLOW: i32 = 0o400000;
 
 #[derive(Clone, Debug)]
-struct RunNames {
-    token: String,
-    client: String,
-    gateways: [String; 3],
-    sinks: [String; 3],
-    client_interfaces: [String; 3],
-    gateway_client_interfaces: [String; 3],
-    gateway_sink_interfaces: [String; 3],
-    sink_interfaces: [String; 3],
+pub(super) struct RunNames {
+    pub(super) token: String,
+    pub(super) client: String,
+    pub(super) gateways: [String; 3],
+    pub(super) sinks: [String; 3],
+    pub(super) client_interfaces: [String; 3],
+    pub(super) gateway_client_interfaces: [String; 3],
+    pub(super) gateway_sink_interfaces: [String; 3],
+    pub(super) sink_interfaces: [String; 3],
 }
 
 impl RunNames {
-    fn from_env() -> Result<Self, String> {
+    pub(super) fn from_env() -> Result<Self, String> {
         let token = env::var("ROUTELANE_TEST_TOKEN")
             .map_err(|_| "ROUTELANE_TEST_TOKEN is required".to_owned())?;
         Self::from_token(token)
@@ -529,7 +529,7 @@ fn assert_lane_mark_awareness(names: &RunNames, expected: u8) {
     assert_eq!(global.trim(), "0", "the global setting is never written");
 }
 
-fn require_root_capabilities() -> RunNames {
+pub(super) fn require_root_capabilities() -> RunNames {
     assert_eq!(
         unsafe { libc::geteuid() },
         0,
@@ -553,14 +553,14 @@ fn require_root_capabilities() -> RunNames {
     names
 }
 
-struct NamespaceHarness {
+pub(super) struct NamespaceHarness {
     names: RunNames,
     backend: SystemProvisionBackend,
     owned: Vec<KernelObject>,
 }
 
 impl NamespaceHarness {
-    fn create(names: RunNames) -> Self {
+    pub(super) fn create(names: RunNames) -> Self {
         let mut backend =
             SystemProvisionBackend::from_env(&names).expect("open secure owned-resource registry");
         let owned = provision_owned(&names.creations(), &mut backend)
@@ -823,7 +823,7 @@ fn plan(
     }
 }
 
-fn lane(
+pub(super) fn lane(
     id: &str,
     interface: &str,
     gateway: &str,
@@ -849,7 +849,7 @@ fn lane(
     }
 }
 
-fn rule(id: &str, priority: u32, target: &str, action: CompiledAction) -> CompiledRule {
+pub(super) fn rule(id: &str, priority: u32, target: &str, action: CompiledAction) -> CompiledRule {
     CompiledRule {
         family: routelane::backend::IpFamily::V4,
         id: RuleId::from(id),
@@ -977,7 +977,7 @@ fn assert_generation_one_routing_restored(names: &RunNames) {
     ));
 }
 
-fn assert_managed_resources_absent() {
+pub(super) fn assert_managed_resources_absent() {
     let routes = ip_json(&["-j", "-4", "route", "show", "table", "all"]);
     assert!(
         routes.as_array().unwrap().iter().all(|route| {
@@ -1037,14 +1037,14 @@ fn json_u32(value: &Value) -> Option<u32> {
     })
 }
 
-struct HelperProcess {
+pub(super) struct HelperProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
 
 impl HelperProcess {
-    fn spawn(state_directory: &std::path::Path) -> Self {
+    pub(super) fn spawn(state_directory: &std::path::Path) -> Self {
         let mut child = Command::new(HELPER)
             .arg("--root-integration-stdio")
             .env("ROUTELANE_TEST_STATE_DIRECTORY", state_directory)
@@ -1075,7 +1075,7 @@ impl HelperProcess {
         serde_json::from_str(&response).unwrap()
     }
 
-    fn ok(&mut self, request: Value) -> Value {
+    pub(super) fn ok(&mut self, request: Value) -> Value {
         let response = self.request(request);
         assert!(response.get("error").is_none(), "helper error: {response}");
         response["ok"].clone()
@@ -1121,18 +1121,18 @@ fn state_fingerprint(path: &str) -> Option<StateFingerprint> {
     }
 }
 
-fn run_ip<const N: usize>(args: [&str; N]) {
+pub(super) fn run_ip<const N: usize>(args: [&str; N]) {
     checked_output(
         Command::new("/usr/sbin/ip").args(args),
         "configure namespace topology",
     );
 }
 
-fn command_output(command: &mut Command) -> Output {
+pub(super) fn command_output(command: &mut Command) -> Output {
     command.output().expect("start integration command")
 }
 
-fn checked_output(command: &mut Command, context: &str) -> Output {
+pub(super) fn checked_output(command: &mut Command, context: &str) -> Output {
     let output = command_output(command);
     assert!(
         output.status.success(),
