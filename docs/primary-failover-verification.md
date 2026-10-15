@@ -154,9 +154,9 @@ yeniden başlatma ve kaldırma.
 
 | Dağıtım | Kernel / iproute2 / nft | systemd / Polkit / D-Bus | GTK4 / Libadwaita | Rootless | Root süiti | System bus + yükseltme | Reboot + kaldırma |
 |---|---|---|---|---|---|---|---|
-| Ubuntu 22.04.5 | 5.15.0-198 / 5.15.0 / 1.0.2 | 249.11 / 0.105 (pkla) / 1.12.20 | 4.6.9 / 1.1.7 | 432 PASS | 18/18 + 18/18 PASS | PASS | PASS |
-| Ubuntu 24.04.5 | 6.8.0-147 / 6.1.0 / 1.0.9 | 255.4 / 124 / 1.14.10 | 4.14.5 / 1.5.0 | 432 PASS (host) | 18/18 + 18/18 PASS | PASS | PASS |
-| Ubuntu 26.04.1 | 7.0.0-34 / 6.19.0 / 1.1.6 | 259.5 / 127 / 1.16.2 | 4.22.4 / 1.9.1 | 432 PASS | 18/18 + 18/18 PASS | PASS | PASS |
+| Ubuntu 22.04.5 | 5.15.0-198 / 5.15.0 / 1.0.2 | 249.11 / 0.105 (pkla) / 1.12.20 | 4.6.9 / 1.1.7 | 433 PASS | 18/18 + 18/18 PASS | PASS | PASS |
+| Ubuntu 24.04.5 | 6.8.0-147 / 6.1.0 / 1.0.9 | 255.4 / 124 / 1.14.10 | 4.14.5 / 1.5.0 | 433 PASS (host) | 18/18 + 18/18 PASS | PASS | PASS |
+| Ubuntu 26.04.1 | 7.0.0-34 / 6.19.0 / 1.1.6 | 259.5 / 127 / 1.16.2 | 4.22.4 / 1.9.1 | 433 PASS | standart 18/18 (3/3); strict 2/4 temiz, 2/4’te sayaç/eşik kaynaklı tek hata — aşağıya bkz. | PASS | PASS |
 | Debian 12, 13 | — | — | — | — | NOT VERIFIED | NOT VERIFIED | NOT VERIFIED |
 | Fedora 43, 44 | — | — | — | — | NOT VERIFIED | NOT VERIFIED | NOT VERIFIED |
 | aarch64 (tümü) | — | — | — | — | NOT VERIFIED | NOT VERIFIED | NOT VERIFIED |
@@ -177,11 +177,24 @@ aldı, yani fail-closed davrandı):
   normalleştirme kararlı bölme yapar
   (`fingerprint_and_seal_accept_nft_1_0_2_chain_interleaved_listing_order`).
 
-Yukarıdaki satırlar bu düzeltmelerden sonraki koşulardır.
+Yukarıdaki satırlar bu düzeltmelerden ve son incelemedeki `0203fab`
+(başarısız geçişin geri çekilmesi) düzeltmesinden sonraki koşulardır. Koşular
+commit edilmiş HEAD’den değil, kullanıcının henüz commit edilmemiş güvenilirlik
+hunk’larını da içeren çalışma ağacından yapıldı.
+
+26.04 strict-RPF modunda 4 koşunun 2’si temiz geçti; diğer ikisinde birer
+test düştü ve tekrarlanmadı: (a) Faz 1 testi
+`real_helper_routes_three_lanes_and_preserves_generation_one_on_activate_failure`
+sink arayüzünün link RX sayaçlarını okur (iki farklı satırda, ölçüm
+penceresinde fazladan paket); (b) `runtime_refresh…` içinde `exchanges > 20`
+verim eşiği 19 ile kaçtı (0 UDP yanıt kaybı). Hipotez: kernel 7.0’da
+veth üzerindeki IPv6 ND/MLD trafiği link sayaçlarını kirletiyor ve yük
+altında verim eşiği sınırda kalıyor; doğrulanmadı. Bu satır bu yüzden temiz
+PASS değildir; Task 7’deki gibi nft ingress gözlemcilerine geçmek ertelendi.
 
 Fedora rpm: `packaging/rpm/build-rpm.sh`, Docker `fedora:latest` (Fedora 44,
-cargo 1.98.1, RPM 6.0.2) içinde son ağaçtan üretildi
-(`routelane-0.1.0-1.x86_64`, sha256 `f697a0ac2e2f29ce82ba1618379678c97ee75da38b39587ef0303f6f305eb7b6`); 11 dosya + `/usr/lib/routelane`
+cargo 1.99.0, RPM 6.0.2) içinde son ağaçtan üretildi
+(`routelane-0.1.0-1.x86_64`, sha256 `b2ae2b8a26c139281ef2698f5f3b167f95b589cfcb10905dd1ff5d08761b759f`); 11 dosya + `/usr/lib/routelane`
 dizini beklenen mod ve root/root sahipliğiyle, scriptlet’ler mevcut. Bu yalnız
 paket üretimidir: Fedora’da kurulum, firewalld/SELinux, Polkit ve kernel
 kabulü **NOT VERIFIED**.
