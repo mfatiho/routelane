@@ -1,0 +1,154 @@
+{
+  "nft_fingerprint": "e53e9c4d361afb75fa658d5bdbd36f92f913f2754ace1b1bd7643914afaf0dcd",
+  "plan_hash": [
+    174,
+    43,
+    27,
+    255,
+    168,
+    54,
+    252,
+    79,
+    63,
+    87,
+    47,
+    108,
+    229,
+    144,
+    61,
+    135,
+    63,
+    227,
+    149,
+    101,
+    69,
+    211,
+    208,
+    41,
+    120,
+    221,
+    109,
+    164,
+    3,
+    135,
+    224,
+    201
+  ],
+  "policy_hash": [
+    203,
+    96,
+    6,
+    223,
+    27,
+    38,
+    9,
+    5,
+    42,
+    219,
+    40,
+    123,
+    67,
+    227,
+    81,
+    64,
+    16,
+    190,
+    145,
+    227,
+    53,
+    184,
+    134,
+    233,
+    46,
+    198,
+    142,
+    38,
+    130,
+    236,
+    208,
+    222
+  ],
+  "routing": {
+    "routes": [
+      {
+        "family": 4,
+        "gateway": null,
+        "interface": "",
+        "table": 20000,
+        "terminal": true
+      },
+      {
+        "family": 4,
+        "gateway": "10.0.0.1",
+        "interface": "eth0",
+        "table": 20000
+      },
+      {
+        "family": 4,
+        "gateway": null,
+        "interface": "",
+        "table": 20001,
+        "terminal": true
+      },
+      {
+        "family": 4,
+        "gateway": "192.168.0.1",
+        "interface": "usb0",
+        "table": 20001
+      },
+      {
+        "family": 6,
+        "gateway": null,
+        "interface": "",
+        "table": 20000,
+        "terminal": true
+      },
+      {
+        "family": 6,
+        "gateway": "2001:db8:1::1",
+        "interface": "eth0",
+        "table": 20000
+      },
+      {
+        "family": 6,
+        "gateway": null,
+        "interface": "",
+        "table": 20001,
+        "terminal": true
+      },
+      {
+        "family": 6,
+        "gateway": "2001:db8:2::1",
+        "interface": "usb0",
+        "table": 20001
+      }
+    ],
+    "rules": [
+      {
+        "family": 4,
+        "mark": 1380712449,
+        "priority": 10000,
+        "table": 20000
+      },
+      {
+        "family": 4,
+        "mark": 1380712450,
+        "priority": 10001,
+        "table": 20001
+      },
+      {
+        "family": 6,
+        "mark": 1380712449,
+        "priority": 10000,
+        "table": 20000
+      },
+      {
+        "family": 6,
+        "mark": 1380712450,
+        "priority": 10001,
+        "table": 20001
+      }
+    ]
+  },
+  "state_chain_name": "state_g1_fd28e61b0433fb55"
+}

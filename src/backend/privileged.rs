@@ -5115,6 +5115,32 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v2_nft_fixture_matches_original_fingerprint_and_seal() {
+        let nft: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-v2/active-nft.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            nft_document_fingerprint(&nft).unwrap(),
+            "e53e9c4d361afb75fa658d5bdbd36f92f913f2754ace1b1bd7643914afaf0dcd"
+        );
+        assert!(super::super::nft_document::has_valid_policy_seal(&nft));
+        let mut changed = nft;
+        let rule = changed["nftables"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|o| o["rule"]["chain"] == "output")
+            .unwrap();
+        rule["rule"]["expr"] = serde_json::json!([{"accept":null}]);
+        assert!(!super::super::nft_document::has_valid_policy_seal(&changed));
+        assert_ne!(
+            nft_document_fingerprint(&changed).unwrap(),
+            "e53e9c4d361afb75fa658d5bdbd36f92f913f2754ace1b1bd7643914afaf0dcd"
+        );
+    }
+
+    #[test]
     fn privileged_nft_renderer_delegates_mark_to_terminal_selection_after_counter() {
         let mut plan = fixture_valid_plan();
         let rule = plan.rules.remove(0);

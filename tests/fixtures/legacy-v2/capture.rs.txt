@@ -1,0 +1,33 @@
+    #[test]
+    #[ignore = "one-off synthetic pre-selective compatibility capture"]
+    fn capture_legacy_v2_evidence() {
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        let armed = backend.activate_runtime(&activation(0), 1000,
+            &fixture.observe(&up()), Duration::ZERO).unwrap();
+        let committed = fixture.store.state.lock().unwrap().clone().unwrap();
+        let mut next = armed.plan.clone();
+        next.generation = 2;
+        let pending = StoredAppliedState {
+            pending: Some(next.clone()),
+            pending_expectations: Some(super::build_pending_expectations(Some(&armed.plan), &next).unwrap()),
+            pending_runtime: committed.runtime.clone(),
+            ..committed.clone()
+        };
+        let cleanup = StoredAppliedState {
+            cleanup_pending: true, runtime: None, runtime_restore: None,
+            ..committed.clone()
+        };
+        let nft = super::expected_nft_document(Some(&armed.plan), None, false);
+        let evidence = serde_json::json!({
+            "plan_hash": armed.plan.content_hash(),
+            "state_chain_name": super::super::nft_document::state_chain_name(&armed.plan),
+            "nft_fingerprint": super::nft_document_fingerprint(&nft).unwrap(),
+            "routing": super::plan_routing_ownership(&armed.plan),
+            "policy_hash": armed.status.grant.unwrap().policy_hash
+        });
+        println!("LEGACY_CAPTURE={}", serde_json::json!({
+            "committed":committed,"pending":pending,"cleanup-pending":cleanup,
+            "active-nft":nft,"evidence":evidence
+        }));
+    }

@@ -2,6 +2,8 @@ mod cgroup;
 mod inspect;
 mod interface_settings;
 mod legacy_journal;
+#[cfg(test)]
+mod legacy_journal_v2;
 mod nft_document;
 mod nftables;
 mod plan;

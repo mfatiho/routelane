@@ -12,6 +12,8 @@ use anyhow::{bail, Context};
 
 mod v2;
 pub use v2::ConfigV2;
+#[cfg(test)]
+pub(crate) mod v3;
 
 pub const MAX_CONFIG_BYTES: usize = 1_048_576;
 

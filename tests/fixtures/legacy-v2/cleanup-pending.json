@@ -1,0 +1,92 @@
+{
+  "active": {
+    "generation": 1,
+    "lanes": [
+      {
+        "availability": "Available",
+        "failure_policy": "Block",
+        "id": "ethernet",
+        "identity": {
+          "hardware_address": null,
+          "ifindex": 2,
+          "kind": "",
+          "name": "eth0"
+        },
+        "interface": "eth0",
+        "mark": 1380712449,
+        "route_v4": {
+          "Via": "10.0.0.1"
+        },
+        "route_v6": {
+          "Via": "2001:db8:1::1"
+        },
+        "rule_priority": 10000,
+        "source_v4": [
+          "10.0.0.2"
+        ],
+        "source_v6": [
+          "2001:db8:1::2"
+        ],
+        "table": 20000
+      },
+      {
+        "availability": "Available",
+        "failure_policy": "Block",
+        "id": "vinn",
+        "identity": {
+          "hardware_address": null,
+          "ifindex": 3,
+          "kind": "",
+          "name": "usb0"
+        },
+        "interface": "usb0",
+        "mark": 1380712450,
+        "route_v4": {
+          "Via": "192.168.0.1"
+        },
+        "route_v6": {
+          "Via": "2001:db8:2::1"
+        },
+        "rule_priority": 10001,
+        "source_v4": [
+          "192.168.0.2"
+        ],
+        "source_v6": [
+          "2001:db8:2::2"
+        ],
+        "table": 20001
+      }
+    ],
+    "local_addresses": [
+      "10.0.0.2",
+      "172.16.0.2",
+      "192.168.0.2",
+      "2001:db8:1::2",
+      "2001:db8:2::2",
+      "2001:db8:3::2"
+    ],
+    "local_networks": [],
+    "primary": {
+      "effective": {
+        "v4": {
+          "Lane": "ethernet"
+        },
+        "v6": {
+          "Lane": "ethernet"
+        }
+      },
+      "preferred": {
+        "v4": "ethernet",
+        "v6": "ethernet"
+      }
+    },
+    "profile_id": "office",
+    "rules": []
+  },
+  "active_nft_fingerprint": "e53e9c4d361afb75fa658d5bdbd36f92f913f2754ace1b1bd7643914afaf0dcd",
+  "cleanup_pending": true,
+  "journal_version": 2,
+  "pending": null,
+  "pending_expectations": null,
+  "restore_receipt": null
+}
