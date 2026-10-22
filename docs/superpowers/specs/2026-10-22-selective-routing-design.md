@@ -1,7 +1,7 @@
 # Seçici yönlendirme ve sistem davranışının korunması
 
 Tarih: 22 Ekim 2026.
-Durum: Kullanıcı davranış hedefini “devam et” yanıtıyla onayladı; bu yazılı tasarım inceleme bekliyor. Uygulama planı henüz hazırlanmadı; ürün kodu ve canlı ağ değiştirilmedi.
+Durum: Kullanıcı yazılı tasarımı 22 Ekim'deki “Devam et” yanıtıyla onayladı. [Uygulama planı](../plans/2026-10-22-selective-routing.md) hazırlanmıştır ve ayrı inceleme bekler; ürün kodu ve canlı ağ değiştirilmedi.
 
 ## 1. Amaç ve önceki kararla ilişkisi
 
