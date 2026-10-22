@@ -11,6 +11,7 @@ pub fn profile() -> Profile {
         enabled: true,
         rules: vec![],
         routing: RoutingPolicy {
+            unmatched_traffic: routelane::domain::UnmatchedTraffic::UsePrimary,
             primary: PrimarySelection::Lane("ethernet".into()),
             backups: vec!["vinn".into()],
             automatic_failover: true,

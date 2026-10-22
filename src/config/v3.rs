@@ -3,7 +3,9 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::Language;
-use crate::domain::{Lane, LaneId, PrimarySelection, ProfileId, Rule};
+use crate::domain::{
+    Lane, LaneId, PrimarySelection, Profile, ProfileId, RoutingPolicy, Rule, UnmatchedTraffic,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,6 +37,24 @@ pub struct RoutingPolicyV3 {
     pub primary: PrimarySelection,
     pub backups: Vec<LaneId>,
     pub automatic_failover: bool,
+}
+
+impl From<ProfileV3> for Profile {
+    fn from(old: ProfileV3) -> Self {
+        Self {
+            id: old.id,
+            name: old.name,
+            enabled: false,
+            lanes: old.lanes,
+            rules: old.rules,
+            routing: RoutingPolicy {
+                unmatched_traffic: UnmatchedTraffic::PreserveSystem,
+                primary: old.routing.primary,
+                backups: old.routing.backups,
+                automatic_failover: old.routing.automatic_failover,
+            },
+        }
+    }
 }
 
 fn version_three<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {

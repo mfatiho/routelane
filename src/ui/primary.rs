@@ -56,6 +56,7 @@ pub fn validate_primary_draft(
     }
     let mut candidate = profile.clone();
     candidate.routing = RoutingPolicy {
+        unmatched_traffic: profile.routing.unmatched_traffic,
         primary: draft.primary.clone(),
         backups: draft.backups.clone(),
         automatic_failover: draft.automatic_failover,

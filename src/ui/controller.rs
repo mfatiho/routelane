@@ -1,7 +1,7 @@
 use crate::models::{DaemonToUi, UiToDaemon};
 use crate::ui::session::{AfterSave, UiEffect, UiSession};
 use async_channel::Sender;
-use routelane::config::{ConfigV3, PersistenceRequest, PersistenceWorker};
+use routelane::config::{ConfigV4, PersistenceRequest, PersistenceWorker};
 use routelane::domain::Profile;
 use routelane::ipc::{DaemonRequest, DaemonResult, IpcError};
 use std::cell::{Cell, Ref, RefCell};
@@ -77,7 +77,7 @@ impl UiController {
         }
     }
 
-    pub fn save(self: &Rc<Self>, config: ConfigV3, profile: Profile, follow_up: AfterSave) -> bool {
+    pub fn save(self: &Rc<Self>, config: ConfigV4, profile: Profile, follow_up: AfterSave) -> bool {
         let apply = matches!(
             &follow_up,
             AfterSave::Request(DaemonRequest::ApplyProfile(_))
@@ -356,7 +356,7 @@ mod tests {
     fn save_then_apply_holds_one_gate() {
         run(false, |controller, requests, writes, results, context| {
             assert!(controller.save(
-                ConfigV3::default(),
+                ConfigV4::default(),
                 profile(),
                 AfterSave::Request(DaemonRequest::ApplyProfile(profile()))
             ));
@@ -386,7 +386,7 @@ mod tests {
     fn save_failure_sends_no_apply_and_still_allows_deactivate() {
         run(true, |controller, requests, writes, results, context| {
             assert!(controller.save(
-                ConfigV3::default(),
+                ConfigV4::default(),
                 profile(),
                 AfterSave::Request(DaemonRequest::ApplyProfile(profile()))
             ));
@@ -528,7 +528,7 @@ mod tests {
             assert!(!controller.recovery_available());
             controller.receive(snapshot(false));
             assert!(controller.save(
-                ConfigV3::default(),
+                ConfigV4::default(),
                 profile(),
                 AfterSave::Request(DaemonRequest::ApplyProfile(profile()))
             ));

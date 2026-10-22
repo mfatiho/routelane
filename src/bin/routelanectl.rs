@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
-use routelane::config::{load_config_file, ConfigV3};
+use routelane::config::{load_config_file, ConfigV4};
 use routelane::domain::{validate_profile, Profile};
 use routelane::ipc::{
     socket_path, DaemonClient, DaemonEnvelope, DaemonRequest, DaemonResponse, DaemonResult,
@@ -97,7 +97,7 @@ async fn load_selected_profile(
     select_profile(document, selector)
 }
 
-fn select_profile(mut document: ConfigV3, selector: Option<&str>) -> Result<Profile, CliError> {
+fn select_profile(mut document: ConfigV4, selector: Option<&str>) -> Result<Profile, CliError> {
     validate_profile_identities(&document)?;
     let selected_index = match selector {
         Some(selector) => {
@@ -140,7 +140,7 @@ fn select_profile(mut document: ConfigV3, selector: Option<&str>) -> Result<Prof
     Ok(profile)
 }
 
-fn validate_profile_identities(document: &ConfigV3) -> Result<(), CliError> {
+fn validate_profile_identities(document: &ConfigV4) -> Result<(), CliError> {
     let mut ids = BTreeSet::new();
     let mut names = BTreeSet::new();
     for profile in &document.profiles {
