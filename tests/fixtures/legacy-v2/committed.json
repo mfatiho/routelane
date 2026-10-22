@@ -1,0 +1,236 @@
+{
+  "active": {
+    "generation": 1,
+    "lanes": [
+      {
+        "availability": "Available",
+        "failure_policy": "Block",
+        "id": "ethernet",
+        "identity": {
+          "hardware_address": null,
+          "ifindex": 2,
+          "kind": "",
+          "name": "eth0"
+        },
+        "interface": "eth0",
+        "mark": 1380712449,
+        "route_v4": {
+          "Via": "10.0.0.1"
+        },
+        "route_v6": {
+          "Via": "2001:db8:1::1"
+        },
+        "rule_priority": 10000,
+        "source_v4": [
+          "10.0.0.2"
+        ],
+        "source_v6": [
+          "2001:db8:1::2"
+        ],
+        "table": 20000
+      },
+      {
+        "availability": "Available",
+        "failure_policy": "Block",
+        "id": "vinn",
+        "identity": {
+          "hardware_address": null,
+          "ifindex": 3,
+          "kind": "",
+          "name": "usb0"
+        },
+        "interface": "usb0",
+        "mark": 1380712450,
+        "route_v4": {
+          "Via": "192.168.0.1"
+        },
+        "route_v6": {
+          "Via": "2001:db8:2::1"
+        },
+        "rule_priority": 10001,
+        "source_v4": [
+          "192.168.0.2"
+        ],
+        "source_v6": [
+          "2001:db8:2::2"
+        ],
+        "table": 20001
+      }
+    ],
+    "local_addresses": [
+      "10.0.0.2",
+      "172.16.0.2",
+      "192.168.0.2",
+      "2001:db8:1::2",
+      "2001:db8:2::2",
+      "2001:db8:3::2"
+    ],
+    "local_networks": [],
+    "primary": {
+      "effective": {
+        "v4": {
+          "Lane": "ethernet"
+        },
+        "v6": {
+          "Lane": "ethernet"
+        }
+      },
+      "preferred": {
+        "v4": "ethernet",
+        "v6": "ethernet"
+      }
+    },
+    "profile_id": "office",
+    "rules": []
+  },
+  "active_nft_fingerprint": "e53e9c4d361afb75fa658d5bdbd36f92f913f2754ace1b1bd7643914afaf0dcd",
+  "cleanup_pending": false,
+  "journal_version": 2,
+  "pending": null,
+  "pending_expectations": null,
+  "restore_receipt": null,
+  "runtime": {
+    "decision": {
+      "effective": {
+        "v4": {
+          "Lane": "ethernet"
+        },
+        "v6": {
+          "Lane": "ethernet"
+        }
+      },
+      "preferred": {
+        "v4": "ethernet",
+        "v6": "ethernet"
+      }
+    },
+    "grant": {
+      "boot_id": "00000000-0000-4000-8000-000000000001",
+      "interfaces": {
+        "ethernet": {
+          "hardware_address": null,
+          "ifindex": 2,
+          "kind": "",
+          "name": "eth0"
+        },
+        "vinn": {
+          "hardware_address": null,
+          "ifindex": 3,
+          "kind": "",
+          "name": "usb0"
+        }
+      },
+      "network_namespace": 4026531840,
+      "owner_uid": 1000,
+      "policy_hash": [
+        203,
+        96,
+        6,
+        223,
+        27,
+        38,
+        9,
+        5,
+        42,
+        219,
+        40,
+        123,
+        67,
+        227,
+        81,
+        64,
+        16,
+        190,
+        145,
+        227,
+        53,
+        184,
+        134,
+        233,
+        46,
+        198,
+        142,
+        38,
+        130,
+        236,
+        208,
+        222
+      ]
+    },
+    "profile": {
+      "enabled": true,
+      "id": "office",
+      "lanes": [
+        {
+          "failure_policy": "Block",
+          "fallback_lane": null,
+          "id": "ethernet",
+          "interface": "eth0",
+          "name": "ethernet"
+        },
+        {
+          "failure_policy": "Block",
+          "fallback_lane": null,
+          "id": "vinn",
+          "interface": "usb0",
+          "name": "vinn"
+        }
+      ],
+      "name": "Office",
+      "routing": {
+        "automatic_failover": true,
+        "backups": [
+          "vinn"
+        ],
+        "primary": {
+          "Lane": "ethernet"
+        }
+      },
+      "rules": []
+    },
+    "resolutions": {
+      "rules": {}
+    }
+  },
+  "runtime_restore": {
+    "issued_for_generation": 1,
+    "issued_for_plan_hash": [
+      174,
+      43,
+      27,
+      255,
+      168,
+      54,
+      252,
+      79,
+      63,
+      87,
+      47,
+      108,
+      229,
+      144,
+      61,
+      135,
+      63,
+      227,
+      149,
+      101,
+      69,
+      211,
+      208,
+      41,
+      120,
+      221,
+      109,
+      164,
+      3,
+      135,
+      224,
+      201
+    ],
+    "owner_uid": 1000,
+    "previous_plan": null,
+    "previous_record": null,
+    "token_hash": "90cd2705dd10a186d3ddf6412047a4f611d42bf111539c6d62cbd4146fb2246e"
+  }
+}
