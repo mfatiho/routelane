@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use async_channel::{Receiver, Sender};
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
-use routelane::config::{ConfigRepository, ConfigV3, PersistenceWorker};
+use routelane::config::{ConfigRepository, ConfigV4, PersistenceWorker};
 use routelane::domain::{HealthState, Profile, Rule, RuleAction, RuleId, RuleSource};
 use routelane::ipc::{DaemonRequest, DaemonResult};
 
@@ -48,7 +48,7 @@ fn empty_default_profile() -> Profile {
     }
 }
 
-fn store_profile(document: &mut ConfigV3, current: Profile) {
+fn store_profile(document: &mut ConfigV4, current: Profile) {
     if let Some(stored) = document
         .profiles
         .iter_mut()
@@ -61,7 +61,7 @@ fn store_profile(document: &mut ConfigV3, current: Profile) {
 }
 
 fn reconcile_profiles(
-    document: &mut ConfigV3,
+    document: &mut ConfigV4,
     selected: &mut Profile,
     canonical: Vec<Profile>,
     replace_selected: bool,
@@ -81,7 +81,7 @@ fn reconcile_profiles(
 struct WindowUi {
     window: glib::WeakRef<adw::ApplicationWindow>,
     texts: Texts,
-    document: Rc<RefCell<ConfigV3>>,
+    document: Rc<RefCell<ConfigV4>>,
     profile: Rc<RefCell<Profile>>,
     controller: Rc<UiController>,
     shell: Shell,
@@ -819,7 +819,7 @@ fn build_window_with_repository(
 ) -> adw::ApplicationWindow {
     let (mut document, load_error) = match repository.load() {
         Ok(document) => (document, None),
-        Err(error) => (ConfigV3::default(), Some(error.to_string())),
+        Err(error) => (ConfigV4::default(), Some(error.to_string())),
     };
     if document.profiles.is_empty() {
         document.profiles.push(empty_default_profile());
@@ -1728,7 +1728,7 @@ mod tests {
         use routelane::domain::{InterfaceSelector, Lane, LaneFailurePolicy, PrimarySelection};
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("config.json");
-        let mut document = ConfigV3::default();
+        let mut document = ConfigV4::default();
         let mut profile = empty_default_profile();
         profile.lanes = [("ethernet", "eth0"), ("vinn", "usb0")]
             .into_iter()
@@ -1873,7 +1873,7 @@ mod tests {
 
     #[test]
     fn partial_daemon_profile_snapshot_merges_without_deleting_local_profiles() {
-        let mut document = ConfigV3::default();
+        let mut document = ConfigV4::default();
         let mut selected = empty_default_profile();
         document.profiles.push(selected.clone());
         let mut other = selected.clone();
@@ -1890,7 +1890,7 @@ mod tests {
     fn snapshot_preserves_local_failed_apply_draft() {
         let mut selected = empty_default_profile();
         selected.name = "Local edit".into();
-        let mut document = ConfigV3 {
+        let mut document = ConfigV4 {
             profiles: vec![selected.clone()],
             ..Default::default()
         };
@@ -1907,7 +1907,7 @@ mod tests {
     #[test]
     fn canonical_profile_survives_a_later_language_save() {
         let mut selected = empty_default_profile();
-        let mut document = ConfigV3::default();
+        let mut document = ConfigV4::default();
         let mut canonical = selected.clone();
         canonical.name = "Canonical".into();
         reconcile_profiles(&mut document, &mut selected, vec![canonical], true);

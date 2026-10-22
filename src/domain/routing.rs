@@ -14,6 +14,7 @@ pub enum PrimarySelection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingPolicy {
+    pub unmatched_traffic: UnmatchedTraffic,
     pub primary: PrimarySelection,
     pub backups: Vec<LaneId>,
     pub automatic_failover: bool,
@@ -22,11 +23,19 @@ pub struct RoutingPolicy {
 impl Default for RoutingPolicy {
     fn default() -> Self {
         Self {
+            unmatched_traffic: UnmatchedTraffic::PreserveSystem,
             primary: PrimarySelection::FollowSystemDefault,
             backups: Vec::new(),
             automatic_failover: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UnmatchedTraffic {
+    #[default]
+    PreserveSystem,
+    UsePrimary,
 }
 
 impl RoutingPolicy {

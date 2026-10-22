@@ -9124,6 +9124,7 @@ mod tests {
         let authorization_calls = events
             .lock()
             .unwrap()
+                unmatched_traffic: crate::domain::UnmatchedTraffic::UsePrimary,
             .iter()
             .filter(|event| **event == "authorize")
             .count();

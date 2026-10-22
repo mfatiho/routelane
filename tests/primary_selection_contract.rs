@@ -15,6 +15,7 @@ fn profile() -> Profile {
         enabled: true,
         rules: vec![],
         routing: RoutingPolicy {
+            unmatched_traffic: routelane::domain::UnmatchedTraffic::UsePrimary,
             primary: PrimarySelection::Lane("ethernet".into()),
             backups: vec!["vinn".into()],
             automatic_failover: true,
@@ -255,6 +256,7 @@ fn default_lane_id_is_not_a_role() {
     let mut p = profile();
     p.lanes[1].id = "default".into();
     p.routing = RoutingPolicy {
+        unmatched_traffic: routelane::domain::UnmatchedTraffic::UsePrimary,
         primary: PrimarySelection::FollowSystemDefault,
         backups: vec!["default".into()],
         automatic_failover: true,

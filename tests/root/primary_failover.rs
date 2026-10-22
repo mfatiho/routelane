@@ -672,6 +672,7 @@ fn runtime_activation(names: &RunNames) -> routelane::backend::RuntimeActivation
             enabled: true,
             rules: vec![],
             routing: RoutingPolicy {
+                unmatched_traffic: routelane::domain::UnmatchedTraffic::UsePrimary,
                 primary: PrimarySelection::Lane(LANE_IDS[0].into()),
                 backups: vec![LANE_IDS[2].into()],
                 automatic_failover: true,

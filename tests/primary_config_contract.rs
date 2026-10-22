@@ -24,6 +24,12 @@ fn policy(primary: Value, backups: Value) -> Value {
     json!({"primary":primary,"backups":backups,"automatic_failover":true})
 }
 
+fn current_policy(primary: Value, backups: Value) -> Value {
+    let mut policy = policy(primary, backups);
+    policy["unmatched_traffic"] = json!("PreserveSystem");
+    policy
+}
+
 #[test]
 fn v2_migration_preserves_ids_language_and_launcher_arguments() {
     let old = old_document();
@@ -32,7 +38,7 @@ fn v2_migration_preserves_ids_language_and_launcher_arguments() {
         .into_current()
         .unwrap();
     let current = serde_json::to_value(current).unwrap();
-    assert_eq!(current["schema_version"], 3);
+    assert_eq!(current["schema_version"], 4);
     assert_eq!(current["language"], "en");
     assert_eq!(current["profiles"][0]["enabled"], false);
     for key in ["id", "name", "lanes", "rules"] {
@@ -40,7 +46,7 @@ fn v2_migration_preserves_ids_language_and_launcher_arguments() {
     }
     assert_eq!(
         current["profiles"][0]["routing"],
-        policy(json!("FollowSystemDefault"), json!([]))
+        current_policy(json!("FollowSystemDefault"), json!([]))
     );
     assert_eq!(current["routing_notice_pending"], true);
 }
@@ -54,7 +60,7 @@ fn legacy_migration_never_activates() {
             .unwrap();
     assert!(current.profiles.iter().all(|profile| !profile.enabled));
     let stored = serde_json::to_value(current).unwrap();
-    assert_eq!(stored["schema_version"], 3);
+    assert_eq!(stored["schema_version"], 4);
     assert_eq!(
         stored["profiles"][0]["routing"]["primary"],
         "FollowSystemDefault"
@@ -71,6 +77,7 @@ fn invalid_primary_and_duplicate_backups_are_rejected() {
     ] {
         let mut value = old_document()["profiles"][0].clone();
         value["routing"] = routing.clone();
+        value["routing"]["unmatched_traffic"] = json!("PreserveSystem");
         let profile: Profile = serde_json::from_value(value).unwrap();
         assert!(validate_profile(&profile).is_err(), "accepted {routing}");
     }
@@ -103,7 +110,7 @@ fn save_failure_preserves_original_bytes() {
     let repository = ConfigRepository::new(&path);
     let mut document = repository.load().unwrap();
     let mut value = serde_json::to_value(&document.profiles[0]).unwrap();
-    value["routing"] = policy(json!({"Lane":"missing"}), json!([]));
+    value["routing"] = current_policy(json!({"Lane":"missing"}), json!([]));
     document.profiles[0] = serde_json::from_value(value).unwrap();
     assert!(repository.save(&document).is_err());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
@@ -136,7 +143,7 @@ fn daemon_saved_profile_migration_is_read_only() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
     repository.save(Some(&migrated)).unwrap();
     let current: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(current["schema_version"], 3);
+    assert_eq!(current["schema_version"], 4);
     assert_eq!(current["profile"]["id"], "work");
     assert_eq!(repository.load().unwrap(), Some(migrated));
 }
