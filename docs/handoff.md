@@ -1,6 +1,80 @@
 # RouteLane — geliştirici devir belgesi
 
-Tarih: 15 Ekim 2026. Bu belge, devralan geliştiricinin geçmiş kararları bulması ve yarım kalan işi güvenli şekilde sürdürmesi içindir. Kalıcı devir kaydı `docs/handoff.md` dosyasıdır; `/tmp` kopyasına veya oturumlar arası asistan hafızasına bağımlı değildir. Ayrıntılı değişiklik geçmişinin kaynağı Git ve aşağıdaki depo belgeleridir.
+Tarih: 22 Ekim 2026. Bu belge, devralan geliştiricinin geçmiş kararları bulması ve yarım kalan işi güvenli şekilde sürdürmesi içindir. Kalıcı devir kaydı `docs/handoff.md` dosyasıdır; `/tmp` kopyasına veya oturumlar arası asistan hafızasına bağımlı değildir. Ayrıntılı değişiklik geçmişinin kaynağı Git ve aşağıdaki depo belgeleridir.
+
+## En son kayıt — seçici yönlendirme uygulama planı (22 Ekim 2026)
+
+- Kullanıcı son “Devam et” ile yazılı seçici yönlendirme tasarımını onayladı. `writing-plans` kullanılarak `docs/superpowers/plans/2026-10-22-selective-routing.md` yazıldı; tasarımın durum satırı onaylandı olarak güncellendi. Yalnız bu iki belge `0ec1661` (`docs(routing): plan selective routing implementation`) commit'ine alındı. Önceki tasarım commit'i `ff317b1` korunuyor.
+- **Plan kullanıcı incelemesini bekliyor; Task 1 dahil hiçbir uygulama görevi başlamadı.** Kullanıcının bir sonraki onayı planı kapsıyorsa Task 1'den başlanabilir; yeniden tasarım/plan döngüsü başlatma. Korunan yürütme seçimi main/inline, alt ajan ve yeni worktree yoktur.
+- 10 görev: frozen V2 journal/V3 profil kanıtı → zorunlu mod/ConfigV4 → cleanup-only yükseltme → seçici nft/planner → scoped transaction guard → protocol3/grant/applied mode → root-observed lab önizlemesi/CLI onayı → GTK → gerçek kernel/VM kabulü → tam regresyon/paket/devir. Task 9'un trafik kanıtı olmadan düzeldi veya kurulum hazır deme.
+- Plan öz incelemesi: spec §1–10 görevlerle eşleştirildi, beş Review Focus durumu ilgili testlere bağlandı; kesin tip/API adları, literal davranış assertion'ları ve RED/GREEN komutları yazıldı. `git diff --check` ve staged dokümantasyon kontrolü geçti. Bu tur yalnız dokümantasyon: uygulama testleri/derleme/VM testi çalıştırılmadı.
+- Önceden kirli kaynak/Cargo/README/CIDR/nesil değişiklikleri korundu ve commit edilmedi. `docs/handoff.md` önceki kullanıcı tercihiyle kalıcı kayıt olarak güncellendi, bu commit'e alınmadı; AGENTS.md değişmedi. Host servis/paket/profil/kernel/lab VM'lerine dokunulmadı; canlı lab erişimi hâlâ doğrulanmış değil.
+
+### Sonraki adım ve Suggested Skills
+
+`rtk git status --short --branch` ve `rtk proxy sed -n '1,280p' docs/superpowers/plans/2026-10-22-selective-routing.md` ile başla. Plan onayından sonra `executing-plans`, `test-driven-development` ve gerektiğinde `implement`; önce tam başlangıç test koşusu ve dirty baseline ayrımı, sonra frozen kanıt/Task 1. Sonuçlar için `verification-before-completion`, kalıcı kayıt için `handoff`. Plan yürütme onayı canlı RouteLane'i kapatma/yeniden açma, host kurulumu veya mevcut lab kuralını düzenleme izni değildir.
+
+## En son kayıt — seçici yönlendirme tasarımı (22 Ekim 2026)
+
+- Kullanıcı eşleşmeyen trafiğin OS davranışını korumasını istedi ve açıklanan hedefe “devam et” dedi. Bu, 14 Ekim'deki tüm eşleşmeyen internet trafiğini ana hatta taşıma varsayılanını değiştirir; önceki özellik ayrı opt-in olarak korunacak.
+- Mimari tasarım becerisi kullanıldı. Yazılı tasarım: `docs/superpowers/specs/2026-10-22-selective-routing-design.md`; yalnız bu belge commit edildi: `ff317b1` (`docs(routing): define selective routing and system preservation`). **Yazılı tasarım kullanıcı incelemesini bekliyor; uygulama planı ve ürün uygulaması henüz yok.** Genel “devam et” onayını henüz var olmayan planın onayı sayma.
+- Tasarım: `PreserveSystem` varsayılan, `UsePrimary` açık onaylı seçenek; mode planner/hash/runtime grant'e dahil. Global foreign-mark reject ve seçici transaction guard kapsamı daralır; açık Block/Route önceliği, owned-flow NAT/affinity ve dar yetki korunur. Config/desired schema 4, IPC/runtime 3, journal 3 öneriliyor; eski V2 plan/hash dondurulmuş decoder ile yalnız exact cleanup, modern activation öncesi temizlik ve yeniden yetkilendirme.
+- `Direct` ana hattır; gerçek OS-bypass diye sunulmayacak. Etkin `10.65.201.0/24 → Ethernet` varsa bu açık bir eşleşmedir: sessiz silme/bypass değil, çakışma önizlemesi ve kullanıcının düzenleme/devre dışı bırakma/açık onayı gerekir. Eski mark/NAT uygulanmış socket'lerin kesintisiz taşınacağı iddia edilmez; yeni bağlantı ile doğrulama şart.
+- Bu turda yalnız dokümantasyon yazıldı; uygulama testleri yeniden çalıştırılmadı. `git diff --check` ve yeni belgenin staged diff kontrolü geçti; kaynak incelemesi global output fallback, foreign reject, global guard ve exact rollback riskini doğruladı. Önceki 451 passed/1 failed/2 ignored ve diğer doğrulamalar tarihsel, bu tasarımın uygulandığına kanıt değil.
+- Önceki CIDR/nesil düzeltmeleri ile başlangıçta kirli bulunan `Cargo.toml`/`Cargo.lock` korundu; bu commit'e alınmadı. AGENTS.md değiştirilmedi, alt ajan/worktree yok. Profil, kurulu paket, servis, VM ve canlı kernel ağına dokunulmadı; kullanıcının lab erişimi düzeltilmiş sayılmıyor.
+
+### Sonraki adım ve Suggested Skills
+
+Önce `rtk proxy sed -n '1,180p' docs/superpowers/specs/2026-10-22-selective-routing-design.md` ve `rtk git status --short --branch`. Yazılı tasarım için kullanıcı yanıtını al; onaydan sonra `writing-plans` ile ayrı uygulama planını yaz ve yürütme öncesi plan onayını tamamla. Ardından `test-driven-development` / `implement`, en sonda `verification-before-completion`; devir kaydı `handoff` ile yine bu dosyaya. Canlı lab için RouteLane'i devre dışı bırakma/manuel RPDB istisnası ayrıca konuşuldu fakat kullanıcı bu host mutasyonu seçeneklerinden birini onaylamadı.
+
+## En son kayıt — kapatma sonrası nesil uyuşmazlığı (22 Ekim 2026)
+
+- Kullanıcı `ActivateRuntime: runtime activation expected generation 2 but 0 is applied` hatasını bildirdi ve dar düzeltmeyi onayladı. Salt okunur gözlemde daemon generation=2/applied_profile=null, helper plan=null/runtime generation=0/Inactive ve RouteLane nft tablosu yoktu.
+- Neden: `DaemonService::deactivate` başarılı cleanup sonrasında planı siliyor ama `state.generation` değerini koruyordu. Artık yalnız cleanup başarılı olduktan sonra nesil 0 olur; başarısız cleanup uygulanmış nesli ve planı korur. Helper'ın generation/CAS, Polkit ve sahiplik kontrolleri değiştirilmedi; otomatik hata tekrar denemesi eklenmedi.
+- `src/ui/session.rs`: aynı bağlantı epoch'unda önce daemon'un monoton `event_sequence` değeriyle sırala; daha yeni sıra numarası cleanup sonrası daha düşük helper neslini taşıyabilir. Düşük sıra numaralı eski güncellemeler ve aynı sıra numarasındaki düşük nesiller reddedilir. Böylece başarılı yeniden aktivasyon arayüzü beklemede bırakmaz.
+- Regresyonlar: `tests/primary_daemon_contract.rs` nesil 2 → cleanup → 0 → activate → 1 döngüsünü iki kez doğrular; gecikmiş eski helper bildirimi kapatılan runtime'ı canlandıramaz. UI testi nesil sıfırlanmasını/yeni aktivasyonu kabul eder ve eski yüksek nesilli olayı reddeder. `tests/ipc_contract.rs` başarısız cleanup'ta neslin korunmasını, başarılı cleanup'ta sıfırlanmasını doğrular.
+- RED gözlendi: yeni daemon testleri `stale expected generation` ve 2≠0; yeni UI testi 8≠0 hatası verdi. Düzeltmeden sonra IPC + primary daemon **47/47 PASS**, UI session **18/18 PASS**.
+- Güncel tam tur: `rtk cargo test --all-targets --no-fail-fast` **451 passed, 1 failed, 2 ignored**, exit 101. Tek hata bu turdan önce yeniden üretilen `ui::desktop_catalog::tests::sandbox_launcher_is_not_selectable_as_a_host_application`; bağımsız Snap/symlink sorunu çözülmedi. Tam suite GREEN değil.
+- `rtk cargo clippy --all-targets -- -D warnings`, `rtk proxy cargo fmt --all -- --check`, `rtk git diff --check`, `rtk cargo build --release --bins`: PASS. `rtk proxy bash scripts/run-gtk-smoke.sh`: izole GTK oturumunda **1/1 PASS**. Gerçek kernel/Polkit/VM testi bu turda çalıştırılmadı.
+- Kurulu binary/paket/servisler, kullanıcı yapılandırması ve canlı host ağı değiştirilmedi. Önceki CIDR/mükerrer değişiklikler korundu; yeni düzeltme de commit edilmedi. Yeni worktree/alt ajan kullanılmadı; inceleme aynı ajan tarafından yapıldı.
+
+### Kalan iş ve sonraki adım
+
+Multipass yerel köprü trafiğini lane yönlendirmesinden koruma işi daha önce onaylandı fakat **henüz uygulanmadı**. Önceki inceleme: `10.65.201.0/24` için açık lane kuralı yerel `mpqemubr0` rotasının önüne geçiyor; grant-filtered topology köprünün connected prefix'ini plandan çıkarıyor. Direct, OS-yerel bypass değildir. Çözüm açık Block kurallarını, dar exit grant'ini ve eski journal'ın exact rollback/cleanup uyumunu korumalı; yalnız RFC1918 geneli için koşulsuz bypass ekleme. Mevcut kullanıcı lab VM'lerini test ortamı sanma ve canlı ağı yeniden etkinleştirme.
+
+Önce `rtk git diff -- src/daemon/service.rs src/ui/session.rs tests/primary_daemon_contract.rs tests/ipc_contract.rs` ile bu düzeltmeyi ayır; hızlı doğrulama `rtk cargo test --test primary_daemon_contract --test ipc_contract`. Paket kurulumu veya canlı servis/ağ işlemini ayrıca kapsamla eşleştir; kaynak düzeltmesi kurulu sürümün güncellendiği anlamına gelmez.
+
+### Suggested Skills
+
+Yerel köprü sorunu için `systematic-debugging`, `test-driven-development`; tamamlanma kanıtı için `verification-before-completion`; sonraki kalıcı devir kaydı için `handoff`. Kullanıcının repo içindeki kalıcı kayıt tercihi `/tmp` varsayımından üstündür.
+
+## En son kayıt — CIDR ve mükerrer kurallar (22 Ekim 2026)
+
+- Kullanıcı `10.65.201.0/24` girişi ve uygulama/kernel tarafında mükerrer kayıtların engellenmesini istedi; kaynak + normalize hedef + eylem/lane tanımını onayladı. Ticari analiz talebinin yerine bu uygulama işi geçti.
+- Başlangıç: temiz `main`, HEAD `f492062` (`add handoff.md`), origin ile aynı. Bu turdaki değişiklikler commit edilmedi; alt ajan/worktree kullanılmadı. AGENTS.md değiştirilmedi. Bu dosya artık Git takibinde; aşağıdaki eski ignore uyarısı tarihsel.
+- CIDR zaten destekleniyordu; artık editor ve planner host bitlerini sıfırlıyor (`10.65.201.25/24` → `10.65.201.0/24`). IP ile `/32` veya `/128` karşılığı, domain case/son nokta farkı mükerrerlik kontrolünde eşdeğer. ID/öncelik/aktiflik farkı yeni kural sayılmaz. Farklı kaynak, eylem/lane veya yalnız örtüşen farklı ağlar korunuyor; düzenleme kendisini dışlıyor.
+- `src/domain/{rule,profile}.rs`: tipli eşdeğerlik anahtarı ve ortak profil doğrulaması. Uygulama seçiminde executable/include_children esas; launcher/desktop alias metadata'sı aynı süreç kuralını ikinci kez tanımlayamaz. `src/ui/rule_editor.rs` ve `i18n.rs`: kaydetmeden önce TR/EN uyarı. Config ve CLI aynı domain doğrulamasını kullanıyor.
+- `src/backend/{plan,planner}.rs`: DNS alias'ları aynı aile/hedef/eyleme derlenirse ilk eşleşmeyi koruyarak tek verdict üret; kayıtlı mantıksal kuralları silme. `privileged.rs`: yalnız yeni ApplyPlan/backend.apply girişlerinde mükerrer derlenmiş planı kernel komutundan önce reddet. Eski journal decoder'ına daha katı kontrol eklenmedi; eski mükerrer içeren committed journal'ın exact cleanup regresyonu geçti.
+- Eski JSON'daki mantıksal mükerrerler yükleme/import sırasında reddedilir, dosya sessizce düzeltilmez/silinmez; hata verilen kayıtlar kullanıcı tarafından düzenlenmeli. Yabancı nftables/iptables/routing kaynaklarına dokunulmadı; yeni iptables backend'i eklenmedi.
+
+### Bu turdaki doğrulama
+
+- RED: yeni domain testlerinde iki, editor testlerinde üç, planner testlerinde iki, privileged duplicate-plan testlerinde iki davranış hatası görüldü; ardından uygulama yapıldı. Yeni tek başına eski-journal cleanup fixture'ında fazladan metainfo placeholder hatası düzeltildi; üretim sahiplik kontrolü gevşetilmedi.
+- `rtk cargo test --all-targets --no-fail-fast`: **448 passed, 1 failed, 2 ignored**, exit 101. Tek hata başlangıçta da bağımsız yeniden üretilen `ui::desktop_catalog::tests::sandbox_launcher_is_not_selectable_as_a_host_application`; `/usr/bin/snap` bu makinede `../lib/snapd/snapd` symlink'i olduğundan mevcut basename kontrolü `sandbox` döndürmüyor. Bu ayrı hata kapsam dışı bırakıldı; tam suite GREEN değil.
+- `rtk cargo test --test duplicate_rule_contract`: **4/4 PASS**. Config no-write/import, CLI daemon'a hiç bağlanmama, planner/nft verdict tekilleştirme ve tekrarlanan apply'da NFT/route/rule büyümemesi regresyonları tam turda geçti.
+- `rtk proxy bash scripts/run-gtk-smoke.sh`: **1/1 PASS**; gerçek diyalog mükerrerde açık kalıyor/uyarı veriyor/save çağırmıyor; hedef düzeltilince canonical CIDR kaydediliyor. Özel Broadway/session bus; kullanıcının masaüstü/config'i kullanılmadı.
+- `rtk cargo clippy --all-targets -- -D warnings`, `rtk proxy cargo fmt --all -- --check`, `rtk git diff --check`: PASS.
+- `rtk cargo test --test root --features root-integration --no-run`: derlendi. Gerçek kernel/VM testleri bu turda **çalıştırılmadı**; host ağ/servis/paket kurulumu değiştirilmedi. Önceki dağıtım yayın kapıları hâlâ ayrı kanıt gerektirir.
+
+### Devam noktası
+
+Önce `rtk git status --short --branch` ve bu turdaki diff'i oku. Ayrı Snap tespiti sorununa geçilecekse başlangıç komutu:
+
+```bash
+rtk cargo test --bin routelane ui::desktop_catalog::tests::sandbox_launcher_is_not_selectable_as_a_host_application -- --exact
+```
+
+Bu yeni davranışın kernel kabulü gerekirse yalnız yetkilendirilmiş disposable VM'de çalıştır; canlı host üzerinde genel kural temizliği yapma. Geçmiş failover doğrulaması için `docs/primary-failover-verification.md` geçerli kaynak olmaya devam ediyor.
 
 ## En son kayıt — hafıza güncellemesi (15 Ekim 2026)
 
