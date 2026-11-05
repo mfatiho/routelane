@@ -15,12 +15,13 @@ Commands, code style, testing and commit rules live in `AGENTS.md` and are not r
 
 ## Reading order (when starting a task)
 
-1. `docs/superpowers/specs/2026-10-14-primary-connection-failover-design.md`: approved requirements and security boundary.
-2. `docs/superpowers/plans/2026-10-14-primary-connection-failover.md`: 12 tasks, acceptance tests, dependencies.
-3. `docs/handoff.md` and, if present, `.superpowers/.../progress.md`: latest state, decisions, VM notes.
-4. `docs/research/primary-failover-kernel.md`: kernel/nft ABI evidence.
-5. `README.md`, `docs/reliability-audit.md`, `docs/ui-ux-verification.md`: architecture and earlier verification. Historical results are not current evidence.
-6. `docs/commercial-roadmap.md`: commercial scope only; not a substitute for the technical spec.
+1. `docs/handoff.md`: the newest `## En son kayıt` section at the top is the latest state, decisions and next step.
+2. In-flight work: `docs/superpowers/specs/2026-10-22-selective-routing-design.md` and `docs/superpowers/plans/2026-10-22-selective-routing.md` (selective routing; it changes the failover design's "all unmatched traffic to the primary" default).
+3. `docs/superpowers/specs/2026-10-14-primary-connection-failover-design.md` and its plan: the completed primary/failover feature and its security boundary.
+4. `.superpowers/sdd/<plan>/progress.md`, if present: detailed per-plan decision/test ledger.
+5. `docs/research/primary-failover-kernel.md` and `docs/primary-failover-verification.md`: kernel/nft ABI evidence and the distribution matrix.
+6. `README.md`, `docs/reliability-audit.md`, `docs/ui-ux-verification.md`: architecture and earlier verification. Historical results are not current evidence.
+7. `docs/commercial-roadmap.md`: commercial scope only; not a substitute for the technical spec.
 
 **Plan checkboxes alone are not the source of truth.** Cross-check them against commits, `git diff` and test logs.
 
@@ -28,8 +29,8 @@ Commands, code style, testing and commit rules live in `AGENTS.md` and are not r
 
 - A documentation, handoff or review request is **not authorization to implement**. Before touching source code, confirm that the current request is to continue implementation.
 - A documentation request does not authorize fixing fmt/lint failures you find either; report them.
-- Until the primary connection/failover feature is complete, do not install, publish or apply intermediate builds as a product or to the user's live network.
-- **Working preference for the failover work:** the user chose to proceed on `main`, inline, with no new worktree and no subagents. For this feature, apply that instead of the general delegation routing; change it only if the user says otherwise. Never report an independent review as done when it was not.
+- Do not install, publish or apply intermediate builds as a product or to the user's live network. Plan approval is not permission to disable/re-enable live RouteLane, install on the host, or edit the user's live profile or lab rules.
+- **Working preference (failover and selective routing work):** the user chose to proceed on `main`, inline, with no new worktree and no subagents. Apply that instead of the general delegation routing; change it only if the user says otherwise. Never report an independent review as done when it was not.
 
 ## Architecture and security boundary
 
@@ -52,14 +53,14 @@ routelane-daemon  --(system D-Bus + Polkit io.github.routelane.apply)-->  routel
 - The helper has no enable/install target and is never started directly; it is activated via system D-Bus. With no Polkit agent the result is `NeedsAuthorization`; there is no silent privilege escalation. No sudo password is ever requested or stored.
 - Connection Health proves only local conformance with the plan. It uses no external "what is my IP" service and does not show that a site loads.
 - Domain rules use the resolver IP snapshot taken when the profile is applied; there is no DNS/TTL tracking. Application affinity covers every new connection from the process tree; in a browser, other tabs join the same lane too. Flatpak and Snap are outside the first release's scope.
-- The config schema is v3 (`CURRENT_SCHEMA_VERSION`, `src/config.rs`). v2 and legacy documents are migrated on load. The `routing` field is required in v3 profiles. If the schema changes, update the `README.md` example as well.
+- The config schema is v4 (`CURRENT_SCHEMA_VERSION`, `src/config.rs`). v3, v2 and legacy documents are migrated read-only on load. Every v4 profile requires `routing` with `unmatched_traffic` (`PreserveSystem` default, or `UsePrimary`); unknown fields are rejected. The kernel plan does **not** use `unmatched_traffic` yet (selective routing plan, Task 4); do not describe it as working. If the schema changes, update the `README.md` example as well.
 - A GUI crash is not caught by `fmt`/`test`/`clippy` (e.g. a `RefCell` double-borrow inside a live GTK callback). Do a real launch and diagnose with `journalctl --user -g routelane --since "-10 min"`. For an isolated launch use `scripts/run-gtk-smoke.sh`.
 - **First official release gate:** each of Ubuntu 22.04/24.04/26.04, Debian 12/13 and Fedora 43/44 must be green in CI and release validation on both x86_64 and aarch64. Coverage: namespaces, install, systemd user, D-Bus, Polkit, GTK and rollback/health. The `.deb` is only a development verification artifact.
 
 ## Dirty working tree: preserve the user's changes
 
-- Changes that existed before the failover work belong to the user: `.gitignore`, `README.md`, `data/routelane-helper.service`, `packaging/deb/build-deb.sh`, `src/application/process.rs`, `src/backend/inspect.rs`, `src/backend/privileged.rs`, `src/daemon/service.rs`, `tests/ipc_contract.rs`. Pre-existing untracked files: `data/routelane-tmpfiles.conf`, `docs/reliability-audit.md`, `packaging/deb/postinst`.
-- **`src/backend/privileged.rs` contains both the user's baseline and task hunks.** Stage it hunk by hunk only. Never commit, restore or check out the whole file, and never copy it from another file.
+- The working tree usually holds uncommitted work of several origins. Run `rtk git status --short` and read the latest handoff record before staging: it names which changes are unfinished plan tasks and which are user-approved fixes that stay uncommitted (for example CIDR/duplicate rules, the deactivate generation reset, user `Cargo.toml`/`Cargo.lock` version changes, README edits). Commit only what the current task owns.
+- **`src/backend/privileged.rs` mixes several origins.** Stage it hunk by hunk only. Never commit, restore or check out the whole file, and never copy it from another file.
 - No `git add .`, `git reset --hard`, `git clean`, or whole-file `checkout`/`restore`.
 - `git diff` does not show the contents of untracked files (e.g. `src/backend/interface_settings.rs`); read those separately.
 
@@ -68,7 +69,7 @@ routelane-daemon  --(system D-Bus + Polkit io.github.routelane.apply)-->  routel
 - At startup the OS default connection is the primary. If the user picks a different primary, warn first and get confirmation.
 - When the primary goes down, switch only to backups the user approved. On failback apply a 5 s stability period; do not tear down existing owned backup flows; only new flows go to the primary.
 - IPv4 and IPv6 decisions are separate. With no eligible exit, stay **fail-closed**; no silent escape to the OS default.
-- Route/Direct/Block and application affinity are preserved. The V3 migration does not enable networking on a read-only load; the semantic change is explained on first activation.
+- Route/Direct/Block and application affinity are preserved. Config migrations (to V3 and V4) never enable networking on a read-only load; a semantic change is explained on first activation. `Direct` means "use the primary", not an OS bypass.
 - Never rewrite the OS main routing table, DNS, foreign firewall/policy rules or global sysctl values. Never use global NAT, conntrack flush, disabling IPv6 or a proxy to make tests pass.
 - Approval does not permit deleting an unknown resource. Nothing is cleaned up just because its name contains `routelane`. The root helper mutates only with verified ownership and narrow, typed contracts. `Inspect` is read-only.
 - Sysctl access is fixed-purpose: only `src_valid_mark` on the selected interface is changed. There is no IPC that accepts an arbitrary sysctl path/value; `all`/`default` are never written. The service stays `ProtectKernelTunables=yes`; only a documented narrow exception may be added.
@@ -86,17 +87,19 @@ routelane-daemon  --(system D-Bus + Polkit io.github.routelane.apply)-->  routel
 
 ## Kernel/root tests and the VM boundary
 
-- **Never run root tests on the workstation with sudo.** Run them only inside the approved guest, as root, via `bash scripts/run-root-integration.sh` or a verified prebuilt runner.
-- The only approved VM: Multipass `routelane-test-u2404-20261014` (Ubuntu 24.04, nft 1.0.9). `slave-01`, `master-01`, `master-02` and `central-lab-01` are out of scope; do not touch them. VM approval does not extend to host installation or live network mutation.
+- **Never run root tests on the workstation with sudo.** Run them only inside an approved disposable guest, as root, via `bash scripts/run-root-integration.sh` or a verified prebuilt runner.
+- **No approved test VM currently exists.** The former test VM `routelane-test-u2404-20261014` was deleted (absent from `multipass list` on 5 Nov 2026). Creating a new disposable `routelane-test-*` VM needs the user's explicit approval first; until then kernel/root evidence is NOT VERIFIED. All other Multipass VMs (`central-lab-01`, `master-01`, `master-02`, `slave-01`, `pits-t-master`, `pits-t-slave1`, …) are the user's and out of scope; do not touch them. VM approval does not extend to host installation or live network mutation.
+- `tests/root/system_bus_acceptance.sh` installs the package inside the guest and refuses to run unless `ROUTELANE_DISPOSABLE_VM` equals the guest's hostname. The multipass snap cannot read `/tmp`; stage transfers under the workspace (e.g. `.superpowers/sdd/...`).
 - **Build trap:** `cargo test --all-targets` overwrites the feature-built `target/debug/routelane-helper` with a binary built without `root-integration`. Build the feature helper serially with the root tests, transfer it to the guest immediately, and verify the artifact identity (hash/date).
 - Copies in the guest may be stale; compare hashes before using them.
 
 ## Current state (changes often; verify every session)
 
-- All 12 tasks of the failover plan are committed (last: `80e109c`). Ubuntu 22.04/24.04/26.04 x86_64 kernel, system-bus, upgrade, reboot and removal runs pass (26.04 has intermittent failures in two counter/threshold-based root tests); see `docs/primary-failover-verification.md`.
+- Primary/failover: all 12 plan tasks committed (through `80e109c`); Ubuntu 22.04/24.04/26.04 x86_64 evidence in `docs/primary-failover-verification.md`.
+- Selective routing (10-task plan): Task 1 (`fb88c25`, frozen V2 journal/V3 profile evidence) and Task 2 (`937ea67`, mode + ConfigV4) committed; Task 3 (journal V3, cleanup-only V2) is unfinished in the working tree.
+- Rootless baseline on 5 Nov 2026: `rtk cargo test --all-targets --no-fail-fast` → 468 passed, 3 failed, 2 ignored. Failing: `journal_versions_are_explicit_and_strict` and `v2_empty_journal_can_be_cleared_without_network_mutation` (unfinished Task 3), and the older `ui::desktop_catalog::tests::sandbox_launcher_is_not_selectable_as_a_host_application`. The suite is not GREEN.
 - The first-release gate is **open**: Debian 12/13, Fedora 43/44, aarch64, interactive Polkit agent, GTK launch per distro, firewalld/SELinux and CI are NOT VERIFIED.
-- The user's remaining dirty hunks are still unstaged (see the list above); stage feature work around them.
-- For the exact state, first run `rtk git status --short --branch`, then read `docs/handoff.md` §0.
+- For the exact state, first run `rtk git status --short --branch`, then read the newest record in `docs/handoff.md`.
 - At the end of a session, record the new state and the next narrow step in `docs/handoff.md`.
 
 ## Useful skills
