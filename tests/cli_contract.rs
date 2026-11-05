@@ -126,6 +126,26 @@ async fn assert_local_config_error_without_daemon_contact(
 }
 
 #[tokio::test]
+async fn duplicate_rule_input_is_rejected_before_daemon_contact() {
+    let runtime = TempDir::new().unwrap();
+    let path = runtime.path().join("profile.json");
+    let mut document: serde_json::Value = serde_json::from_str(profile_json()).unwrap();
+    document["profiles"][0]["rules"] = serde_json::json!([
+        {"id":"first","priority":10,"enabled":true,"source":"Any","target":{"Cidr":"10.65.201.0/24"},"action":"Block"},
+        {"id":"second","priority":20,"enabled":true,"source":"Any","target":{"Cidr":"10.65.201.25/24"},"action":"Block"}
+    ]);
+    let content = serde_json::to_vec(&document).unwrap();
+    write_private(&path, &content);
+    let output = assert_local_config_error_without_daemon_contact(
+        &runtime,
+        &["apply-profile", path.to_str().unwrap()],
+    )
+    .await;
+    assert!(String::from_utf8_lossy(&output.stderr).contains("DuplicateRule"));
+    assert_eq!(std::fs::read(path).unwrap(), content);
+}
+
+#[tokio::test]
 async fn status_json_is_machine_readable_and_keeps_stderr_empty() {
     let runtime = TempDir::new().unwrap();
     serve_once(

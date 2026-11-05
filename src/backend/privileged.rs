@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::nft_document::{
     has_valid_policy_seal, normalize_nft_document, state_chain_name, POLICY_SEAL_PREFIX,
 };
-use crate::domain::LaneId;
+use crate::domain::{LaneId, RuleId};
 
 use super::interface_settings::{InterfaceSettingReceipt, MarkAwareRpf, MarkAwareRpfBackend};
 use super::legacy_journal::{legacy_nft_fingerprint, LegacyJournalV1};
@@ -932,6 +932,7 @@ where
     S: AppliedStateStore,
 {
     fn apply(&mut self, plan: &KernelPlan) -> Result<ApplyResponse, PrivilegedError> {
+        validate_new_plan_rules(plan).map_err(|error| PrivilegedError::new(error.to_string()))?;
         self.ensure_reconciled()?;
         self.refuse_legacy_activation()?;
         self.refuse_armed_runtime()?;
@@ -4475,6 +4476,7 @@ pub enum ValidationError {
     DuplicateTable(u32),
     DuplicateMark(u32),
     DuplicatePriority(u32),
+    DuplicateCompiledRule(RuleId),
     InvalidInterface(String),
     InvalidApplicationCgroup(String),
     UnknownMark(u32),
@@ -4509,6 +4511,7 @@ impl fmt::Display for ValidationError {
             Self::DuplicatePriority(priority) => {
                 write!(formatter, "duplicate rule priority {priority}")
             }
+            Self::DuplicateCompiledRule(id) => write!(formatter, "duplicate compiled rule {id:?}"),
             Self::InvalidInterface(interface) => {
                 write!(formatter, "invalid kernel interface name {interface:?}")
             }
@@ -4589,6 +4592,18 @@ pub fn validate_privileged_plan(plan: &KernelPlan) -> Result<(), ValidationError
         }
     }
 
+    Ok(())
+}
+
+/// Only new activations use this stricter check. Old journals and rollback
+/// receipts retain their original exact plan so they remain recoverable.
+fn validate_new_plan_rules(plan: &KernelPlan) -> Result<(), ValidationError> {
+    let mut verdicts = BTreeSet::new();
+    for rule in &plan.rules {
+        if !verdicts.insert(rule.routing_key()) {
+            return Err(ValidationError::DuplicateCompiledRule(rule.id.clone()));
+        }
+    }
     Ok(())
 }
 
@@ -4915,6 +4930,7 @@ where
         let plan: KernelPlan = serde_json::from_str(plan_json)
             .map_err(|error| ServiceError::InvalidPlanJson(error.to_string()))?;
         validate_privileged_plan(&plan).map_err(ServiceError::Validation)?;
+        validate_new_plan_rules(&plan).map_err(ServiceError::Validation)?;
 
         self.run_backend(move |backend| backend.apply(&plan)).await
     }
@@ -7512,6 +7528,118 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_compiled_rules_are_rejected_before_any_kernel_command() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            FakeAppliedStateStore::default(),
+        );
+        let mut plan = fixture_valid_plan();
+        let mut duplicate = plan.rules[0].clone();
+        duplicate.id = "duplicate".into();
+        duplicate.priority = 90;
+        duplicate.target = CompiledTarget::Network("203.0.113.25/24".parse().unwrap());
+        plan.rules.push(duplicate);
+        assert!(backend.apply(&plan).is_err());
+        assert!(kernel.lock().unwrap().commands.is_empty());
+    }
+
+    #[test]
+    fn older_duplicate_containing_journal_can_still_be_cleaned_exactly() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        let mut old = fixture_valid_plan();
+        backend.apply(&old).unwrap();
+        let mut duplicate = old.rules[0].clone();
+        duplicate.id = "old-duplicate".into();
+        old.rules.push(duplicate);
+        // Seed the exact state an older release was allowed to commit. Do not
+        // use the new activation path to manufacture historical journal data.
+        let document = super::expected_nft_document(Some(&old), None, false);
+        let fingerprint = super::nft_document_fingerprint(&document).unwrap();
+        {
+            let mut state = kernel.lock().unwrap();
+            // The executor supplies dump metainfo itself; the semantic
+            // document's empty metainfo placeholder is not a kernel object.
+            state.nft_objects = Some(
+                document["nftables"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|object| !object.as_object().is_some_and(|object| object.is_empty()))
+                    .cloned()
+                    .collect(),
+            );
+            state.marker = Some(super::state_chain_name(&old));
+        }
+        *store.state.lock().unwrap() = Some(StoredAppliedState::committed(
+            Some(old),
+            Some(fingerprint),
+            None,
+        ));
+        drop(backend);
+        let mut restarted = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        restarted.cleanup().unwrap();
+        assert!(store.state.lock().unwrap().is_none());
+        let state = kernel.lock().unwrap();
+        assert!(!state.has_table && !state.has_route && !state.has_rule);
+        assert!(state.extra_routes.is_empty());
+        assert!(state.extra_rules.is_empty());
+    }
+
+    #[test]
+    fn repeated_apply_keeps_exact_nft_routes_and_rules_without_extra_mutations() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            FakeAppliedStateStore::default(),
+        );
+        let plan = fixture_valid_plan();
+        backend.apply(&plan).unwrap();
+        let before = {
+            let state = kernel.lock().unwrap();
+            (
+                state.nft_objects.clone(),
+                state.extra_routes.clone(),
+                state.extra_rules.clone(),
+                state.has_route,
+                state.has_rule,
+                mutation_count(&state),
+            )
+        };
+        for _ in 0..3 {
+            backend.apply(&plan).unwrap();
+        }
+        let state = kernel.lock().unwrap();
+        assert_eq!(
+            (
+                state.nft_objects.clone(),
+                state.extra_routes.clone(),
+                state.extra_rules.clone(),
+                state.has_route,
+                state.has_rule,
+                mutation_count(&state)
+            ),
+            before
+        );
+    }
+
+    #[test]
     fn same_generation_apply_revalidates_live_state_before_journal_or_mutation() {
         let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
         let store = FakeAppliedStateStore::default();
@@ -8431,6 +8559,20 @@ mod tests {
             Err(ServiceError::MissingSender)
         );
         assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_compiled_rules_never_reach_the_authorized_backend() {
+        let (service, events) = fixture_service(Ok(()));
+        let mut plan = fixture_valid_plan();
+        let mut duplicate = plan.rules[0].clone();
+        duplicate.id = "duplicate".into();
+        plan.rules.push(duplicate);
+        assert!(service
+            .apply_plan(Some(":1.42"), &serde_json::to_string(&plan).unwrap())
+            .await
+            .is_err());
+        assert_eq!(*events.lock().unwrap(), vec!["authorize"]);
     }
 
     #[tokio::test]

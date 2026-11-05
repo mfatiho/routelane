@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +75,7 @@ pub enum DomainError {
     EmptyLaneName(LaneId),
     DuplicateLaneName(String),
     DuplicateRuleId(RuleId),
+    DuplicateRule { existing: RuleId, duplicate: RuleId },
     InvalidApplicationRule(RuleId),
     EmptyApplicationExecutable(RuleId),
     DuplicateApplicationDesktopId(String),
@@ -116,6 +117,7 @@ pub fn validate_profile(profile: &Profile) -> Result<(), DomainError> {
     let mut rule_ids = BTreeSet::new();
     profile.routing.validate(&profile.lanes)?;
     let mut application_desktop_ids = BTreeSet::new();
+    let mut rule_contents = BTreeMap::new();
     for rule in &profile.rules {
         if !rule_ids.insert(rule.id.clone()) {
             return Err(DomainError::DuplicateRuleId(rule.id.clone()));
@@ -136,6 +138,12 @@ pub fn validate_profile(profile: &Profile) -> Result<(), DomainError> {
                     ));
                 }
             }
+        }
+        if let Some(existing) = rule_contents.insert(rule.duplicate_key(), rule.id.clone()) {
+            return Err(DomainError::DuplicateRule {
+                existing,
+                duplicate: rule.id.clone(),
+            });
         }
     }
 
@@ -175,6 +183,19 @@ pub fn validate_profile(profile: &Profile) -> Result<(), DomainError> {
     }
 
     Ok(())
+}
+
+/// Finds the same routing intent while allowing an existing rule to edit itself.
+pub fn find_duplicate_rule<'a>(
+    profile: &'a Profile,
+    candidate: &Rule,
+    excluding: Option<&RuleId>,
+) -> Option<&'a Rule> {
+    let key = candidate.duplicate_key();
+    profile
+        .rules
+        .iter()
+        .find(|rule| excluding != Some(&rule.id) && rule.duplicate_key() == key)
 }
 
 pub fn canonical_lane_name(

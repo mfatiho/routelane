@@ -1,7 +1,9 @@
 use crate::ui::{form::Form, i18n::Texts, rule_row::ReorderDirection};
 use gtk4::{self as gtk, prelude::*};
 use libadwaita as adw;
-use routelane::domain::{Lane, Profile, Rule, RuleAction, RuleId, RuleSource, RuleTarget};
+use routelane::domain::{
+    find_duplicate_rule, Lane, Profile, Rule, RuleAction, RuleId, RuleSource, RuleTarget,
+};
 use std::{cell::RefCell, rc::Rc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,8 +27,8 @@ pub fn parse_rule_target(input: &str) -> Result<RuleTarget, TargetInputError> {
     if let Ok(address) = value.parse() {
         return Ok(RuleTarget::Ip(address));
     }
-    if let Ok(network) = value.parse() {
-        return Ok(RuleTarget::Cidr(network));
+    if let Ok(network) = value.parse::<ipnet::IpNet>() {
+        return Ok(RuleTarget::Cidr(network.trunc()));
     }
     let domain = value.strip_suffix('.').unwrap_or(value);
     if domain.len() > 253
@@ -44,7 +46,7 @@ pub fn parse_rule_target(input: &str) -> Result<RuleTarget, TargetInputError> {
     {
         return Err(TargetInputError::Invalid);
     }
-    Ok(RuleTarget::Domain(value.to_ascii_lowercase()))
+    Ok(RuleTarget::Domain(domain.to_ascii_lowercase()))
 }
 
 #[derive(Debug)]
@@ -56,17 +58,40 @@ pub struct RuleDraft {
 pub enum RuleDraftError {
     Target(TargetInputError),
     MissingLane,
+    DuplicateRule,
 }
 
 pub fn validate_rule_draft(
     profile: &Profile,
     draft: &RuleDraft,
 ) -> Result<(RuleTarget, RuleAction), RuleDraftError> {
+    validate_rule_draft_for_edit(profile, draft, None)
+}
+
+pub fn validate_rule_draft_for_edit(
+    profile: &Profile,
+    draft: &RuleDraft,
+    editing: Option<&RuleId>,
+) -> Result<(RuleTarget, RuleAction), RuleDraftError> {
     let target = parse_rule_target(&draft.target).map_err(RuleDraftError::Target)?;
     if let RuleAction::Route(id) = &draft.action {
         if !profile.lanes.iter().any(|lane| &lane.id == id) {
             return Err(RuleDraftError::MissingLane);
         }
+    }
+    let candidate = Rule {
+        id: editing.cloned().unwrap_or_else(|| "".into()),
+        enabled: true,
+        priority: 0,
+        source: editing
+            .and_then(|id| profile.rules.iter().find(|rule| &rule.id == id))
+            .map(|rule| rule.source.clone())
+            .unwrap_or(RuleSource::Any),
+        target: target.clone(),
+        action: draft.action.clone(),
+    };
+    if find_duplicate_rule(profile, &candidate, editing).is_some() {
+        return Err(RuleDraftError::DuplicateRule);
     }
     Ok((target, draft.action.clone()))
 }
@@ -242,13 +267,16 @@ pub fn open_rule_editor(
                 RuleAction::Route(lane.id.clone())
             }
         };
-        match validate_rule_draft(
-            &current,
-            &RuleDraft {
-                target: target.text().to_string(),
-                action: selected_action,
-            },
-        ) {
+        let draft = RuleDraft {
+            target: target.text().to_string(),
+            action: selected_action,
+        };
+        let validated = if editing.is_some() {
+            validate_rule_draft_for_edit(&current, &draft, editing.as_ref())
+        } else {
+            validate_rule_draft(&current, &draft)
+        };
+        match validated {
             Ok((target_value, action)) => {
                 let mut rule = original.clone().unwrap_or_else(|| Rule {
                     id: format!("rule-{}", uuid::Uuid::new_v4()).as_str().into(),
@@ -278,6 +306,7 @@ pub fn open_rule_editor(
                         texts.ux.unsupported_target
                     }
                     RuleDraftError::MissingLane => texts.ux.missing_interface,
+                    RuleDraftError::DuplicateRule => texts.ux.duplicate_rule,
                     _ => texts.invalid_rule_target,
                 },
                 &target,
@@ -321,7 +350,7 @@ mod tests {
         );
         assert_eq!(
             parse_rule_target("claude.ai."),
-            Ok(RuleTarget::Domain("claude.ai.".into()))
+            Ok(RuleTarget::Domain("claude.ai".into()))
         );
         assert_eq!(
             parse_rule_target("*.claude.ai"),
@@ -346,6 +375,42 @@ mod tests {
         assert_eq!(
             parse_rule_target("192.0.2.0/24"),
             Ok(RuleTarget::Cidr("192.0.2.0/24".parse().unwrap()))
+        );
+    }
+    #[test]
+    fn cidr_input_is_stored_as_its_canonical_network() {
+        assert_eq!(
+            parse_rule_target(" 10.65.201.25/24 "),
+            Ok(RuleTarget::Cidr("10.65.201.0/24".parse().unwrap()))
+        );
+    }
+    #[test]
+    fn duplicate_rule_draft_is_rejected_before_submission() {
+        let mut p = profile();
+        p.rules.push(rule("existing", 10));
+        let draft = RuleDraft {
+            target: "Existing.Example.".into(),
+            action: RuleAction::Block,
+        };
+        assert!(validate_rule_draft(&p, &draft).is_err());
+    }
+    #[test]
+    fn editing_a_rule_does_not_count_itself_as_a_duplicate() {
+        let mut p = profile();
+        p.rules.push(rule("existing", 10));
+        let draft = RuleDraft {
+            target: "Existing.Example.".into(),
+            action: RuleAction::Block,
+        };
+        assert!(validate_rule_draft_for_edit(&p, &draft, Some(&"existing".into())).is_ok());
+        p.rules.push(rule("other", 20));
+        let draft = RuleDraft {
+            target: "other.example".into(),
+            action: RuleAction::Block,
+        };
+        assert_eq!(
+            validate_rule_draft_for_edit(&p, &draft, Some(&"existing".into())),
+            Err(RuleDraftError::DuplicateRule)
         );
     }
     #[test]

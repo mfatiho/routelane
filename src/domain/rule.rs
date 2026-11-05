@@ -51,7 +51,7 @@ pub enum RuleSource {
     Application(ApplicationSelector),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum RuleTarget {
     Any,
     Domain(String),
@@ -61,7 +61,20 @@ pub enum RuleTarget {
     ServicePack(ServicePackId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl RuleTarget {
+    /// Canonical spelling without changing the target's kind or scope.
+    pub fn normalized(&self) -> Self {
+        match self {
+            Self::Domain(domain) => {
+                Self::Domain(domain.trim().trim_end_matches('.').to_ascii_lowercase())
+            }
+            Self::Cidr(network) => Self::Cidr(network.trunc()),
+            _ => self.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum RuleAction {
     Route(LaneId),
     Direct,
@@ -78,7 +91,35 @@ pub struct Rule {
     pub action: RuleAction,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RuleKey {
+    source: Option<(PathBuf, bool)>,
+    target: RuleTarget,
+    action: RuleAction,
+}
+
 impl Rule {
+    /// Identity, priority and enabled state are not distinct routing intent.
+    pub(crate) fn duplicate_key(&self) -> RuleKey {
+        // Desktop aliases and launch arguments do not change the process
+        // selector used when adopting an already-running application.
+        let source = match &self.source {
+            RuleSource::Any => None,
+            RuleSource::Application(selector) => {
+                Some((selector.executable_path.clone(), selector.include_children))
+            }
+        };
+        let target = match self.target.normalized() {
+            RuleTarget::Ip(address) => RuleTarget::Cidr(IpNet::from(address)),
+            target => target,
+        };
+        RuleKey {
+            source,
+            target,
+            action: self.action.clone(),
+        }
+    }
+
     pub fn execution_cmp(&self, other: &Self) -> Ordering {
         self.priority
             .cmp(&other.priority)

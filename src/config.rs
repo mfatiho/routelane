@@ -810,6 +810,58 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_rule_save_leaves_the_existing_configuration_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let repository = ConfigRepository::new(&path);
+        let mut document = ConfigV4::default();
+        document.profiles.push(Profile {
+            id: "work".into(),
+            name: "Work".into(),
+            enabled: false,
+            lanes: vec![],
+            rules: vec![Rule {
+                id: "original".into(),
+                enabled: true,
+                priority: 10,
+                source: RuleSource::Any,
+                target: RuleTarget::Cidr("10.65.201.0/24".parse().unwrap()),
+                action: RuleAction::Block,
+            }],
+            routing: Default::default(),
+        });
+        repository.save(&document).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut duplicate = document.profiles[0].rules[0].clone();
+        duplicate.id = "duplicate".into();
+        duplicate.target = RuleTarget::Cidr("10.65.201.25/24".parse().unwrap());
+        document.profiles[0].rules.push(duplicate);
+
+        assert!(repository.save(&document).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_rules_in_imported_json_are_rejected_without_rewriting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let content = r#"{
+            "schema_version":3,"language":"tr","profiles":[{
+                "id":"work","name":"Work","enabled":false,"lanes":[],
+                "routing":{"primary":"FollowSystemDefault","backups":[],"automatic_failover":true},
+                "rules":[
+                    {"id":"one","enabled":true,"priority":10,"source":"Any","target":{"Ip":"10.65.201.25"},"action":"Block"},
+                    {"id":"two","enabled":false,"priority":20,"source":"Any","target":{"Cidr":"10.65.201.25/32"},"action":"Block"}
+                ]
+            }]
+        }"#;
+        std::fs::write(&path, content).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(ConfigRepository::new(&path).load().is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), content);
+    }
+
+    #[test]
     fn duplicate_profile_ids_and_names_are_rejected_before_atomic_save() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.json");
