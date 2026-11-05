@@ -1,19 +1,25 @@
 # RouteLane
 
 RouteLane is a Linux desktop application for policy-based multi-lane routing.
-It can route selected domains, IP addresses, or CIDR ranges through different
-network interfaces while leaving unmatched traffic on the normal system route.
+It can route selected domains, IP addresses, CIDR ranges, or applications
+through different network interfaces. While a profile is active, traffic that
+matches no rule currently leaves through the primary connection; leaving it to
+the operating system instead is being implemented (see
+[Unmatched traffic](#unmatched-traffic-selective-routing)).
 
-Phase 1 includes:
+Current capabilities:
 
 - GTK4/Libadwaita multi-lane profile management
 - `Route`, `Direct`, and independently enabled/disabled `Block` rules
 - IPv4 and IPv6 policy routing with nftables marking
 - per-application lane selection with cgroup v2 process affinity
+- a primary connection with approved backups and automatic, consent-bounded
+  failover that keeps working while the GUI is closed
 - a per-user daemon and versioned Unix-socket IPC
 - a small system D-Bus helper authorized by Polkit
 - kernel-derived Connection Health reports
 - transactional apply, rollback, ownership checks, and conflict diagnostics
+- development `.deb` and `.rpm` packages
 
 ## Architecture and security boundary
 
@@ -92,6 +98,16 @@ domain IP snapshots for new connections from supported host processes.
 Connection Health verifies local routing resources, not successful loading of
 an arbitrary website.
 
+A domain rule matches only that exact name. Subdomains, HTTP redirects to
+another host, and CDN or download hosts need their own rules: for example,
+`https://chatgpt.com/codex/install.sh` redirects to `releases.openai.com`,
+which a `chatgpt.com` rule does not cover. `curl -sIL <url>` shows a redirect
+chain. Wildcard domains (`*.example.com`) and service packs exist in the
+profile format but are rejected when a profile is applied; they are not yet
+supported. CDN addresses are often shared, so a domain rule can also steer
+other sites that use the same IP. For work that reaches many hosts, such as an
+installer, an application rule for a dedicated terminal is more reliable.
+
 Host `.desktop` applications with a resolvable executable are supported.
 Flatpak and Snap applications are detected as sandboxed integration cases and
 are not part of the first application-routing release; they require separate
@@ -116,6 +132,32 @@ address family with no available approved connection is blocked instead of
 leaving through another interface. Existing connections are not moved.
 Overview shows the saved preference separately from the verified effective
 connection.
+
+Failover reacts to local link evidence (carrier, address and default-route
+loss), not to internet reachability: a link that stays up while the upstream
+network fails does not trigger it. If a transition cannot be committed and
+verified, the helper keeps the previous plan in force, reports `Degraded`, and
+retries the same transition after an increasing wait (2 s up to 60 s); new
+link evidence is acted on at once.
+
+### Unmatched traffic (selective routing)
+
+Every schema-version-4 profile records what happens to traffic that matches no
+enabled rule in `routing.unmatched_traffic`:
+
+| Value | Intended behavior |
+| --- | --- |
+| `PreserveSystem` | Unmatched traffic keeps the operating system's own routing; RouteLane does not mark, NAT or reroute it. Default for new and migrated profiles. |
+| `UsePrimary` | Unmatched internet traffic is also sent through the primary connection and its approved backups. Requires the user's explicit choice. |
+
+**Status:** the setting is stored, validated and migrated, but the kernel plan
+does not use it yet. Until the selective routing work is complete, an active
+profile sends unmatched traffic through the primary connection whatever the
+value, so local bridges such as Multipass, Docker or other VPN networks can be
+affected. The GUI does not offer the choice yet. The design and plan are
+[docs/superpowers/specs/2026-10-22-selective-routing-design.md](docs/superpowers/specs/2026-10-22-selective-routing-design.md)
+and
+[docs/superpowers/plans/2026-10-22-selective-routing.md](docs/superpowers/plans/2026-10-22-selective-routing.md).
 
 ## Build
 
@@ -196,11 +238,15 @@ routelanectl deactivate
 ```
 
 `routelanectl` uses the same canonical daemon IPC client as the GUI. Its Phase
-1 surface is intentionally limited to the commands above.
+1 surface is intentionally limited to the commands above. `status` also prints
+the runtime phase and the preferred and effective exit for each address
+family.
 
-`apply-profile` reads the same schema-version-3 configuration document as the
-desktop application. Schema-version-2 and legacy documents are migrated to
-version 3 on load, and every migrated profile is inactive. When the document has one profile, no selector is needed.
+`apply-profile` reads the same schema-version-4 configuration document as the
+desktop application. Schema-version-3, version-2 and legacy documents are
+migrated to version 4 on load without being rewritten; rules, IDs, lanes and
+the primary selection are kept, `unmatched_traffic` is proposed as
+`PreserveSystem`, and every migrated profile is inactive. When the document has one profile, no selector is needed.
 For multiple profiles, `--profile <id-or-name>` is required; missing, duplicate,
 ambiguous, or unknown selectors fail locally before daemon contact. Bare
 profile JSON is not accepted. Input must be a current-user-owned regular file
@@ -209,7 +255,7 @@ devices, and oversized files are rejected.
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "language": "en",
   "profiles": [
     {
@@ -227,6 +273,7 @@ devices, and oversized files are rejected.
       ],
       "rules": [],
       "routing": {
+        "unmatched_traffic": "PreserveSystem",
         "primary": "FollowSystemDefault",
         "backups": [],
         "automatic_failover": true
@@ -236,21 +283,24 @@ devices, and oversized files are rejected.
 }
 ```
 
-Every version-3 profile requires a `routing` object. `primary` is either
-`"FollowSystemDefault"` or `{"Lane": "<lane-id>"}`, and `backups` lists the
-lane IDs the user approved for failover.
+Every version-4 profile requires a `routing` object with all four fields;
+unknown fields are rejected. `unmatched_traffic` is `"PreserveSystem"` or
+`"UsePrimary"`, `primary` is either `"FollowSystemDefault"` or
+`{"Lane": "<lane-id>"}`, and `backups` lists the lane IDs the user approved
+for failover.
 
-The desktop configuration is schema version 3 and is stored at
+The desktop configuration is schema version 4 and is stored at
 `~/.config/routelane/config.json`. Stored profiles are inactive on load; a user
 must explicitly apply one.
 
 ## Uninstalling
 
 ```bash
-sudo apt remove routelane
+sudo apt remove routelane    # Debian/Ubuntu
+sudo dnf remove routelane    # Fedora
 ```
 
-`apt remove` deletes every file the package owns (there are no conffiles), stops
+Removing the package deletes every file it owns (there are no conffiles), stops
 and disables `routelane-helper.service`, and best-effort stops
 `routelane-daemon.service` for any active user session. `~/.config/routelane/config.json`
 is not owned by the package and is left in place for each user.
@@ -260,10 +310,12 @@ package if routing is currently active. Tearing down the live kernel routing
 state (the `inet routelane` nftables table, rule priorities 10000-10099, and
 routing tables 20000-20099) requires RouteLane's privileged Polkit action,
 which needs an interactive prompt — a package removal script cannot satisfy
-that non-interactively, so it cannot be done automatically during `apt remove`.
-If you remove the package while routing was still active, `postrm` detects and
-warns about any leftover kernel state and prints the exact commands to clear it
-manually.
+that non-interactively, so it cannot be done automatically during removal.
+If you remove the package while routing was still active, the removal script
+detects and warns about any leftover kernel state and prints the exact
+commands to clear it manually. Upgrades only try-restart running services; the
+ownership journal under `/run/routelane` and each user's configuration are
+kept.
 
 ## Troubleshooting a GUI crash
 
@@ -299,20 +351,33 @@ activation, system D-Bus activation, Polkit authorization, GTK launch, and
 rollback/health scenarios must pass for every listed distribution and
 architecture.
 
+**Gate status: open.** Ubuntu 22.04, 24.04 and 26.04 on x86_64 have recorded
+kernel, system-bus/Polkit, upgrade, reboot and removal runs for the primary
+failover work (26.04 with intermittent failures in two counter- and
+threshold-based root tests). Debian, Fedora (the rpm was only built in a
+container), aarch64, the interactive Polkit agent, GTK launch per distribution
+and CI are **NOT VERIFIED**. Selective routing has no kernel evidence yet.
+Details: [docs/primary-failover-verification.md](docs/primary-failover-verification.md).
+
 ## Testing
 
-See [the reliability audit](docs/reliability-audit.md) for the current fixes,
-verification evidence, and remaining runtime/release gates.
+See [the reliability audit](docs/reliability-audit.md) for earlier fixes and
+[the failover verification record](docs/primary-failover-verification.md) for
+the current kernel, package and distribution evidence. Historical results are
+not current evidence; rerun the commands below.
 
 Rootless checks:
 
 ```bash
 cargo fmt --check
-cargo test
+cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release --bins
 ./packaging/deb/build-deb.sh
 ```
+
+`tests/primary_packaging_contract.rs` checks that the deb and rpm ship the
+same files and lifecycle and that the helper keeps its hardening.
 
 The real GTK window and add dialogs can also be tested without the user's
 desktop session or configuration. This needs `dbus-run-session` and
@@ -335,7 +400,10 @@ Root namespace integration is separate:
 ```
 
 Exit 77 means the environment cannot run the root namespace suite. It is a
-skip, not a pass, and must be reported as **NOT VERIFIED**.
+skip, not a pass, and must be reported as **NOT VERIFIED**. Run it only in an
+authorized disposable VM, never on a workstation. The real system-bus/Polkit
+acceptance (`tests/root/system_bus_acceptance.sh`) installs the package and
+refuses to run unless `ROUTELANE_DISPOSABLE_VM` equals the VM's hostname.
 
 ## License
 
