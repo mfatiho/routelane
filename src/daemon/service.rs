@@ -734,6 +734,9 @@ where
             let mut state = self.state.lock().await;
             state.applied = None;
             state.applied_profile = None;
+            // Cleanup removed the helper's current plan, so its next activation
+            // expects generation zero. event_sequence still orders UI updates.
+            state.generation = 0;
             state.health = HealthReport::inactive();
             state.primary = RuntimeStatus::default();
             state.last_error = None;
