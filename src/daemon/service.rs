@@ -715,8 +715,9 @@ where
         if let Err(error) = self.ensure_reconciled().await.result {
             // A validated plan with missing live resources must remain removable.
             // The authorized helper still checks exact ownership before deleting.
-            if error.code() != "DAEMON_RECONCILIATION_FAILED"
-                || self.state.lock().await.applied.is_none()
+            if error.code() != "DAEMON_LEGACY_CLEANUP_REQUIRED"
+                && (error.code() != "DAEMON_RECONCILIATION_FAILED"
+                    || self.state.lock().await.applied.is_none())
             {
                 return Err(error);
             }
@@ -1065,6 +1066,11 @@ where
             }
         };
 
+        if inspected.diagnostics.iter().any(|d| d.starts_with("DAEMON_LEGACY_CLEANUP_REQUIRED:")) {
+            return self.record_reconciliation_drift_with_code(None,
+                "DAEMON_LEGACY_CLEANUP_REQUIRED",
+                "validated legacy RouteLane state requires authorized cleanup before activation").await;
+        }
         let Some(plan) = inspected.applied_plan else {
             if inspected.generation.is_some()
                 || inspected.plan_hash.is_some()

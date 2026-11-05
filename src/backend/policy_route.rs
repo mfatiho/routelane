@@ -3,6 +3,15 @@ use std::net::IpAddr;
 use super::{KernelPlan, LaneAvailability, LanePlan};
 use serde::{Deserialize, Serialize};
 
+/// Routing-only evidence, independent of plan serialization and NFT semantics.
+pub trait RoutingPlan {
+    fn lanes(&self) -> &[LanePlan];
+}
+
+impl RoutingPlan for KernelPlan {
+    fn lanes(&self) -> &[LanePlan] { &self.lanes }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Program {
     Ip,
@@ -223,20 +232,20 @@ fn rule_step(lane: &LanePlan, family: IpFamily) -> RoutingStep {
     }
 }
 
-fn lane_for_table(plan: &KernelPlan, table: u32) -> Option<&LanePlan> {
-    plan.lanes.iter().find(|lane| lane.table == table)
+fn lane_for_table<P: RoutingPlan>(plan: &P, table: u32) -> Option<&LanePlan> {
+    plan.lanes().iter().find(|lane| lane.table == table)
 }
 
 /// Steps that create a plan's complete routing state from an empty kernel.
-pub fn install_steps(plan: &KernelPlan) -> Vec<RoutingStep> {
+pub fn install_steps<P: RoutingPlan>(plan: &P) -> Vec<RoutingStep> {
     transition_steps(None, plan)
 }
 
 /// Steps that move the routing state from `previous` to `next` before nftables
 /// activation. Every lane×family owns a terminal route and a policy rule.
-pub fn transition_steps(previous: Option<&KernelPlan>, next: &KernelPlan) -> Vec<RoutingStep> {
+pub fn transition_steps<P: RoutingPlan>(previous: Option<&P>, next: &P) -> Vec<RoutingStep> {
     let mut steps = Vec::new();
-    for lane in &next.lanes {
+    for lane in next.lanes() {
         let previous_lane = previous.and_then(|plan| lane_for_table(plan, lane.table));
         for family in FAMILIES {
             let unicast = lane_unicast_route(lane, family);
@@ -285,8 +294,8 @@ pub fn transition_steps(previous: Option<&KernelPlan>, next: &KernelPlan) -> Vec
     steps
 }
 
-fn install_rules(plan: &KernelPlan) -> Vec<RoutingStep> {
-    plan.lanes
+fn install_rules<P: RoutingPlan>(plan: &P) -> Vec<RoutingStep> {
+    plan.lanes()
         .iter()
         .flat_map(|lane| FAMILIES.map(|family| rule_step(lane, family)))
         .collect()
@@ -294,7 +303,7 @@ fn install_rules(plan: &KernelPlan) -> Vec<RoutingStep> {
 
 /// Steps that remove what `previous` owned and `next` does not, after the new
 /// generation is verified. Removals tolerate resources the kernel already dropped.
-pub fn retire_steps(previous: &KernelPlan, next: &KernelPlan) -> Vec<RoutingStep> {
+pub fn retire_steps<P: RoutingPlan>(previous: &P, next: &P) -> Vec<RoutingStep> {
     let mut steps = Vec::new();
     let next_rules = install_rules(next);
     for rule in install_rules(previous) {
@@ -316,7 +325,7 @@ pub fn retire_steps(previous: &KernelPlan, next: &KernelPlan) -> Vec<RoutingStep
             });
         }
     }
-    for lane in &previous.lanes {
+    for lane in previous.lanes() {
         let Some(next_lane) = lane_for_table(next, lane.table) else {
             for family in FAMILIES {
                 steps.push(RoutingStep::FlushTable {

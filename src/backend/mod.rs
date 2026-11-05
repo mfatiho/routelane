@@ -2,8 +2,8 @@ mod cgroup;
 mod inspect;
 mod interface_settings;
 mod legacy_journal;
-#[cfg(test)]
 mod legacy_journal_v2;
+mod legacy_nft_v2;
 mod nft_document;
 mod nftables;
 mod plan;
@@ -38,6 +38,7 @@ pub use planner::{compile_profile, compile_profile_with_primary, Capability, Pla
 pub use policy_route::{
     build_policy_commands, install_steps, lane_unicast_route, retire_steps, transition_steps,
     CommandSpec, IpFamily, OwnedRoute, Program, RoutingStep, TERMINAL_ROUTE_METRIC,
+    RoutingPlan,
 };
 pub use primary::{FamilyExit, FamilyPair, PrimaryDecision, PrimarySelector};
 pub use privileged::{
