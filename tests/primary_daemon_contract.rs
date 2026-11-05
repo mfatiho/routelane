@@ -307,6 +307,62 @@ async fn helper_transition_updates_status_without_gui() {
 }
 
 #[tokio::test]
+async fn reactivation_after_cleanup_uses_the_helpers_empty_generation() {
+    let helper = RuntimeHelper::default();
+    let service = service(helper.clone(), MemoryConfig::default());
+    service.apply_profile(profile()).await.unwrap();
+    let automatic = helper.transition(RuntimePhase::Armed);
+    service.on_runtime_changed(automatic).await;
+    assert_eq!(service.state().await.generation, 2);
+    let mut events = service.subscribe();
+    let before = service.state().await.event_sequence;
+
+    for _ in 0..2 {
+        service.deactivate().await.unwrap();
+        let inactive = service.state().await;
+        let applied = service.apply_profile(profile()).await.unwrap();
+        assert!(inactive.applied.is_none());
+        assert_eq!(inactive.generation, 0);
+        assert_eq!(inactive.primary.generation, 0);
+        assert!(inactive.event_sequence > before);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            DaemonEvent::StateChanged { generation: 0, .. }
+        ));
+
+        assert_eq!(applied.generation, 1);
+        let active = service.state().await;
+        assert_eq!(active.generation, 1);
+        assert_eq!(active.primary.generation, 1);
+        assert!(active.applied.is_some());
+        assert!(active.last_error.is_none());
+        assert!(active.event_sequence > inactive.event_sequence);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            DaemonEvent::StateChanged { generation: 1, .. }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn queued_runtime_announcement_cannot_rearm_a_cleaned_runtime() {
+    let helper = RuntimeHelper::default();
+    let service = service(helper.clone(), MemoryConfig::default());
+    service.apply_profile(profile()).await.unwrap();
+    let queued = helper.transition(RuntimePhase::Armed);
+    service.on_runtime_changed(queued.clone()).await;
+    service.deactivate().await.unwrap();
+
+    service.on_runtime_changed(queued).await;
+    let inactive = service.state().await;
+    assert_eq!(inactive.generation, 0);
+    assert_eq!(inactive.primary.phase, RuntimePhase::Inactive);
+    assert!(inactive.applied.is_none());
+    assert!(inactive.applied_profile.is_none());
+    assert!(inactive.primary.grant.is_none());
+}
+
+#[tokio::test]
 async fn daemon_restart_reconciles_valid_runtime() {
     let helper = RuntimeHelper::default();
     let config = MemoryConfig::default();

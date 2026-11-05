@@ -487,7 +487,10 @@ impl UiSession {
         if self
             .accepted_revision
             .is_some_and(|(generation, sequence)| {
-                status.generation < generation || status.event_sequence < sequence
+                // Helper generations restart after cleanup; the daemon's event
+                // sequence remains monotonic for this connection epoch.
+                status.event_sequence < sequence
+                    || (status.event_sequence == sequence && status.generation < generation)
             })
         {
             return false;
@@ -897,6 +900,55 @@ mod tests {
         });
         assert!(!s.is_busy());
         assert!(s.confirmed_status().unwrap().applied_profile_id.is_none());
+    }
+
+    #[test]
+    fn newer_event_sequence_accepts_generation_reset_and_reactivation() {
+        let mut s = applied_session();
+        let mut inactive = status(0, false);
+        inactive.event_sequence = 9;
+        s.handle_daemon(DaemonToUi::Snapshot {
+            epoch: 1,
+            status: inactive,
+            profiles: vec![profile()],
+        });
+        assert_eq!(s.confirmed_status().unwrap().generation, 0);
+        assert!(s.confirmed_status().unwrap().applied_profile_id.is_none());
+        assert!(!s.application_actions_enabled(&profile(), &profile().rules[0]));
+
+        let request = sent(
+            s.begin_request(DaemonRequest::ApplyProfile(profile()), Some(profile()))
+                .unwrap(),
+        );
+        s.handle_daemon(DaemonToUi::Response {
+            epoch: 1,
+            response: applied_response(&request.request_id, 1),
+        });
+        let mut active = status(1, true);
+        active.event_sequence = 10;
+        s.handle_daemon(DaemonToUi::Snapshot {
+            epoch: 1,
+            status: active,
+            profiles: vec![profile()],
+        });
+        assert!(!s.is_busy());
+        assert!(s.application_actions_enabled(&profile(), &profile().rules[0]));
+
+        // An old high-generation event must not overwrite the new runtime.
+        s.handle_daemon(DaemonToUi::Event {
+            epoch: 1,
+            event: DaemonEvent::StateChanged {
+                sequence: 8,
+                generation: 8,
+                health: HealthReport::inactive(),
+            },
+        });
+        assert_eq!(s.confirmed_status().unwrap().generation, 1);
+        assert_eq!(s.confirmed_status().unwrap().event_sequence, 10);
+        assert_eq!(
+            s.confirmed_status().unwrap().health.state,
+            HealthState::Healthy
+        );
     }
 
     #[test]

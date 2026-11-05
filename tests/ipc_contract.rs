@@ -602,13 +602,15 @@ async fn deactivate_only_clears_applied_state_after_cleanup_success() {
 
     service.deactivate().await.unwrap_err();
     assert!(service.state().await.applied.is_some());
+    assert_eq!(service.state().await.generation, 1);
     assert_eq!(service.state().await.health.state, HealthState::Degraded);
 
     helper.succeed();
     service.deactivate().await.unwrap();
     let state = service.state().await;
     assert!(state.applied.is_none());
-    assert_eq!(state.generation, 1);
+    assert_eq!(state.generation, 0);
+    assert_eq!(state.primary.generation, 0);
     assert_eq!(state.health.state, HealthState::Inactive);
 }
 
