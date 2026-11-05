@@ -59,8 +59,8 @@ routelane-daemon  --(system D-Bus + Polkit io.github.routelane.apply)-->  routel
 
 ## Dirty working tree: preserve the user's changes
 
-- The working tree usually holds uncommitted work of several origins. Run `rtk git status --short` and read the latest handoff record before staging: it names which changes are unfinished plan tasks and which are user-approved fixes that stay uncommitted (for example CIDR/duplicate rules, the deactivate generation reset, user `Cargo.toml`/`Cargo.lock` version changes, README edits). Commit only what the current task owns.
-- **`src/backend/privileged.rs` mixes several origins.** Stage it hunk by hunk only. Never commit, restore or check out the whole file, and never copy it from another file.
+- The working tree was clean on 5 Nov 2026 (all earlier dirty work committed by origin). New uncommitted work can again mix origins: run `rtk git status --short` and read the latest handoff record before staging, and commit only what the current task owns, one origin per commit.
+- When a file mixes origins (often `src/backend/privileged.rs` or `src/daemon/service.rs`), stage it hunk by hunk only. Never commit, restore or check out the whole file, and never copy it from another file. Verify each staged state in an isolated tree exported with `git checkout-index -a --prefix=<dir>/`.
 - No `git add .`, `git reset --hard`, `git clean`, or whole-file `checkout`/`restore`.
 - `git diff` does not show the contents of untracked files (e.g. `src/backend/interface_settings.rs`); read those separately.
 
@@ -96,8 +96,9 @@ routelane-daemon  --(system D-Bus + Polkit io.github.routelane.apply)-->  routel
 ## Current state (changes often; verify every session)
 
 - Primary/failover: all 12 plan tasks committed (through `80e109c`); Ubuntu 22.04/24.04/26.04 x86_64 evidence in `docs/primary-failover-verification.md`.
-- Selective routing (10-task plan): Task 1 (`fb88c25`, frozen V2 journal/V3 profile evidence) and Task 2 (`937ea67`, mode + ConfigV4) committed; Task 3 (journal V3, cleanup-only V2) is unfinished in the working tree.
-- Rootless baseline on 5 Nov 2026: `rtk cargo test --all-targets --no-fail-fast` → 468 passed, 3 failed, 2 ignored. Failing: `journal_versions_are_explicit_and_strict` and `v2_empty_journal_can_be_cleared_without_network_mutation` (unfinished Task 3), and the older `ui::desktop_catalog::tests::sandbox_launcher_is_not_selectable_as_a_host_application`. The suite is not GREEN.
+- Selective routing (10-task plan): Task 1 (`fb88c25`, frozen V2 journal/V3 profile evidence) and Task 2 (`937ea67`, mode + ConfigV4, with its test fixture fixed in `f89e161`) committed. Task 3 (journal V3, cleanup-only V2) is committed only as work in progress, `0ddeb25` (`wip(upgrade): …`): two of its tests fail and its files are not rustfmt-formatted; finishing it still needs the plan's own Task 3 commit. Task 4 (kernel plan actually using `unmatched_traffic`) has not started.
+- Also committed on 5 Nov 2026: CIDR normalization and duplicate-rule rejection (`8e94a51`), the deactivate generation reset (`d377f76`), version 0.1.1 (`41a3616`).
+- Rootless baseline at `0ddeb25` (5 Nov 2026): `rtk cargo test --all-targets --no-fail-fast` → 468 passed, 3 failed, 2 ignored, and `cargo fmt --check` fails. Failing: `journal_versions_are_explicit_and_strict` and `v2_empty_journal_can_be_cleared_without_network_mutation` (WIP Task 3), and the older `ui::desktop_catalog::tests::sandbox_launcher_is_not_selectable_as_a_host_application` (Snap symlink). The suite is not GREEN.
 - The first-release gate is **open**: Debian 12/13, Fedora 43/44, aarch64, interactive Polkit agent, GTK launch per distro, firewalld/SELinux and CI are NOT VERIFIED.
 - For the exact state, first run `rtk git status --short --branch`, then read the newest record in `docs/handoff.md`.
 - At the end of a session, record the new state and the next narrow step in `docs/handoff.md`.
