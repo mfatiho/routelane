@@ -8982,6 +8982,7 @@ mod tests {
             enabled: true,
             rules: vec![],
             routing: RoutingPolicy {
+                unmatched_traffic: crate::domain::UnmatchedTraffic::UsePrimary,
                 primary: PrimarySelection::Lane("ethernet".into()),
                 backups: vec!["vinn".into()],
                 automatic_failover: true,
@@ -9124,7 +9125,6 @@ mod tests {
         let authorization_calls = events
             .lock()
             .unwrap()
-                unmatched_traffic: crate::domain::UnmatchedTraffic::UsePrimary,
             .iter()
             .filter(|event| **event == "authorize")
             .count();
