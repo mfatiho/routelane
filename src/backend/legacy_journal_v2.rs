@@ -100,6 +100,10 @@ impl LegacyPlanV2 {
     }
 }
 
+impl super::RoutingPlan for LegacyPlanV2 {
+    fn lanes(&self) -> &[LanePlan] { &self.lanes }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeRecordV2 {
