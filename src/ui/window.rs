@@ -1357,6 +1357,63 @@ mod tests {
         assert_eq!(accepted.borrow()[0].action, RuleAction::Block);
         assert!(!rule_dialog.is_visible());
         assert!(requests.try_recv().is_err());
+
+        // The real dialog must retain the draft, show actionable feedback and
+        // avoid invoking save when a canonical equivalent already exists.
+        let mut existing = empty_default_profile();
+        existing.rules.push(accepted.borrow()[0].clone());
+        let output = accepted.clone();
+        open_rule_editor(
+            &window,
+            texts,
+            Rc::new(RefCell::new(existing)),
+            None,
+            Rc::new(move |rule| {
+                output.borrow_mut().push(rule);
+                true
+            }),
+        );
+        drain();
+        let dialog = transient(&window);
+        find_named(dialog.upcast_ref(), "rule-action")
+            .unwrap()
+            .downcast::<gtk::DropDown>()
+            .unwrap()
+            .set_selected(2);
+        let entry = find_named(dialog.upcast_ref(), "rule-target")
+            .unwrap()
+            .downcast::<gtk::Entry>()
+            .unwrap();
+        entry.set_text("CLAUDE.AI.");
+        dialog
+            .default_widget()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap()
+            .emit_clicked();
+        drain();
+        let feedback = find_named(dialog.upcast_ref(), "form-feedback")
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert!(feedback.is_visible());
+        assert_eq!(feedback.text(), texts.ux.duplicate_rule);
+        assert_eq!(accepted.borrow().len(), 1);
+        assert!(dialog.is_visible());
+        entry.set_text("10.65.201.25/24");
+        dialog
+            .default_widget()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap()
+            .emit_clicked();
+        wait_for(|| accepted.borrow().len() == 2);
+        assert_eq!(
+            accepted.borrow()[1].target,
+            routelane::domain::RuleTarget::Cidr("10.65.201.0/24".parse().unwrap())
+        );
+        assert!(!dialog.is_visible());
+        assert!(requests.try_recv().is_err());
         let sample = Rule {
             id: "plain-label".into(),
             enabled: true,

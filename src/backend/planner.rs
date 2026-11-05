@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use ipnet::IpNet;
@@ -137,6 +137,11 @@ fn compile_profile_inner(
         )?;
     }
 
+    // Distinct domains can resolve to the same network and verdict. Keep the
+    // first match in execution order; never merge different actions or families.
+    let mut verdicts = BTreeSet::new();
+    compiled_rules.retain(|rule| verdicts.insert(rule.routing_key()));
+
     Ok(KernelPlan {
         primary: primary.clone(),
         local_networks: topology.connected_networks(),
@@ -198,12 +203,14 @@ fn compile_rule(
         RuleSource::Any => match &rule.target {
             RuleTarget::Any => vec![CompiledTarget::Any],
             RuleTarget::Ip(address) => vec![CompiledTarget::Network(host_network(*address))],
-            RuleTarget::Cidr(network) => vec![CompiledTarget::Network(*network)],
+            RuleTarget::Cidr(network) => vec![CompiledTarget::Network(network.trunc())],
             RuleTarget::Domain(_) => {
                 let mut addresses = resolutions
                     .addresses(&rule.id)
                     .ok_or_else(|| PlanError::DomainResolutionUnavailable(rule.id.clone()))?
-                    .to_vec();
+                    .iter()
+                    .map(|network| network.trunc())
+                    .collect::<Vec<_>>();
                 addresses.sort();
                 addresses.dedup();
                 addresses.into_iter().map(CompiledTarget::Network).collect()

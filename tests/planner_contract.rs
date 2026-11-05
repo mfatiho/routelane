@@ -65,15 +65,113 @@ fn profile_with_three_lanes_and_unsorted_rules() -> Profile {
             lane("privacy", "tun-privacy"),
         ],
         vec![
-            rule("priority-20", 20, RuleAction::Direct),
-            rule("priority-10-b", 10, RuleAction::Block),
-            rule("priority-10-a", 10, RuleAction::Direct),
+            rule_with(
+                "priority-20",
+                20,
+                RuleSource::Any,
+                RuleTarget::Ip("203.0.113.20".parse().unwrap()),
+                RuleAction::Direct,
+            ),
+            rule_with(
+                "priority-10-b",
+                10,
+                RuleSource::Any,
+                RuleTarget::Ip("203.0.113.11".parse().unwrap()),
+                RuleAction::Block,
+            ),
+            rule_with(
+                "priority-10-a",
+                10,
+                RuleSource::Any,
+                RuleTarget::Ip("203.0.113.10".parse().unwrap()),
+                RuleAction::Direct,
+            ),
         ],
     )
 }
 
 fn profile_with_block_rule() -> Profile {
     profile(vec![], vec![rule("block", 10, RuleAction::Block)])
+}
+
+#[test]
+fn dns_aliases_emit_a_single_verdict_in_first_match_order() {
+    let first = rule_with(
+        "first",
+        10,
+        RuleSource::Any,
+        RuleTarget::Domain("a.example".into()),
+        RuleAction::Block,
+    );
+    let second = rule_with(
+        "second",
+        30,
+        RuleSource::Any,
+        RuleTarget::Domain("b.example".into()),
+        RuleAction::Block,
+    );
+    let middle = rule_with(
+        "middle",
+        20,
+        RuleSource::Any,
+        RuleTarget::Cidr("10.65.201.0/24".parse().unwrap()),
+        RuleAction::Direct,
+    );
+    let p = profile(vec![], vec![second, middle, first]);
+    let mut resolutions = ResolutionSnapshot::empty();
+    resolutions.insert("first".into(), vec!["10.65.201.25/32".parse().unwrap()]);
+    resolutions.insert("second".into(), vec!["10.65.201.25/32".parse().unwrap()]);
+    let plan = compile_profile(&p, &TopologySnapshot::empty(), &resolutions, 1).unwrap();
+    assert_eq!(plan.rules.len(), 2);
+    assert_eq!(plan.rules[0].id.as_str(), "first");
+    assert_eq!(plan.rules[1].id.as_str(), "middle");
+    let document = routelane::backend::render_nft_document(Some(&plan), None, false);
+    let rules = document["nftables"].as_array().unwrap();
+    let explicit = rules
+        .iter()
+        .filter_map(|object| object.get("rule"))
+        .filter(|rule| rule["chain"] == "output")
+        .filter(|rule| {
+            rule["expr"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|expr| expr["match"]["left"]["payload"]["field"] == "daddr")
+        })
+        .filter(|rule| {
+            rule["expr"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|expr| expr.get("reject").is_some())
+        })
+        .count();
+    assert_eq!(explicit, 2);
+}
+
+#[test]
+fn compiled_cidr_target_has_no_host_bits() {
+    let p = profile(
+        vec![],
+        vec![rule_with(
+            "subnet",
+            10,
+            RuleSource::Any,
+            RuleTarget::Cidr("10.65.201.25/24".parse().unwrap()),
+            RuleAction::Block,
+        )],
+    );
+    let plan = compile_profile(
+        &p,
+        &TopologySnapshot::empty(),
+        &ResolutionSnapshot::empty(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.rules[0].target,
+        CompiledTarget::Network("10.65.201.0/24".parse().unwrap())
+    );
 }
 
 fn topology_for(entries: &[(&str, &str)]) -> TopologySnapshot {

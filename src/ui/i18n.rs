@@ -57,11 +57,13 @@ pub struct UxTexts {
     pub nft_issue: &'static str,
     pub rolled_back: &'static str,
     pub unsupported_target: &'static str,
+    pub duplicate_rule: &'static str,
     pub remove_impact: &'static str,
     pub snapshot_help: &'static str,
 }
 
 const UX_TR: UxTexts = UxTexts {
+    duplicate_rule: "Bu hedef ve işlem için zaten bir kural var. Yeni kayıt yerine mevcut kuralı düzenleyin.",
     review_definitions: "Tanımları Gözden Geçir",
     fallback_in_use: "Bu bağlantı başka bir bağlantının yedeği olarak kullanılıyor. Önce yedek bağlantı tanımını değiştirin.",
     overview: "Genel Bakış", rules: "Kurallar", applications: "Uygulamalar", connections: "Bağlantılar",
@@ -88,6 +90,7 @@ const UX_TR: UxTexts = UxTexts {
 };
 
 const UX_EN: UxTexts = UxTexts {
+    duplicate_rule: "A rule with this target and action already exists. Edit the existing rule instead.",
     review_definitions: "Review definitions",
     fallback_in_use: "Another connection uses this connection as its fallback. Change that fallback definition first.",
     overview: "Overview", rules: "Rules", applications: "Applications", connections: "Connections",

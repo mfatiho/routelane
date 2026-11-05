@@ -137,10 +137,17 @@ fn missing_family_is_explicitly_blocked() {
         action(&plan, "direct", IpFamily::V6),
         Some(CompiledAction::Block)
     );
-    assert_eq!(
-        action(&plan, "vinn-site", IpFamily::V6),
-        Some(CompiledAction::Block)
-    );
+    // Both requested actions compile to the same IPv6 Any/Block verdict.
+    // The first one blocks every IPv6 flow; do not emit a redundant copy.
+    assert_eq!(action(&plan, "vinn-site", IpFamily::V6), None);
+    let v6 = plan
+        .rules
+        .iter()
+        .filter(|rule| rule.family == IpFamily::V6)
+        .collect::<Vec<_>>();
+    assert_eq!(v6.len(), 1);
+    assert_eq!(v6[0].action, CompiledAction::Block);
+    assert_eq!(p.rules.len(), 2, "saved user intent remains unchanged");
     assert_eq!(
         action(&plan, "vinn-site", IpFamily::V4),
         Some(mark(&plan, "vinn"))

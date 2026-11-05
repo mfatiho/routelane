@@ -89,6 +89,28 @@ tree, including CDN, authentication, and browser verification endpoints. For a
 browser this also means other tabs in the same browser process use that lane.
 RouteLane does not decrypt HTTPS or infer third-party domains.
 
+### CIDR input and duplicate rules
+
+The rule target accepts networks such as `10.65.201.0/24` without quotes.
+Host bits are normalized: `10.65.201.25/24` becomes `10.65.201.0/24`.
+Within a profile, an equivalent source, target and action/connection cannot
+be saved twice, even with a different ID, priority or enabled state. Domain
+case and a trailing dot are ignored; an IP and its `/32` or `/128` equivalent
+also count as duplicates. Overlapping but distinct networks and different
+actions remain valid. Editing a rule does not conflict with itself.
+
+The editor shows an actionable warning; configuration loading/saving and CLI
+input enforce the same rule. Older configuration files containing duplicates
+are rejected, not silently rewritten: remove or adjust the reported duplicate
+before importing them. Existing journaled kernel state remains eligible for
+exact ownership-verified cleanup.
+
+Distinct domains can legitimately resolve to the same IP. The planner emits
+one identical family/target/verdict while retaining first-match order and the
+saved domain rules. New helper ApplyPlan requests with duplicate compiled
+verdicts are rejected before kernel mutation. RouteLane uses nftables, not an
+additional iptables backend, and does not remove other programs' rules.
+
 Domain rules currently use the system resolver's IP snapshot when a profile is
 applied. Continuous DNS/TTL refresh is not implemented; a later IP change or a
 browser using a different DNS resolver can therefore miss that snapshot.

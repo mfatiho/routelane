@@ -98,14 +98,24 @@ pub struct CompiledRule {
     pub action: CompiledAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl CompiledRule {
+    pub(crate) fn routing_key(&self) -> (IpFamily, CompiledTarget, CompiledAction) {
+        let target = match &self.target {
+            CompiledTarget::Network(network) => CompiledTarget::Network(network.trunc()),
+            target => target.clone(),
+        };
+        (self.family, target, self.action.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum CompiledTarget {
     Any,
     Cgroup(String),
     Network(IpNet),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum CompiledAction {
     Mark(u32),
     Direct,
