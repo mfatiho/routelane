@@ -102,12 +102,8 @@ impl DbusHelper2 {
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<String> {
-        let response = self
-            .core
-            .inspect(header.sender().map(|sender| sender.as_str()))
+        inspect_with_observed_networks(&self.core, header.sender().map(|sender| sender.as_str()))
             .await
-            .map_err(to_fdo_error)?;
-        serialize_response(&response)
     }
 
     async fn cleanup(
@@ -147,6 +143,28 @@ async fn announce(emitter: &SignalEmitter<'_>, status: &RuntimeStatus) {
             eprintln!("routelane-helper could not announce runtime status: {error}");
         }
     }
+}
+
+/// Read-only Inspect plus the directly connected networks from a fresh root
+/// topology capture (off the async worker). A failed or unobserved capture
+/// leaves them `None`, so a preview can never present unknown facts as safe.
+async fn inspect_with_observed_networks(
+    core: &HelperCore,
+    sender: Option<&str>,
+) -> zbus::fdo::Result<String> {
+    let mut response = core.inspect(sender).await.map_err(to_fdo_error)?;
+    match capture_topology().await {
+        Ok(topology) if topology.is_observed() => {
+            response.observed_connected_networks = Some(topology.connected_networks());
+        }
+        Ok(_) => response
+            .diagnostics
+            .push("HELPER_TOPOLOGY_UNAVAILABLE: connected networks were not observed".into()),
+        Err(error) => response
+            .diagnostics
+            .push(format!("HELPER_TOPOLOGY_UNAVAILABLE: {error}")),
+    }
+    serialize_response(&response)
 }
 
 async fn capture_topology() -> Result<TopologySnapshot, String> {
@@ -296,12 +314,8 @@ impl DbusHelper {
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<String> {
-        let response = self
-            .core
-            .inspect(header.sender().map(|sender| sender.as_str()))
+        inspect_with_observed_networks(&self.core, header.sender().map(|sender| sender.as_str()))
             .await
-            .map_err(to_fdo_error)?;
-        serialize_response(&response)
     }
 
     async fn restore_plan(

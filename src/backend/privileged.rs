@@ -11,6 +11,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 use super::nft_document::{
@@ -1066,6 +1067,8 @@ where
             snapshot,
             diagnostics,
             runtime,
+            // Filled only at the helper's bus boundary from a fresh capture.
+            observed_connected_networks: None,
         })
     }
 
@@ -5114,6 +5117,11 @@ pub struct InspectResponse {
     /// Absent from Helper1 responses; such a helper never arms a runtime.
     #[serde(default)]
     pub runtime: RuntimeStatus,
+    /// Directly connected networks from a fresh root topology capture at the
+    /// helper's bus boundary; `None` when unobserved or from an older helper.
+    /// Only for the activation preview: never an exit, never part of pairing.
+    #[serde(default)]
+    pub observed_connected_networks: Option<Vec<IpNet>>,
 }
 
 impl InspectResponse {
@@ -5126,6 +5134,7 @@ impl InspectResponse {
             snapshot: KernelSnapshot::default(),
             diagnostics: vec![],
             runtime: RuntimeStatus::default(),
+            observed_connected_networks: None,
         }
     }
 }
@@ -10017,6 +10026,79 @@ mod tests {
             .refresh_runtime(&fixture.observe(&replaced), Duration::from_secs(60))
             .unwrap();
         assert_eq!(effective(&later), lane_exit("vinn"));
+    }
+
+    /// `up()` plus a directly connected lab bridge (no default route).
+    fn up_with_lab_bridge() -> crate::backend::TopologySnapshot {
+        let links = serde_json::json!([
+            {"ifindex": 2, "ifname": "eth0", "flags": ["UP", "LOWER_UP"], "operstate": "UP"},
+            {"ifindex": 3, "ifname": "usb0", "flags": ["UP", "LOWER_UP"], "operstate": "UP"},
+            {"ifindex": 5, "ifname": "mpqemubr0", "flags": ["UP", "LOWER_UP"], "operstate": "UP"},
+        ]);
+        let address = |index: u32, name: &str, v4: &str, v6: &str| {
+            serde_json::json!({"ifindex": index, "ifname": name, "addr_info": [
+                {"family": "inet", "local": v4, "scope": "global"},
+                {"family": "inet6", "local": v6, "scope": "global"}]})
+        };
+        let addresses = serde_json::json!([
+            address(2, "eth0", "10.0.0.2", "2001:db8:1::2"),
+            address(3, "usb0", "192.168.0.2", "2001:db8:2::2"),
+            address(5, "mpqemubr0", "10.65.201.1", "fd00:65::1"),
+        ]);
+        let v4 = serde_json::json!([
+            {"dst":"default","dev":"eth0","gateway":"10.0.0.1","metric":100},
+            {"dst":"default","dev":"usb0","gateway":"192.168.0.1","metric":1},
+            {"dst":"10.65.201.0/24","dev":"mpqemubr0","scope":"link","protocol":"kernel"},
+        ]);
+        let v6 = serde_json::json!([
+            {"dst":"default","dev":"eth0","gateway":"2001:db8:1::1","metric":100},
+            {"dst":"default","dev":"usb0","gateway":"2001:db8:2::1","metric":1},
+        ]);
+        crate::backend::parse_topology(crate::backend::TopologyInput {
+            links: links.to_string().as_bytes(),
+            addresses: addresses.to_string().as_bytes(),
+            routes_v4: v4.to_string().as_bytes(),
+            routes_v6: v6.to_string().as_bytes(),
+            rules_v4: b"[]",
+            rules_v6: b"[]",
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn lab_bridge_never_becomes_a_runtime_exit() {
+        use crate::domain::{Rule, RuleAction, RuleSource, RuleTarget, UnmatchedTraffic};
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        let topology = up_with_lab_bridge();
+        assert!(
+            topology
+                .connected_networks()
+                .contains(&"10.65.201.0/24".parse().unwrap()),
+            "the bridge is observed as a connected network"
+        );
+        let mut lab = activation(0);
+        lab.profile.routing.unmatched_traffic = UnmatchedTraffic::PreserveSystem;
+        lab.profile.rules = vec![Rule {
+            id: RuleId::from("lab-route"),
+            enabled: true,
+            priority: 10,
+            source: RuleSource::Any,
+            target: RuleTarget::Cidr("10.65.201.0/24".parse().unwrap()),
+            action: RuleAction::Route(LaneId::from("ethernet")),
+        }];
+        let armed = backend
+            .activate_runtime(&lab, 1000, &fixture.observe(&topology), Duration::ZERO)
+            .unwrap();
+
+        let grant = armed.status.grant.as_ref().unwrap();
+        assert!(!grant.interfaces.values().any(|i| i.name == "mpqemubr0"));
+        assert!(super::restrict_to_grant(&topology, grant)
+            .interface("mpqemubr0")
+            .is_none());
+        let plan = backend.inspect().unwrap().applied_plan.unwrap();
+        assert!(plan.lanes.iter().all(|lane| lane.interface != "mpqemubr0"));
+        assert_eq!(plan.rules.len(), 1, "the lab rule is kept, not bypassed");
     }
 
     #[test]

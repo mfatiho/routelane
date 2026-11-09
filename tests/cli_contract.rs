@@ -3,6 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
+use routelane::backend::{RoutingPreview, RoutingWarning};
 use routelane::domain::{HealthState, Profile};
 use routelane::health::HealthReport;
 use routelane::ipc::{
@@ -46,6 +47,105 @@ async fn serve_once(
         write_frame(&mut stream, &response).await.unwrap();
     });
 }
+
+type Expect = Box<dyn FnOnce(&DaemonRequest) + Send>;
+
+/// Serves `steps` one connection at a time, then waits briefly for one more
+/// connection. Returns how many unexpected connections arrived (0 or 1).
+async fn serve_sequence(
+    runtime: &Path,
+    steps: Vec<(Expect, Result<DaemonResult, IpcError>)>,
+) -> tokio::task::JoinHandle<usize> {
+    let socket_dir = runtime.join("routelane");
+    std::fs::create_dir(&socket_dir).unwrap();
+    let listener = UnixListener::bind(socket_dir.join("routelane.sock")).unwrap();
+    tokio::spawn(async move {
+        for (expected, response) in steps {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .expect("the CLI never made an expected request")
+                .unwrap();
+            let request: DaemonEnvelope = read_frame(&mut stream).await.unwrap();
+            expected(&request.request);
+            let response = match response {
+                Ok(result) => DaemonResponse::success(request.request_id, result),
+                Err(error) => DaemonResponse::failure(request.request_id, error),
+            };
+            write_frame(&mut stream, &response).await.unwrap();
+        }
+        usize::from(
+            tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_ok(),
+        )
+    })
+}
+
+fn preview_step(
+    profile_id: &'static str,
+    warnings: Vec<RoutingWarning>,
+) -> (Expect, Result<DaemonResult, IpcError>) {
+    (
+        Box::new(move |request| match request {
+            DaemonRequest::PreviewProfile(profile) => {
+                assert_eq!(profile.id, profile_id.into());
+                assert!(profile.enabled);
+            }
+            other => panic!("expected a read-only preview first, got {other:?}"),
+        }),
+        Ok(DaemonResult::Preview(RoutingPreview {
+            policy_hash: plan_hash("3"),
+            warnings,
+        })),
+    )
+}
+
+fn apply_step(
+    profile_id: &'static str,
+    generation: u64,
+) -> (Expect, Result<DaemonResult, IpcError>) {
+    (
+        Box::new(move |request| match request {
+            DaemonRequest::ApplyProfile(profile) => assert_eq!(profile.id, profile_id.into()),
+            other => panic!("expected ApplyProfile, got {other:?}"),
+        }),
+        Ok(DaemonResult::Applied(routelane::ipc::ApplyProfileResult {
+            generation,
+            plan_hash: plan_hash("1"),
+        })),
+    )
+}
+
+fn plan_hash(byte: &str) -> routelane::backend::PlanHash {
+    serde_json::from_str(&format!("[{}]", [byte; 32].join(","))).unwrap()
+}
+
+/// An explicit current-schema profile: no migration notice.
+fn v4_profile_json(mode: &str, rules: &str) -> String {
+    format!(
+        r#"{{
+      "schema_version":4,
+      "language":"en",
+      "profiles":[{{
+        "id":"work","name":"Work","enabled":false,
+        "lanes":[{{"id":"vpn","name":"VPN","interface":"wg0","fallback_lane":null,"failure_policy":"Inactive"}}],
+        "rules":{rules},
+        "routing":{{"unmatched_traffic":"{mode}","primary":"FollowSystemDefault","backups":[],"automatic_failover":true}}
+      }}]
+    }}"#
+    )
+}
+
+const LAB_RULE: &str = r#"[{"id":"lab-route","enabled":true,"priority":10,"source":"Any","target":{"Cidr":"10.65.201.0/24"},"action":{"Route":"vpn"}}]"#;
+
+fn lab_warning() -> RoutingWarning {
+    RoutingWarning::LocalNetworkRule {
+        rule_id: "lab-route".into(),
+        network: "10.65.201.0/24".parse().unwrap(),
+    }
+}
+
+const ACK: &str = "--acknowledge-routing-impact";
 
 fn inactive_status() -> DaemonStatus {
     DaemonStatus {
@@ -233,24 +333,36 @@ async fn apply_profile_reads_schema_v2_and_uses_daemon_protocol() {
     let runtime = TempDir::new().unwrap();
     let config = runtime.path().join("profile.json");
     write_private(&config, profile_json());
-    serve_once(
+    // A migrated document needs the acknowledgement (see
+    // `migrated_profile_requires_routing_acknowledgement`).
+    let server = serve_sequence(
         runtime.path(),
-        |request| match request {
-            DaemonRequest::ApplyProfile(profile) => {
-                assert_eq!(profile.id, "work".into());
-                assert!(profile.enabled);
-                assert_eq!(profile.lanes[0].interface.as_str(), "wg0");
-            }
-            other => panic!("unexpected request: {other:?}"),
-        },
-        Ok(DaemonResult::Applied(routelane::ipc::ApplyProfileResult {
-            generation: 8,
-            plan_hash: serde_json::from_str(&format!("[{}]", ["1"; 32].join(","))).unwrap(),
-        })),
+        vec![
+            preview_step("work", vec![]),
+            (
+                Box::new(|request| match request {
+                    DaemonRequest::ApplyProfile(profile) => {
+                        assert_eq!(profile.id, "work".into());
+                        assert!(profile.enabled);
+                        assert_eq!(profile.lanes[0].interface.as_str(), "wg0");
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                }),
+                Ok(DaemonResult::Applied(routelane::ipc::ApplyProfileResult {
+                    generation: 8,
+                    plan_hash: plan_hash("1"),
+                })),
+            ),
+        ],
     )
     .await;
 
-    let output = run_cli(runtime.path(), &["apply-profile", config.to_str().unwrap()]).await;
+    let output = run_cli(
+        runtime.path(),
+        &["apply-profile", config.to_str().unwrap(), ACK],
+    )
+    .await;
+    assert_eq!(server.await.unwrap(), 0, "one preview, one apply");
 
     assert!(
         output.status.success(),
@@ -282,19 +394,9 @@ async fn apply_profile_requires_a_selector_for_multiple_profiles_and_selects_by_
     );
 
     std::fs::remove_dir_all(runtime.path().join("routelane")).unwrap();
-    serve_once(
+    let server = serve_sequence(
         runtime.path(),
-        |request| match request {
-            DaemonRequest::ApplyProfile(profile) => {
-                assert_eq!(profile.id, "privacy".into());
-                assert!(profile.enabled);
-            }
-            other => panic!("unexpected request: {other:?}"),
-        },
-        Ok(DaemonResult::Applied(routelane::ipc::ApplyProfileResult {
-            generation: 9,
-            plan_hash: serde_json::from_str(&format!("[{}]", ["2"; 32].join(","))).unwrap(),
-        })),
+        vec![preview_step("privacy", vec![]), apply_step("privacy", 9)],
     )
     .await;
 
@@ -303,11 +405,13 @@ async fn apply_profile_requires_a_selector_for_multiple_profiles_and_selects_by_
         &[
             "apply-profile",
             config.to_str().unwrap(),
+            ACK,
             "--profile",
             "Privacy",
         ],
     )
     .await;
+    assert_eq!(server.await.unwrap(), 0);
     assert!(selected.status.success());
     assert_eq!(
         String::from_utf8(selected.stdout).unwrap(),
@@ -604,4 +708,198 @@ async fn doctor_text_prints_summary_and_rejects_unknown_options() {
         assert!(output.stdout.is_empty());
         assert!(String::from_utf8_lossy(&output.stderr).contains("routelanectl doctor [--json]"));
     }
+}
+
+#[tokio::test]
+async fn migrated_profile_requires_routing_acknowledgement() {
+    // The original invocation on a migrated (schema 2) document.
+    let runtime = TempDir::new().unwrap();
+    let config = runtime.path().join("profile.json");
+    write_private(&config, profile_json());
+    let server = serve_sequence(runtime.path(), vec![preview_step("work", vec![])]).await;
+
+    let output = run_cli(runtime.path(), &["apply-profile", config.to_str().unwrap()]).await;
+
+    assert_eq!(
+        server.await.unwrap(),
+        0,
+        "no ApplyProfile after the preview"
+    );
+    assert_eq!(output.status.code(), Some(6));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("migrated"), "stderr: {stderr}");
+    assert!(stderr.contains(ACK), "stderr: {stderr}");
+    assert!(stderr.contains("nothing was applied"), "stderr: {stderr}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), profile_json());
+}
+
+#[tokio::test]
+async fn local_network_warning_requires_acknowledgement() {
+    let runtime = TempDir::new().unwrap();
+    let config = runtime.path().join("profile.json");
+    let document = v4_profile_json("PreserveSystem", LAB_RULE);
+    write_private(&config, &document);
+    let server = serve_sequence(
+        runtime.path(),
+        vec![preview_step("work", vec![lab_warning()])],
+    )
+    .await;
+
+    let refused = run_cli(runtime.path(), &["apply-profile", config.to_str().unwrap()]).await;
+
+    assert_eq!(server.await.unwrap(), 0);
+    assert_eq!(refused.status.code(), Some(6));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("lab-route"), "stderr: {stderr}");
+    assert!(stderr.contains("10.65.201.0/24"), "stderr: {stderr}");
+    assert!(refused.stderr.len() < 1024);
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), document);
+
+    std::fs::remove_dir_all(runtime.path().join("routelane")).unwrap();
+    let server = serve_sequence(
+        runtime.path(),
+        vec![
+            preview_step("work", vec![lab_warning()]),
+            apply_step("work", 5),
+        ],
+    )
+    .await;
+    let acknowledged = run_cli(
+        runtime.path(),
+        &["apply-profile", config.to_str().unwrap(), ACK],
+    )
+    .await;
+    assert_eq!(server.await.unwrap(), 0);
+    assert!(acknowledged.status.success());
+    assert_eq!(
+        String::from_utf8(acknowledged.stdout).unwrap(),
+        "applied generation=5\n"
+    );
+}
+
+#[tokio::test]
+async fn use_primary_requires_acknowledgement() {
+    let runtime = TempDir::new().unwrap();
+    let config = runtime.path().join("profile.json");
+    write_private(&config, v4_profile_json("UsePrimary", "[]"));
+    let server = serve_sequence(runtime.path(), vec![preview_step("work", vec![])]).await;
+
+    let output = run_cli(runtime.path(), &["apply-profile", config.to_str().unwrap()]).await;
+
+    assert_eq!(server.await.unwrap(), 0);
+    assert_eq!(output.status.code(), Some(6));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("UsePrimary"), "stderr: {stderr}");
+}
+
+#[tokio::test]
+async fn ordinary_preserve_system_apply_needs_no_acknowledgement() {
+    let runtime = TempDir::new().unwrap();
+    let config = runtime.path().join("profile.json");
+    write_private(&config, v4_profile_json("PreserveSystem", "[]"));
+    let server = serve_sequence(
+        runtime.path(),
+        vec![preview_step("work", vec![]), apply_step("work", 3)],
+    )
+    .await;
+
+    let output = run_cli(runtime.path(), &["apply-profile", config.to_str().unwrap()]).await;
+
+    assert_eq!(server.await.unwrap(), 0);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "applied generation=3\n"
+    );
+}
+
+#[tokio::test]
+async fn unavailable_preview_refuses_even_when_acknowledged() {
+    let runtime = TempDir::new().unwrap();
+    let config = runtime.path().join("profile.json");
+    write_private(&config, v4_profile_json("PreserveSystem", LAB_RULE));
+    let server = serve_sequence(
+        runtime.path(),
+        vec![(
+            Box::new(|request| assert!(matches!(request, DaemonRequest::PreviewProfile(_)))),
+            Err(IpcError::new(
+                "DAEMON_PREVIEW_UNAVAILABLE",
+                "connected networks were not observed",
+            )),
+        )],
+    )
+    .await;
+
+    let output = run_cli(
+        runtime.path(),
+        &["apply-profile", config.to_str().unwrap(), ACK],
+    )
+    .await;
+
+    assert_eq!(server.await.unwrap(), 0, "never applied without a preview");
+    assert_eq!(output.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("DAEMON_PREVIEW_UNAVAILABLE"));
+}
+
+#[tokio::test]
+async fn acknowledgement_flag_is_only_an_apply_option() {
+    let runtime = TempDir::new().unwrap();
+    let config = runtime.path().join("profile.json");
+    write_private(&config, v4_profile_json("PreserveSystem", "[]"));
+    let path = config.to_str().unwrap();
+    for args in [
+        vec!["status", ACK],
+        vec!["deactivate", ACK],
+        vec!["apply-profile", path, ACK, ACK],
+        vec!["apply-profile", path, "--profile"],
+        vec!["apply-profile", path, "--unknown"],
+    ] {
+        let output = run_cli(runtime.path(), &args).await;
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn apply_timeout_is_reported_and_never_replayed() {
+    let runtime = TempDir::new().unwrap();
+    let config = runtime.path().join("profile.json");
+    write_private(&config, v4_profile_json("PreserveSystem", "[]"));
+    let socket_dir = runtime.path().join("routelane");
+    std::fs::create_dir(&socket_dir).unwrap();
+    let listener = UnixListener::bind(socket_dir.join("routelane.sock")).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request: DaemonEnvelope = read_frame(&mut stream).await.unwrap();
+        assert!(matches!(request.request, DaemonRequest::PreviewProfile(_)));
+        let preview = DaemonResult::Preview(RoutingPreview {
+            policy_hash: plan_hash("3"),
+            warnings: vec![],
+        });
+        write_frame(
+            &mut stream,
+            &DaemonResponse::success(request.request_id, preview),
+        )
+        .await
+        .unwrap();
+        let (mut apply, _) = listener.accept().await.unwrap();
+        let request: DaemonEnvelope = read_frame(&mut apply).await.unwrap();
+        assert!(matches!(request.request, DaemonRequest::ApplyProfile(_)));
+        // Never answered; a resend would arrive as another connection.
+        tokio::time::timeout(Duration::from_secs(7), listener.accept())
+            .await
+            .is_ok()
+    });
+
+    let output = run_cli(runtime.path(), &["apply-profile", config.to_str().unwrap()]).await;
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("IPC_TIMEOUT"));
+    assert!(!server.await.unwrap(), "the apply was not replayed");
 }

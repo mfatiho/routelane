@@ -305,6 +305,8 @@ impl PrivilegedHelperClient for FakeHelper {
             routelane_table_present: plan.is_some() || orphaned,
             snapshot,
             diagnostics: vec![],
+            // This fake never observes topology: no preview facts.
+            observed_connected_networks: None,
             runtime: self.runtime.lock().unwrap().clone(),
         };
         let gate = self.next_inspect_gate.lock().unwrap().take();

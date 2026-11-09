@@ -11,6 +11,7 @@ mod planner;
 mod policy_route;
 mod primary;
 mod privileged;
+mod routing_preview;
 mod runtime;
 mod runtime_monitor;
 mod topology;
@@ -48,6 +49,7 @@ pub use privileged::{
 };
 #[cfg(feature = "root-integration")]
 pub use privileged::{CommandPrivilegedBackend, FileAppliedStateStore, ProcessCommandExecutor};
+pub use routing_preview::{routing_preview, RoutingPreview, RoutingWarning};
 pub use runtime::{
     policy_hash, restrict_to_grant, RuntimeActivation, RuntimeApplyResponse, RuntimeEnvironment,
     RuntimeGrant, RuntimePhase, RuntimeRecord, RuntimeRestoreReceipt, RuntimeStatus,

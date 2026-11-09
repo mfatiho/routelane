@@ -200,6 +200,8 @@ impl PrivilegedHelperClient for RuntimeHelper {
             routelane_table_present: state.live.is_some(),
             snapshot,
             diagnostics: vec![],
+            // This fake never observes topology: no preview facts.
+            observed_connected_networks: None,
             runtime: state.runtime.clone(),
         })
     }

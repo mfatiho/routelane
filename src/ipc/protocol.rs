@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{PlanHash, RuntimeStatus};
+use crate::backend::{PlanHash, RoutingPreview, RuntimeStatus};
 use crate::domain::{Profile, ProfileId, RuleId};
 use crate::health::HealthReport;
 
@@ -33,6 +33,9 @@ pub enum DaemonRequest {
     /// merge these profiles by ID; absence never authorizes local deletion.
     ListProfiles,
     ApplyProfile(Profile),
+    /// Read-only: the local-network impact of a draft profile. Saves,
+    /// arms and edits nothing.
+    PreviewProfile(Profile),
     SetRuleEnabled {
         profile_id: ProfileId,
         rule_id: RuleId,
@@ -89,6 +92,7 @@ pub enum DaemonResult {
     /// Partial profile snapshot for merge/upsert, not an authoritative catalog.
     Profiles(Vec<Profile>),
     Applied(ApplyProfileResult),
+    Preview(RoutingPreview),
     ApplicationLaunched(ApplicationLaunchResult),
     ApplicationProcessesAdopted(ApplicationAdoptionResult),
     OrphanedResourcesRecovered(OrphanRecoveryResult),

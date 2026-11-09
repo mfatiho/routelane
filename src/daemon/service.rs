@@ -12,9 +12,10 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::application::{matching_processes, RunningProcess};
 use crate::backend::{
-    policy_hash, AppliedKernelState, ApplyResponse, CleanupResponse, InspectResponse, KernelPlan,
-    OrphanRecoveryResponse, PlanHash, ResolutionSnapshot, RestoreResponse, RuntimeActivation,
-    RuntimeApplyResponse, RuntimePhase, RuntimeStatus, TopologySnapshot, RUNTIME_PROTOCOL_VERSION,
+    policy_hash, routing_preview, AppliedKernelState, ApplyResponse, CleanupResponse,
+    InspectResponse, KernelPlan, OrphanRecoveryResponse, PlanHash, ResolutionSnapshot,
+    RestoreResponse, RoutingPreview, RuntimeActivation, RuntimeApplyResponse, RuntimePhase,
+    RuntimeStatus, TopologySnapshot, RUNTIME_PROTOCOL_VERSION,
 };
 use crate::dns::periodic::resolve_domain;
 use crate::domain::{
@@ -253,6 +254,10 @@ where
             DaemonRequest::ApplyProfile(profile) => {
                 self.apply_profile(profile).await.map(DaemonResult::Applied)
             }
+            DaemonRequest::PreviewProfile(profile) => self
+                .preview_profile(profile)
+                .await
+                .map(DaemonResult::Preview),
             DaemonRequest::SetRuleEnabled {
                 profile_id,
                 rule_id,
@@ -409,6 +414,28 @@ where
             }
         }
         Ok(selector)
+    }
+
+    /// Read-only local-network impact of `profile` from the helper's fresh
+    /// root observation. Saves, arms, prepares and records nothing; without
+    /// observed facts it fails instead of returning a clean preview.
+    pub async fn preview_profile(&self, profile: Profile) -> Result<RoutingPreview, DaemonError> {
+        validate_profile(&profile)
+            .map_err(|error| DaemonError::validation(format!("{error:?}")))?;
+        self.require_helper_protocol().await?;
+        let resolutions = self.resolutions.snapshot(&profile).await?;
+        let observed = self
+            .helper
+            .inspect()
+            .await?
+            .observed_connected_networks
+            .ok_or_else(|| {
+                DaemonError::new(
+                    "DAEMON_PREVIEW_UNAVAILABLE",
+                    "the helper could not observe connected networks, so this profile's local-network impact is unknown; nothing was applied",
+                )
+            })?;
+        Ok(routing_preview(&profile, &resolutions, &observed))
     }
 
     pub async fn apply_profile(&self, profile: Profile) -> Result<ApplyProfileResult, DaemonError> {
