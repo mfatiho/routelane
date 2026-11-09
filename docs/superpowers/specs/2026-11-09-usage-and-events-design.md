@@ -2,7 +2,7 @@
 
 Tarih: 9 Kasım 2026.
 Durum: Kullanıcı ekranları 9 Kasım'da tarayıcı taslaklarıyla tek tek onayladı ve
-bağımsız okuma sonrası iki açık soruyu cevapladı; bu belge onay bekliyor. **Sıra kararı (kullanıcının):** önce yarım kalan seçici
+bağımsız okuma sonrası iki açık soruyu cevapladı; belge 9 Kasım 2026'da onaylandı. **Sıra kararı (kullanıcının):** önce yarım kalan seçici
 yönlendirme işi (`docs/superpowers/plans/2026-10-22-selective-routing.md`) bitirilir,
 bu özellik ondan sonra planlanır ve uygulanır.
 
