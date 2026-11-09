@@ -3039,7 +3039,8 @@ where
                 "root integration fail point before activate_nft",
             ));
         }
-        let batch = render_guarded_ruleset(next)?;
+        let batch =
+            render_guarded_ruleset(next, self.previous.as_ref().map(AppliedKernelState::plan))?;
         run_nft_batch(
             self.executor,
             batch,
@@ -3199,8 +3200,14 @@ fn capture_snapshot(executor: &mut impl CommandExecutor) -> Result<CapturedSnaps
     })
 }
 
-fn render_guarded_ruleset(plan: &KernelPlan) -> Result<Vec<u8>, RunnerError> {
-    render_owned_ruleset(plan, TableMode::Replace, true)
+fn render_guarded_ruleset(
+    next: &KernelPlan,
+    replaced: Option<&KernelPlan>,
+) -> Result<Vec<u8>, RunnerError> {
+    render_nft_command_document(
+        &super::render_activated_nft_document(next, replaced),
+        TableMode::Replace,
+    )
 }
 
 fn render_owned_ruleset(
@@ -4595,7 +4602,7 @@ fn build_pending_expectations_from(
         nft_document_fingerprint(&expected_nft_document(active, Some(pending), false))
             .map_err(|error| PrivilegedError::new(error.to_string()))?;
     let activated_nft_fingerprint =
-        nft_document_fingerprint(&expected_nft_document(Some(pending), None, true))
+        nft_document_fingerprint(&super::render_activated_nft_document(pending, active))
             .map_err(|error| PrivilegedError::new(error.to_string()))?;
     let committed_nft_fingerprint =
         nft_document_fingerprint(&expected_nft_document(Some(pending), None, false))
@@ -8199,6 +8206,35 @@ mod tests {
     }
 
     #[test]
+    fn selective_activation_guard_keeps_the_replaced_scope() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let mut active = fixture_valid_plan();
+        active.unmatched_traffic = crate::domain::UnmatchedTraffic::PreserveSystem;
+        let mut pending = active.clone();
+        pending.generation += 1;
+        pending.rules[0].target = CompiledTarget::Network("192.0.2.0/24".parse().unwrap());
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            FakeAppliedStateStore::default(),
+        );
+        backend.apply(&active).unwrap();
+        kernel.lock().unwrap().commands.clear();
+        backend.apply(&pending).unwrap();
+
+        let union = render_guarded_ruleset(&pending, Some(&active)).unwrap();
+        assert_ne!(union, render_guarded_ruleset(&pending, None).unwrap());
+        let batches = kernel.lock().unwrap().commands.clone();
+        assert!(
+            batches
+                .iter()
+                .any(|command| command.stdin.as_ref() == Some(&union)),
+            "activation must keep guarding the replaced generation's scope"
+        );
+    }
+
+    #[test]
     fn restarted_backend_recovers_each_exact_pending_nft_crash_window() {
         #[derive(Clone, Copy)]
         enum CrashWindow {
@@ -8207,14 +8243,20 @@ mod tests {
             Committed,
         }
 
-        for window in [
+        let windows = [
             CrashWindow::Untouched,
             CrashWindow::Activated,
             CrashWindow::Committed,
-        ] {
+        ];
+        // Both modes; the selective transition also changes the managed
+        // scope, so its union guard differs from either generation's own.
+        for (window, selective) in windows.into_iter().flat_map(|w| [(w, false), (w, true)]) {
             let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
             let store = FakeAppliedStateStore::default();
-            let active = fixture_valid_plan();
+            let mut active = fixture_valid_plan();
+            if selective {
+                active.unmatched_traffic = crate::domain::UnmatchedTraffic::PreserveSystem;
+            }
             {
                 let mut backend = CommandPrivilegedBackend::with_store(
                     FakeCommandExecutor {
@@ -8226,6 +8268,9 @@ mod tests {
             }
             let mut pending = active.clone();
             pending.generation = 2;
+            if selective {
+                pending.rules[0].target = CompiledTarget::Network("192.0.2.0/24".parse().unwrap());
+            }
             {
                 let mut persisted = store.state.lock().unwrap();
                 let active_fingerprint = persisted.as_ref().unwrap().active_nft_fingerprint.clone();
@@ -8247,7 +8292,9 @@ mod tests {
             };
             let batch = match window {
                 CrashWindow::Untouched => None,
-                CrashWindow::Activated => Some(render_guarded_ruleset(&pending).unwrap()),
+                CrashWindow::Activated => {
+                    Some(render_guarded_ruleset(&pending, Some(&active)).unwrap())
+                }
                 CrashWindow::Committed => {
                     Some(render_owned_ruleset(&pending, TableMode::Replace, false).unwrap())
                 }
@@ -8273,11 +8320,27 @@ mod tests {
             assert_eq!(*store.state.lock().unwrap(), journal_before);
             assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
             restarted.ensure_reconciled().unwrap();
-            let persisted = store.state.lock().unwrap();
-            let persisted = persisted.as_ref().unwrap();
-            assert_eq!(persisted.active.as_ref(), Some(&active));
-            assert!(persisted.pending.is_none());
-            assert!(persisted.pending_expectations.is_none());
+            {
+                let persisted = store.state.lock().unwrap();
+                let persisted = persisted.as_ref().unwrap();
+                assert_eq!(persisted.active.as_ref(), Some(&active));
+                assert!(persisted.pending.is_none());
+                assert!(persisted.pending_expectations.is_none());
+            }
+            assert!(!kernel.lock().unwrap().has_guard, "guard removed");
+
+            // Replaying the recovered state is a fixed point: no endless
+            // refresh work and no duplicated owned tuples.
+            let settled = mutation_count(&kernel.lock().unwrap());
+            restarted.ensure_reconciled().unwrap();
+            restarted.apply(&active).unwrap();
+            assert_eq!(mutation_count(&kernel.lock().unwrap()), settled);
+            let kernel = kernel.lock().unwrap();
+            let mut tuples = kernel.extra_routes.clone();
+            tuples.extend(kernel.extra_rules.clone());
+            for (index, tuple) in tuples.iter().enumerate() {
+                assert!(!tuples[..index].contains(tuple), "duplicate {tuple:?}");
+            }
         }
     }
 
@@ -8318,7 +8381,7 @@ mod tests {
         };
         run_nft_batch(
             &mut crash_executor,
-            render_guarded_ruleset(&pending).unwrap(),
+            render_guarded_ruleset(&pending, Some(&active)).unwrap(),
             "simulate crash after pending nft activation",
         )
         .unwrap();
@@ -8437,7 +8500,7 @@ mod tests {
         };
         run_nft_batch(
             &mut crash_executor,
-            render_guarded_ruleset(&pending).unwrap(),
+            render_guarded_ruleset(&pending, Some(&active)).unwrap(),
             "simulate crash after pending nft activation",
         )
         .unwrap();

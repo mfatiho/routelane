@@ -16,7 +16,7 @@ pub fn rules(document: &Value, chain: &str) -> Vec<Value> {
         .collect()
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Packet {
     pub family: &'static str,
     pub source: &'static str,

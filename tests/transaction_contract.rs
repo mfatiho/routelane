@@ -7,6 +7,9 @@ use routelane::backend::{
 };
 use routelane::domain::{LaneFailurePolicy, LaneId, ProfileId, RuleId};
 
+#[path = "support/nft_eval.rs"]
+mod nft_eval;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailurePoint {
     Snapshot,
@@ -28,6 +31,14 @@ struct InMemoryKernel {
     snapshot_taken: bool,
     failures: VecDeque<FailurePoint>,
     mutations: usize,
+    /// The plan being applied while the temporary guard is installed.
+    pending: Option<KernelPlan>,
+    /// The generation that plan replaces, as the guard was installed.
+    replaced: Option<KernelPlan>,
+    /// Packets evaluated against the live nft policy after every step.
+    watched: Vec<nft_eval::Packet>,
+    /// (step, guard installed, destination, verdict) for each watched packet.
+    probes: Vec<(&'static str, bool, &'static str, &'static str)>,
 }
 
 impl InMemoryKernel {
@@ -40,6 +51,10 @@ impl InMemoryKernel {
             snapshot_taken: false,
             failures: VecDeque::new(),
             mutations: 0,
+            pending: None,
+            replaced: None,
+            watched: vec![],
+            probes: vec![],
         }
     }
 
@@ -64,6 +79,34 @@ impl InMemoryKernel {
     fn fail_at(mut self, point: FailurePoint) -> Self {
         self.failures.push_back(point);
         self
+    }
+
+    fn watching(mut self, packets: Vec<nft_eval::Packet>) -> Self {
+        self.watched = packets;
+        self
+    }
+
+    /// Walks every watched packet through the live policy: the RouteLane
+    /// output chain (priority -150), then the temporary guard (-149).
+    fn probe(&mut self, step: &'static str) {
+        use routelane::backend::{render_activated_nft_document, render_nft_document};
+        let pending = self.pending.as_ref().filter(|_| self.temporary_guard);
+        let document = match (self.active_nft.as_ref(), pending) {
+            // Activated: the next verdicts are live under the guard.
+            (Some(active), Some(next)) if active == next => {
+                render_activated_nft_document(next, self.replaced.as_ref())
+            }
+            (active, pending) => render_nft_document(active, pending, self.temporary_guard),
+        };
+        for packet in self.watched.clone() {
+            let mut packet = packet;
+            let mut verdict = nft_eval::execute(&document, "output", &mut packet);
+            if !matches!(verdict, "reject" | "drop") && self.temporary_guard {
+                verdict = nft_eval::execute(&document, "guard", &mut packet);
+            }
+            self.probes
+                .push((step, self.temporary_guard, packet.destination, verdict));
+        }
     }
 
     fn fail_in_order(mut self, points: impl IntoIterator<Item = FailurePoint>) -> Self {
@@ -210,6 +253,9 @@ impl KernelRunner for InMemoryKernel {
         }
         self.record_mutation();
         self.temporary_guard = true;
+        self.pending = Some(_next.clone());
+        self.replaced = self.active_nft.clone();
+        self.probe("install guard");
         self.fail_if_scheduled(FailurePoint::InstallGuard)
     }
 
@@ -219,6 +265,7 @@ impl KernelRunner for InMemoryKernel {
         }
         self.record_mutation();
         self.route_generations.insert(next.generation, next.clone());
+        self.probe("prepare routes");
         self.fail_if_scheduled(FailurePoint::PrepareRoutes)
     }
 
@@ -231,6 +278,7 @@ impl KernelRunner for InMemoryKernel {
         self.record_mutation();
         self.fail_if_scheduled(FailurePoint::ActivateNft)?;
         self.active_nft = Some(next.clone());
+        self.probe("activate nft");
         Ok(())
     }
 
@@ -255,12 +303,15 @@ impl KernelRunner for InMemoryKernel {
         }
         self.record_mutation();
         self.route_generations.remove(&generation);
+        self.probe("remove old generation");
         self.fail_if_scheduled(FailurePoint::RemoveOldGeneration)
     }
 
     fn remove_guard(&mut self) -> Result<(), RunnerError> {
         self.record_mutation();
         self.temporary_guard = false;
+        self.pending = None;
+        self.probe("remove guard");
         self.fail_if_scheduled(FailurePoint::RemoveGuard)
     }
 
@@ -273,6 +324,7 @@ impl KernelRunner for InMemoryKernel {
                 .insert(state.generation, state.plan().clone());
             self.active_nft = Some(state.plan().clone());
         }
+        self.probe("restore");
         self.fail_if_scheduled(FailurePoint::Restore)
     }
 }
@@ -594,6 +646,69 @@ fn every_mutating_failure_point_restores_state_hash_and_guard() {
             expected_mutations,
             "failure at {point:?}"
         );
+    }
+}
+
+fn selective_plan(generation: u64, blocked: &str) -> KernelPlan {
+    let mut plan = fixture_kernel_plan(generation);
+    plan.unmatched_traffic = routelane::domain::UnmatchedTraffic::PreserveSystem;
+    plan.rules[0].target = CompiledTarget::Network(blocked.parse().unwrap());
+    plan
+}
+
+#[test]
+fn rollback_never_blocks_unmatched_packets() {
+    let unmanaged = ["10.65.201.60", "198.51.100.20", "172.20.5.5"];
+    let (old_managed, new_managed) = ("203.0.113.5", "192.0.2.5");
+    for point in [
+        FailurePoint::InstallGuard,
+        FailurePoint::PrepareRoutes,
+        FailurePoint::ActivateNft,
+        FailurePoint::Verify,
+        FailurePoint::RemoveOldGeneration,
+        FailurePoint::RemoveGuard,
+    ] {
+        let old = AppliedKernelState::from_plan(&selective_plan(2, "203.0.113.0/24"));
+        let next = selective_plan(3, "192.0.2.0/24");
+        let mut packets: Vec<nft_eval::Packet> = unmanaged
+            .into_iter()
+            .flat_map(|destination| {
+                [(0, 0), (42, 43)].map(|(mark, ct_mark)| nft_eval::Packet {
+                    source: "10.0.0.2",
+                    destination,
+                    mark,
+                    ct_mark,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        for destination in [old_managed, new_managed] {
+            packets.push(nft_eval::Packet {
+                source: "10.0.0.2",
+                destination,
+                ..Default::default()
+            });
+        }
+        let mut runner = InMemoryKernel::from_applied(old.clone())
+            .fail_at(point)
+            .watching(packets);
+
+        apply_plan(&mut runner, Some(&old), &next).unwrap_err();
+
+        assert_eq!(runner.kernel_plan_hash(), Some(old.plan_hash), "{point:?}");
+        assert!(!runner.probes.is_empty(), "{point:?}");
+        for (step, guarded, destination, verdict) in &runner.probes {
+            if unmanaged.contains(destination) {
+                assert!(
+                    !matches!(*verdict, "reject" | "drop"),
+                    "{point:?} at {step}: unmanaged {destination} was {verdict}"
+                );
+            } else if *guarded {
+                // While a transition is in flight the managed scope of
+                // both generations is held back: nothing leaks.
+                assert_eq!(*verdict, "reject", "{point:?} at {step}: {destination}");
+            }
+        }
     }
 }
 

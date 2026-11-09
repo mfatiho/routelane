@@ -27,7 +27,7 @@ pub use inspect::{
 pub use interface_settings::{
     InterfaceSettingReceipt, MarkAwareRpf, MarkAwareRpfBackend, SystemMarkAwareRpfBackend,
 };
-pub use nft_document::render_nft_document;
+pub use nft_document::{render_activated_nft_document, render_nft_document};
 pub use nftables::{render_ruleset, NftRenderError, TableMode};
 pub use plan::{
     CompiledAction, CompiledRule, CompiledTarget, KernelPlan, LaneAvailability, LanePlan, PlanHash,

@@ -436,6 +436,25 @@ pub fn render_nft_document(
     pending: Option<&KernelPlan>,
     guard: bool,
 ) -> Value {
+    let scope: Vec<&KernelPlan> = active.into_iter().chain(pending).collect();
+    render(active, pending, guard.then_some(&scope))
+}
+
+/// The activated phase of a transition: `next`'s verdicts are live while the
+/// temporary guard still holds back the managed scope of both `next` and the
+/// generation it replaces, so a rollback cannot follow a leak of that scope.
+pub fn render_activated_nft_document(next: &KernelPlan, replaced: Option<&KernelPlan>) -> Value {
+    let scope: Vec<&KernelPlan> = replaced.into_iter().chain([next]).collect();
+    render(Some(next), None, Some(&scope))
+}
+
+/// `guard` is the set of plans whose managed scope the temporary guard
+/// holds back; `None` renders no guard chain.
+fn render(
+    active: Option<&KernelPlan>,
+    pending: Option<&KernelPlan>,
+    guard: Option<&Vec<&KernelPlan>>,
+) -> Value {
     let mut chains = Vec::new();
     if let Some(p) = active {
         chains.push(Chain::regular(&state_chain_name(p)));
@@ -573,11 +592,10 @@ pub fn render_nft_document(
         egress.rule(invalid);
         chains.extend([reply, egress, nat]);
     }
-    if guard {
+    if let Some(scope) = guard {
         let mut chain = Chain::base("guard", "route", "output", -149);
-        let mut networks = active
-            .into_iter()
-            .chain(pending)
+        let mut networks = scope
+            .iter()
             .flat_map(|p| p.local_networks.iter().copied())
             .collect::<Vec<_>>();
         networks.sort();
@@ -586,7 +604,29 @@ pub fn render_nft_document(
         for n in networks {
             chain.rule(vec![destination(&n), ret()]);
         }
-        chain.rule(vec![reject(None)]);
+        let plans = || scope.iter().copied();
+        if plans().any(|p| p.unmatched_traffic == UnmatchedTraffic::UsePrimary) {
+            // UsePrimary owns all new internet traffic: hold all of it back.
+            chain.rule(vec![reject(None)]);
+        } else {
+            // Selective: hold back only what either side manages, i.e.
+            // RouteLane-owned flows and the union of explicit rule scopes
+            // (the same predicates as the verdicts). Everything else flows.
+            for key in [meta("mark"), ct("mark")] {
+                let mut expr = owned(key);
+                expr.push(reject(None));
+                chain.rule(expr);
+            }
+            let mut seen = Vec::new();
+            for rule in plans().flat_map(|p| p.rules.iter()) {
+                let mut expr = rule_predicates(rule);
+                expr.push(reject(Some(rule.family)));
+                if !seen.contains(&expr) {
+                    seen.push(expr.clone());
+                    chain.rule(expr);
+                }
+            }
+        }
         chains.push(chain);
     }
     // nft list emits all chain definitions before all rules. Keep that exact
