@@ -24,4 +24,3 @@ dist/*.deb
 docs/*
 !docs/reliability-audit.md
 !docs/handoff.md
-!docs/commercial-roadmap.md
