@@ -41,8 +41,8 @@ Polkit, existing `ConfigV2` persistence and daemon IPC.
 ## Status (2026-07-31, follow-up review)
 
 Tasks 1, 2 and 4 shipped and hold up under `cargo fmt --check`, `cargo test`,
-and `clippy -D warnings`: commits `a60ba4f`, `76417e0`, `5cc3278`, `e23a9cd`,
-`8938c69`, plus `ca3fe74` (this session), which fixed a gap Task 4 required
+and `clippy -D warnings`: commits `47e2045`, `7075ed5`, `d18d56c`, `60af29f`,
+`885a09e`, plus `b4fe9b0` (this session), which fixed a gap Task 4 required
 but the earlier commits missed — the primary button and header switch could
 each fire a second `ApplyProfile`/`Deactivate` before the daemon confirmed
 the first one, because nothing disabled them at click time, only on the

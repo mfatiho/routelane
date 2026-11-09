@@ -15,7 +15,7 @@ yazılır. Exit 77 ve “derlendi” PASS değildir.
 | Dağıtım / kernel | Ubuntu 24.04.5 LTS, `6.8.0-142-generic` |
 | iproute2 / nftables | `iproute2-6.1.0`, `nftables v1.0.9` |
 | systemd / D-Bus / Polkit / GLib | `255.4-1ubuntu8.18`, `dbus 1.14.10-4ubuntu4.1`, `polkitd 124-2ubuntu1.24.04.4`, `glib 2.80.0` |
-| Paket | `routelane_0.1.0_amd64.deb`, sha256 `6ae37f678b076e22cc4a59c35557b8870be6eb1277ca6cb548a6493c28cc7e6e` (`packaging/deb/build-deb.sh`, 33aa274 + çalışma ağacı) |
+| Paket | `routelane_0.1.0_amd64.deb`, sha256 `6ae37f678b076e22cc4a59c35557b8870be6eb1277ca6cb548a6493c28cc7e6e` (`packaging/deb/build-deb.sh`, 547ced5 + çalışma ağacı) |
 
 Host üzerinde hiçbir ağ, firewall, Polkit ya da paket değişikliği yapılmadı.
 
@@ -45,7 +45,7 @@ kopyalandı → `sudo sh vm-run-t11.sh` (registry/token temizliği ile
 - **RED:** Task 8 helper’ı ile `gui_closed_link_loss_fails_over_without_authorization_prompt`,
   ilk carrier kaybı yenilemesinde `Degraded` oldu, etkin çıkış `lane-a`’da kaldı
   (kernel carrier kaybında unicast default’ları `linkdown` bayrağıyla tutar;
-  eski kod bunu yabancı semantik saydı). Düzeltme: 33aa274.
+  eski kod bunu yabancı semantik saydı). Düzeltme: 547ced5.
 - **GREEN:** her iki modda 18/18 geçti. Yeni senaryo tek aktivasyondan sonra
   yalnız kernel kanıtıyla yenileme yapar (yeni yetkilendirme yok) ve şunları
   birbirinden bağımsız doğrular:
@@ -156,7 +156,7 @@ yeniden başlatma ve kaldırma.
 |---|---|---|---|---|---|---|---|
 | Ubuntu 22.04.5 | 5.15.0-198 / 5.15.0 / 1.0.2 | 249.11 / 0.105 (pkla) / 1.12.20 | 4.6.9 / 1.1.7 | 433 PASS | 18/18 + 18/18 PASS | PASS | PASS |
 | Ubuntu 24.04.5 | 6.8.0-147 / 6.1.0 / 1.0.9 | 255.4 / 124 / 1.14.10 | 4.14.5 / 1.5.0 | 433 PASS (host) | 18/18 + 18/18 PASS | PASS | PASS |
-| Ubuntu 26.04.1 | 7.0.0-34 / 6.19.0 / 1.1.6 | 259.5 / 127 / 1.16.2 | 4.22.4 / 1.9.1 | 433 PASS | `0203fab` sonrası standart 2/3, strict 1/2 koşu temiz; diğerlerinde sayaç/eşik kaynaklı tek hata — aşağıya bkz. | PASS | PASS |
+| Ubuntu 26.04.1 | 7.0.0-34 / 6.19.0 / 1.1.6 | 259.5 / 127 / 1.16.2 | 4.22.4 / 1.9.1 | 433 PASS | `d1583de` sonrası standart 2/3, strict 1/2 koşu temiz; diğerlerinde sayaç/eşik kaynaklı tek hata — aşağıya bkz. | PASS | PASS |
 | Debian 12, 13 | — | — | — | — | NOT VERIFIED | NOT VERIFIED | NOT VERIFIED |
 | Fedora 43, 44 | — | — | — | — | NOT VERIFIED | NOT VERIFIED | NOT VERIFIED |
 | aarch64 (tümü) | — | — | — | — | NOT VERIFIED | NOT VERIFIED | NOT VERIFIED |
@@ -177,13 +177,13 @@ aldı, yani fail-closed davrandı):
   normalleştirme kararlı bölme yapar
   (`fingerprint_and_seal_accept_nft_1_0_2_chain_interleaved_listing_order`).
 
-Yukarıdaki satırlar bu düzeltmelerden ve son incelemedeki `0203fab`
+Yukarıdaki satırlar bu düzeltmelerden ve son incelemedeki `d1583de`
 (başarısız geçişin geri çekilmesi) düzeltmesinden sonraki koşulardır. Koşular
 commit edilmiş HEAD’den değil, kullanıcının henüz commit edilmemiş güvenilirlik
 hunk’larını da içeren çalışma ağacından yapıldı.
 
-26.04’te `0203fab` sonrası standart modda 3 koşunun 2’si, strict modda 2
-koşunun 1’i temiz geçti (`d8949e7` sonrası, `0203fab` öncesi koşu iki modda da
+26.04’te `d1583de` sonrası standart modda 3 koşunun 2’si, strict modda 2
+koşunun 1’i temiz geçti (`3ed607e` sonrası, `d1583de` öncesi koşu iki modda da
 temizdi). Düşen koşularda birer test kaldı ve tekrarlanmadı: (a) Faz 1 testi
 `real_helper_routes_three_lanes_and_preserves_generation_one_on_activate_failure`
 sink arayüzünün link RX sayaçlarını okur (iki farklı satırda, ölçüm
@@ -193,7 +193,7 @@ penceresinde fazladan paket; bir kez standart, bir kez strict modda);
 üzerindeki IPv6 ND/MLD trafiği link sayaçlarını kirletiyor ve yük altında verim
 eşiği sınırda kalıyor; doğrulanmadı. Bu satır bu yüzden temiz PASS değildir;
 Task 7’deki gibi nft ingress gözlemcilerine geçmek ertelendi. Matris
-`0203fab` + çalışma ağacında ölçüldü; ardından gelen kurtarma-durumu
+`d1583de` + çalışma ağacında ölçüldü; ardından gelen kurtarma-durumu
 düzeltmesi yalnız rootless testlerle doğrulandı.
 
 Fedora rpm: `packaging/rpm/build-rpm.sh`, Docker `fedora:latest` (Fedora 44,

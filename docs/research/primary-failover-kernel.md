@@ -251,7 +251,7 @@ sinyali teslimi ve gerçek Polkit akışı burada doğrulanmadı (Task 11/12).
   default’ları silmez; kernel bunları `linkdown` bayrağıyla tutar
   (`ignore_routes_with_linkdown=0`). Yönetimsel `down` ve adres kaldırma ise
   route’ları siler. Eski helper `linkdown`’ı yabancı semantik saydığı için
-  carrier kaybında yedeğe geçmeden `Degraded` oldu (VM’de RED); 33aa274 yalnız
+  carrier kaybında yedeğe geçmeden `Degraded` oldu (VM’de RED); 547ced5 yalnız
   tam `["linkdown"]` bayrağını ve taze planın artık kullanmadığı hat×aileyi
   tolere eder.
 - Kurulu paketle gerçek system bus: root olmayan istemci `RuntimeChanged`

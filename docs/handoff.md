@@ -4,7 +4,7 @@ Tarih: 22 Ekim 2026. Bu belge, devralan geliştiricinin geçmiş kararları bulm
 
 ## En son kayıt — seçici yönlendirme uygulama planı (22 Ekim 2026)
 
-- Kullanıcı son “Devam et” ile yazılı seçici yönlendirme tasarımını onayladı. `writing-plans` kullanılarak `docs/superpowers/plans/2026-10-22-selective-routing.md` yazıldı; tasarımın durum satırı onaylandı olarak güncellendi. Yalnız bu iki belge `0ec1661` (`docs(routing): plan selective routing implementation`) commit'ine alındı. Önceki tasarım commit'i `ff317b1` korunuyor.
+- Kullanıcı son “Devam et” ile yazılı seçici yönlendirme tasarımını onayladı. `writing-plans` kullanılarak `docs/superpowers/plans/2026-10-22-selective-routing.md` yazıldı; tasarımın durum satırı onaylandı olarak güncellendi. Yalnız bu iki belge `d09124d` (`docs(routing): plan selective routing implementation`) commit'ine alındı. Önceki tasarım commit'i `8e96baf` korunuyor.
 - **Plan kullanıcı incelemesini bekliyor; Task 1 dahil hiçbir uygulama görevi başlamadı.** Kullanıcının bir sonraki onayı planı kapsıyorsa Task 1'den başlanabilir; yeniden tasarım/plan döngüsü başlatma. Korunan yürütme seçimi main/inline, alt ajan ve yeni worktree yoktur.
 - 10 görev: frozen V2 journal/V3 profil kanıtı → zorunlu mod/ConfigV4 → cleanup-only yükseltme → seçici nft/planner → scoped transaction guard → protocol3/grant/applied mode → root-observed lab önizlemesi/CLI onayı → GTK → gerçek kernel/VM kabulü → tam regresyon/paket/devir. Task 9'un trafik kanıtı olmadan düzeldi veya kurulum hazır deme.
 - Plan öz incelemesi: spec §1–10 görevlerle eşleştirildi, beş Review Focus durumu ilgili testlere bağlandı; kesin tip/API adları, literal davranış assertion'ları ve RED/GREEN komutları yazıldı. `git diff --check` ve staged dokümantasyon kontrolü geçti. Bu tur yalnız dokümantasyon: uygulama testleri/derleme/VM testi çalıştırılmadı.
@@ -17,7 +17,7 @@ Tarih: 22 Ekim 2026. Bu belge, devralan geliştiricinin geçmiş kararları bulm
 ## En son kayıt — seçici yönlendirme tasarımı (22 Ekim 2026)
 
 - Kullanıcı eşleşmeyen trafiğin OS davranışını korumasını istedi ve açıklanan hedefe “devam et” dedi. Bu, 14 Ekim'deki tüm eşleşmeyen internet trafiğini ana hatta taşıma varsayılanını değiştirir; önceki özellik ayrı opt-in olarak korunacak.
-- Mimari tasarım becerisi kullanıldı. Yazılı tasarım: `docs/superpowers/specs/2026-10-22-selective-routing-design.md`; yalnız bu belge commit edildi: `ff317b1` (`docs(routing): define selective routing and system preservation`). **Yazılı tasarım kullanıcı incelemesini bekliyor; uygulama planı ve ürün uygulaması henüz yok.** Genel “devam et” onayını henüz var olmayan planın onayı sayma.
+- Mimari tasarım becerisi kullanıldı. Yazılı tasarım: `docs/superpowers/specs/2026-10-22-selective-routing-design.md`; yalnız bu belge commit edildi: `8e96baf` (`docs(routing): define selective routing and system preservation`). **Yazılı tasarım kullanıcı incelemesini bekliyor; uygulama planı ve ürün uygulaması henüz yok.** Genel “devam et” onayını henüz var olmayan planın onayı sayma.
 - Tasarım: `PreserveSystem` varsayılan, `UsePrimary` açık onaylı seçenek; mode planner/hash/runtime grant'e dahil. Global foreign-mark reject ve seçici transaction guard kapsamı daralır; açık Block/Route önceliği, owned-flow NAT/affinity ve dar yetki korunur. Config/desired schema 4, IPC/runtime 3, journal 3 öneriliyor; eski V2 plan/hash dondurulmuş decoder ile yalnız exact cleanup, modern activation öncesi temizlik ve yeniden yetkilendirme.
 - `Direct` ana hattır; gerçek OS-bypass diye sunulmayacak. Etkin `10.65.201.0/24 → Ethernet` varsa bu açık bir eşleşmedir: sessiz silme/bypass değil, çakışma önizlemesi ve kullanıcının düzenleme/devre dışı bırakma/açık onayı gerekir. Eski mark/NAT uygulanmış socket'lerin kesintisiz taşınacağı iddia edilmez; yeni bağlantı ile doğrulama şart.
 - Bu turda yalnız dokümantasyon yazıldı; uygulama testleri yeniden çalıştırılmadı. `git diff --check` ve yeni belgenin staged diff kontrolü geçti; kaynak incelemesi global output fallback, foreign reject, global guard ve exact rollback riskini doğruladı. Önceki 451 passed/1 failed/2 ignored ve diğer doğrulamalar tarihsel, bu tasarımın uygulandığına kanıt değil.
@@ -51,7 +51,7 @@ Yerel köprü sorunu için `systematic-debugging`, `test-driven-development`; ta
 ## En son kayıt — CIDR ve mükerrer kurallar (22 Ekim 2026)
 
 - Kullanıcı `10.65.201.0/24` girişi ve uygulama/kernel tarafında mükerrer kayıtların engellenmesini istedi; kaynak + normalize hedef + eylem/lane tanımını onayladı. Ticari analiz talebinin yerine bu uygulama işi geçti.
-- Başlangıç: temiz `main`, HEAD `f492062` (`add handoff.md`), origin ile aynı. Bu turdaki değişiklikler commit edilmedi; alt ajan/worktree kullanılmadı. AGENTS.md değiştirilmedi. Bu dosya artık Git takibinde; aşağıdaki eski ignore uyarısı tarihsel.
+- Başlangıç: temiz `main`, HEAD `ae518c8` (`add handoff.md`), origin ile aynı. Bu turdaki değişiklikler commit edilmedi; alt ajan/worktree kullanılmadı. AGENTS.md değiştirilmedi. Bu dosya artık Git takibinde; aşağıdaki eski ignore uyarısı tarihsel.
 - CIDR zaten destekleniyordu; artık editor ve planner host bitlerini sıfırlıyor (`10.65.201.25/24` → `10.65.201.0/24`). IP ile `/32` veya `/128` karşılığı, domain case/son nokta farkı mükerrerlik kontrolünde eşdeğer. ID/öncelik/aktiflik farkı yeni kural sayılmaz. Farklı kaynak, eylem/lane veya yalnız örtüşen farklı ağlar korunuyor; düzenleme kendisini dışlıyor.
 - `src/domain/{rule,profile}.rs`: tipli eşdeğerlik anahtarı ve ortak profil doğrulaması. Uygulama seçiminde executable/include_children esas; launcher/desktop alias metadata'sı aynı süreç kuralını ikinci kez tanımlayamaz. `src/ui/rule_editor.rs` ve `i18n.rs`: kaydetmeden önce TR/EN uyarı. Config ve CLI aynı domain doğrulamasını kullanıyor.
 - `src/backend/{plan,planner}.rs`: DNS alias'ları aynı aile/hedef/eyleme derlenirse ilk eşleşmeyi koruyarak tek verdict üret; kayıtlı mantıksal kuralları silme. `privileged.rs`: yalnız yeni ApplyPlan/backend.apply girişlerinde mükerrer derlenmiş planı kernel komutundan önce reddet. Eski journal decoder'ına daha katı kontrol eklenmedi; eski mükerrer içeren committed journal'ın exact cleanup regresyonu geçti.
@@ -79,9 +79,9 @@ Bu yeni davranışın kernel kabulü gerekirse yalnız yetkilendirilmiş disposa
 ## En son kayıt — hafıza güncellemesi (15 Ekim 2026)
 
 - Kullanıcının son isteği son yapılanların hatırlanmasıdır; bu turda yalnız bu belge güncellendi. Yeni kod, paket kurulumu, VM işlemi veya canlı ağ değişikliği yapılmadı.
-- Başlangıç HEAD'i `d645f44e57d66c17eef44b571d6b92913436a453` (`add AGENTS, CLAUDE`). `rtk git status --short --branch` çıktısında `main...origin/main` ve temiz çalışma ağacı görüldü. Aşağıdaki oturum 3'teki kirli baseline bilgisi artık güncel değildir: kalan değişiklikler bu commit'e alınmış.
+- Başlangıç HEAD'i `6d0bf080a50c9823a335557127835d0c8b489d35` (`add AGENTS, CLAUDE`). `rtk git status --short --branch` çıktısında `main...origin/main` ve temiz çalışma ağacı görüldü. Aşağıdaki oturum 3'teki kirli baseline bilgisi artık güncel değildir: kalan değişiklikler bu commit'e alınmış.
 - 12 görevin uygulanmış olması bütün yayın kapılarının geçtiği anlamına gelmez. Güncel kabul kaynağı `docs/primary-failover-verification.md` dosyasıdır. Ubuntu 22.04/24.04 kayıtlarında iki root modunda temiz 18/18 var; Ubuntu 26.04'te sayaç/verim eşiği kaynaklı aralıklı başarısızlıklar var, bu satır temiz PASS değil.
-- Son runtime düzeltmesi `b34ac27` yalnız rootless testlerle doğrulanmış. Eski VM sonuçları veya 433 testlik tarihsel kayıt, güncel HEAD'in yeniden doğrulandığı şeklinde sunulmamalı. Bu hafıza güncellemesinde testler yeniden çalıştırılmadı.
+- Son runtime düzeltmesi `6a0994f` yalnız rootless testlerle doğrulanmış. Eski VM sonuçları veya 433 testlik tarihsel kayıt, güncel HEAD'in yeniden doğrulandığı şeklinde sunulmamalı. Bu hafıza güncellemesinde testler yeniden çalıştırılmadı.
 - Debian 12/13, Fedora 43/44 gerçek kurulum/kernel/Polkit, tüm aarch64 satırları, etkileşimli Polkit ajanı, dağıtımlarda GTK açılışı, firewalld/SELinux ve CI matrisi hâlâ NOT VERIFIED. Fedora container'ında RPM üretmek bunların yerine geçmez.
 - Devralan kişi önce bu bölümü ve doğrulama kaydını okumalı. Eski Task 6'dan tekrar başlamamalı; §1–9 tarihsel oturum 1 notlarıdır. Sıradaki teknik iş, yeni kullanıcı talebi doğrultusunda Ubuntu 26.04 aralıklı testlerini teşhis etmek veya eksik dağıtım/architecture kabul altyapısını hazırlamaktır; yeni VM/host yetkilerini önce kapsamla eşleştir.
 - Devir kaydını güncellerken her komutu yığmak yerine önemli kararları, commit'i, gerçekten çalıştırılmış doğrulamaları, açık riskleri ve bir sonraki dar adımı kaydet. AGENTS.md bu turda değiştirilmedi.
@@ -99,10 +99,10 @@ Bu bölümün altındaki eski oturum durumları, bu güncel kayıtla çeliştikl
 
 ## 0. Güncel durum (oturum 3, 15 Ekim 2026 — önce bunu oku)
 
-- **Planın 12 görevi uygulandı** (main, inline). Task 6–10 commit'leri: `7ad1766`, `b4e82f5`, `46f1e9a`, `98159b6`, `d336502`, `bb8667a`, `be9982b`, `9d3b49d`.
-- **Task 11:** `33aa274` (carrier kaybında `linkdown` route'larla failover), `18eb413` (kernel kabulü + gerçek system-bus/Polkit betiği `tests/root/system_bus_acceptance.sh`, `docs/primary-failover-verification.md`).
-- **Task 12:** `7a89648` (kullanıcının paketleme güvenilirlik hunk'ları, kullanıcı onayıyla ayrı commit), `d8949e7` (nft 1.0.2/1.1.6 dump uyumu), `333c323` (rpm, paket sözleşmesi, `polkitd | policykit-1`, Ubuntu matrisi).
-- **Son inceleme (self-review, alt ajan yok):** `0203fab` başarısız geçişin kendi rollback bildirimleriyle sonsuz tekrarını ve tutulan journal’ın sürekli replay’ini üstel beklemeyle durdurdu; `b34ac27` tekrar başarısız kurtarmanın Degraded durumunu ve sonraki deneme zamanlayıcısını kaybetmemesini sağladı. 26.04’te sayaç tabanlı iki testte aralıklı hata var (doğrulama belgesi).
+- **Planın 12 görevi uygulandı** (main, inline). Task 6–10 commit'leri: `0ea197b`, `d602642`, `8b8c6bd`, `490ad13`, `68e17f5`, `725e48e`, `500df8b`, `3007a1c`.
+- **Task 11:** `547ced5` (carrier kaybında `linkdown` route'larla failover), `be6faa4` (kernel kabulü + gerçek system-bus/Polkit betiği `tests/root/system_bus_acceptance.sh`, `docs/primary-failover-verification.md`).
+- **Task 12:** `65dd39f` (kullanıcının paketleme güvenilirlik hunk'ları, kullanıcı onayıyla ayrı commit), `3ed607e` (nft 1.0.2/1.1.6 dump uyumu), `9546a18` (rpm, paket sözleşmesi, `polkitd | policykit-1`, Ubuntu matrisi).
+- **Son inceleme (self-review, alt ajan yok):** `d1583de` başarısız geçişin kendi rollback bildirimleriyle sonsuz tekrarını ve tutulan journal’ın sürekli replay’ini üstel beklemeyle durdurdu; `6a0994f` tekrar başarısız kurtarmanın Degraded durumunu ve sonraki deneme zamanlayıcısını kaybetmemesini sağladı. 26.04’te sayaç tabanlı iki testte aralıklı hata var (doğrulama belgesi).
 - **Kanıt:** Ubuntu 22.04/24.04/26.04 (x86_64) root süiti iki modda 18/18, system bus + silahlı yükseltme, reboot ve kaldırma PASS. Fedora rpm yalnız container'da üretildi.
 - **Yayın kapısı AÇIK DEĞİL:** Debian 12/13, Fedora 43/44, aarch64, etkileşimli Polkit ajanı, GTK'nın dağıtımlarda başlatılması, firewalld/SELinux, CI matrisi NOT VERIFIED.
 - **VM'ler:** onaylı test VM'i `routelane-test-u2404-20261014` duruyor; `routelane-test-u2204-20261015` ve `routelane-test-u2604-20261015` bu oturumda kullanıcı onayıyla açıldı ve iş bitince silindi.
@@ -119,7 +119,7 @@ Son kullanıcı talebi geliştirmeyi sürdürmek değil, `AGENTS.md` ve bu devir
 Çalışma dizini: RouteLane deposunun kökü. Dal: `main`; bu belgenin hazırlanmasında `origin/main` karşısında 11 commit ilerideydi. HEAD:
 
 ```text
-a14fffd6a5d1f6e09d923995a9a4f9e9721ec45e
+9fe6e0162eab89feb865938b9e2babdde48dc517
 ```
 
 Kullanıcı önceki uygulamada **main üzerinde, inline; yeni worktree ve alt ajan olmadan** ilerlemeyi seçti. Bağımsız inceleme yapılmış gibi raporlama. Multipass'ta ayrı test VM'i kullanımı onaylı; host kurulumu/canlı ağ mutasyonu için bu onayı genelleme.
@@ -155,14 +155,14 @@ Domain kuralları şu anda uygulama anındaki sistem resolver IP snapshot'una da
 
 | Commit | Teslim edilen parça |
 | --- | --- |
-| `d64cb96` | Ana bağlantı/failover tasarımı |
-| `fd2e705` | 12 adımlı uygulama planı |
-| `545d1d3` | Task 1: ConfigV3, routing policy, eski kayıt migrasyonu |
-| `aa29c4d` | Task 2: gözlenen topology, sistem default'u/owned route ayrımı |
-| `4ad41a4` | Task 3: deterministik aile bazlı failover/failback seçici |
-| `6c1a249` | Task 4: explicit primary/source/identity planner modeli |
-| `6d25b6a` | Kernel-canonical nft reject ifadeleri; exact ownership düzeltmesi |
-| `a14fffd` | Task 5: ortak nft JSON/text semantiği, akış bağlılığı, dar kaynak düzeltmesi |
+| `00e071f` | Ana bağlantı/failover tasarımı |
+| `54102dd` | 12 adımlı uygulama planı |
+| `57471c3` | Task 1: ConfigV3, routing policy, eski kayıt migrasyonu |
+| `254d69a` | Task 2: gözlenen topology, sistem default'u/owned route ayrımı |
+| `a2415b6` | Task 3: deterministik aile bazlı failover/failback seçici |
+| `af1bf23` | Task 4: explicit primary/source/identity planner modeli |
+| `59f3886` | Kernel-canonical nft reject ifadeleri; exact ownership düzeltmesi |
+| `9fe6e01` | Task 5: ortak nft JSON/text semantiği, akış bağlılığı, dar kaynak düzeltmesi |
 
 Task 5 öncesi kernel kanıtı: A lane'i doğru mark alırken ARP isteği B'nin `10.10.2.2` kaynağıyla çıkıyordu; cevap yoktu. Düzeltilmiş disposable VM testinde A kaynağı `10.10.1.2` oldu ve cevap alındı. Mark-only route relookup kaynak adresi tek başına düzeltmiyor.
 
@@ -228,7 +228,7 @@ Guest çalışma dosyaları `/home/ubuntu/` altında: `routelane-root-baseline`,
 
 **Önemli build tuzağı:** `cargo test --all-targets`, `target/debug/routelane-helper` dosyasını root-integration özelliği olmayan binary ile değiştirebilir. Feature'lı helper'ı root tests ile seri olarak yeniden derle ve hemen guest'e aktar; taşınan artifact kimliğini doğrula. Test stdio yolu gerçek system-bus/Polkit yetkilendirme testi değildir; bypass'u üretime taşıma.
 
-Frozen eski nft fixture: `tests/fixtures/nftables/legacy-primary-baseline.nft`, kaynak `aa29c4d`, SHA256 `f581c1775f73d2742a70bea46a68343a26e5bac0260eaf16db9e753203fbe2a3`.
+Frozen eski nft fixture: `tests/fixtures/nftables/legacy-primary-baseline.nft`, kaynak `254d69a`, SHA256 `f581c1775f73d2742a70bea46a68343a26e5bac0260eaf16db9e753203fbe2a3`.
 
 ## 8. Sıradaki uygulama adımları ve kabul sınırı
 
