@@ -1066,7 +1066,11 @@ where
             }
         };
 
-        if inspected.diagnostics.iter().any(|d| d.starts_with("DAEMON_LEGACY_CLEANUP_REQUIRED:")) {
+        if inspected
+            .diagnostics
+            .iter()
+            .any(|d| d.starts_with("DAEMON_LEGACY_CLEANUP_REQUIRED:"))
+        {
             return self.record_reconciliation_drift_with_code(None,
                 "DAEMON_LEGACY_CLEANUP_REQUIRED",
                 "validated legacy RouteLane state requires authorized cleanup before activation").await;

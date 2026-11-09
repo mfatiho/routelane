@@ -37,8 +37,7 @@ pub use plan::{
 pub use planner::{compile_profile, compile_profile_with_primary, Capability, PlanError};
 pub use policy_route::{
     build_policy_commands, install_steps, lane_unicast_route, retire_steps, transition_steps,
-    CommandSpec, IpFamily, OwnedRoute, Program, RoutingStep, TERMINAL_ROUTE_METRIC,
-    RoutingPlan,
+    CommandSpec, IpFamily, OwnedRoute, Program, RoutingPlan, RoutingStep, TERMINAL_ROUTE_METRIC,
 };
 pub use primary::{FamilyExit, FamilyPair, PrimaryDecision, PrimarySelector};
 pub use privileged::{

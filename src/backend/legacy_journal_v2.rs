@@ -90,6 +90,8 @@ impl LegacyPlanV2 {
         PlanHash::of_bytes(&canonical)
     }
 
+    /// Frozen marker derivation, kept to pin the captured evidence in tests.
+    #[cfg(test)]
     pub fn state_chain_name(&self) -> String {
         let encoded = serde_json::to_vec(&self.content_hash()).expect("legacy hash encoding");
         format!(
@@ -101,7 +103,9 @@ impl LegacyPlanV2 {
 }
 
 impl super::RoutingPlan for LegacyPlanV2 {
-    fn lanes(&self) -> &[LanePlan] { &self.lanes }
+    fn lanes(&self) -> &[LanePlan] {
+        &self.lanes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

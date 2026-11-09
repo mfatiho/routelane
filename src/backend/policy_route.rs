@@ -9,7 +9,9 @@ pub trait RoutingPlan {
 }
 
 impl RoutingPlan for KernelPlan {
-    fn lanes(&self) -> &[LanePlan] { &self.lanes }
+    fn lanes(&self) -> &[LanePlan] {
+        &self.lanes
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

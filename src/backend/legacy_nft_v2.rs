@@ -1,10 +1,12 @@
 //! Frozen pre-selective NFT renderer (0ec1661), ownership proof only.
 //! Never edit this to follow modern policy; never use it to activate routing.
+use super::legacy_journal_v2::LegacyPlanV2 as KernelPlan;
+use super::{
+    CompiledAction, CompiledRule, CompiledTarget, FamilyExit, IpFamily, LaneAvailability, LanePlan,
+    MARK_BASE, MARK_MAX,
+};
 use ipnet::IpNet;
 use serde_json::{json, Value};
-use super::{CompiledAction, CompiledRule, CompiledTarget, FamilyExit, IpFamily,
-    LaneAvailability, LanePlan, MARK_BASE, MARK_MAX};
-use super::legacy_journal_v2::LegacyPlanV2 as KernelPlan;
 const POLICY_SEAL_PREFIX: &str = "rules_v2_";
 
 pub(super) fn normalize_nft_document(value: &mut Value) {

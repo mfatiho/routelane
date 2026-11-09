@@ -21,13 +21,13 @@ use crate::domain::{LaneId, RuleId};
 use super::interface_settings::{InterfaceSettingReceipt, MarkAwareRpf, MarkAwareRpfBackend};
 use super::legacy_journal::{legacy_nft_fingerprint, LegacyJournalV1};
 use super::legacy_journal_v2::{LegacyJournalV2, LegacyPlanV2};
-use super::RoutingPlan;
 use super::runtime::{
     policy_hash, restrict_to_grant, RuntimeActivation, RuntimeApplyResponse, RuntimeEnvironment,
     RuntimeGrant, RuntimePhase, RuntimeRecord, RuntimeRestoreReceipt, RuntimeStatus,
     RUNTIME_PROTOCOL_VERSION,
 };
 use super::transaction::restore_plan as restore_kernel_plan;
+use super::RoutingPlan;
 use super::{
     apply_plan as apply_kernel_plan, build_snapshot_commands, detect_resource_conflicts,
     detect_resource_conflicts_for_update, install_steps, retire_steps, transition_steps,
@@ -1214,7 +1214,9 @@ where
 
     fn refuse_legacy_activation(&self) -> Result<(), PrivilegedError> {
         if self.legacy_v2.is_some() {
-            return Err(PrivilegedError::new("a schema-2 RouteLane journal requires authorized cleanup before activation"));
+            return Err(PrivilegedError::new(
+                "a schema-2 RouteLane journal requires authorized cleanup before activation",
+            ));
         }
         if self.legacy.is_some() {
             return Err(PrivilegedError::new(
@@ -1225,9 +1227,14 @@ where
     }
 
     fn adopt_legacy_v2(&mut self, record: StoredAppliedState) -> Result<(), PrivilegedError> {
-        let envelope = StoredAppliedState { legacy_v2: record.legacy_v2.clone(), ..StoredAppliedState::default() };
+        let envelope = StoredAppliedState {
+            legacy_v2: record.legacy_v2.clone(),
+            ..StoredAppliedState::default()
+        };
         if record != envelope {
-            return Err(PrivilegedError::new("a schema-2 journal cannot carry current-schema state"));
+            return Err(PrivilegedError::new(
+                "a schema-2 journal cannot carry current-schema state",
+            ));
         }
         self.current = None;
         self.current_nft_fingerprint = None;
@@ -1245,54 +1252,100 @@ where
     fn cleanup_legacy_v2(&mut self) -> Result<CleanupResponse, PrivilegedError> {
         let mut legacy = self.legacy_v2.clone().expect("legacy v2 cleanup record");
         if let Some(v1) = legacy.legacy_v1.clone() {
-            if legacy.active.is_some() || legacy.pending.is_some() || legacy.orphan_cleanup.is_some() {
-                return Err(PrivilegedError::new("mixed schema-1/schema-2 ownership cannot be cleaned"));
+            if legacy.active.is_some()
+                || legacy.pending.is_some()
+                || legacy.orphan_cleanup.is_some()
+            {
+                return Err(PrivilegedError::new(
+                    "mixed schema-1/schema-2 ownership cannot be cleaned",
+                ));
             }
-            self.store.save(&StoredAppliedState { legacy_v1: Some(v1.clone()), ..StoredAppliedState::default() })?;
+            self.store.save(&StoredAppliedState {
+                legacy_v1: Some(v1.clone()),
+                ..StoredAppliedState::default()
+            })?;
             self.legacy_v2 = None;
             self.legacy = Some(v1);
             return self.cleanup_legacy();
         }
         if legacy.orphan_cleanup.is_some() {
-            return Err(PrivilegedError::new("schema-2 orphan recovery needs exact legacy proof; resources were left untouched"));
+            return Err(PrivilegedError::new(
+                "schema-2 orphan recovery needs exact legacy proof; resources were left untouched",
+            ));
         }
         validate_legacy_v2_evidence(&legacy)?;
         for plan in legacy.active.iter().chain(legacy.pending.iter()) {
             for lane in &plan.lanes {
                 if let Some(identity) = &lane.identity {
                     if self.settings.identity(&identity.name)? != *identity {
-                        return Err(PrivilegedError::new("schema-2 interface identity changed; refusing cleanup"));
+                        return Err(PrivilegedError::new(
+                            "schema-2 interface identity changed; refusing cleanup",
+                        ));
                     }
                 }
             }
         }
         verify_legacy_v2_live(&mut self.executor, &legacy)?;
+        if legacy.active.is_none()
+            && legacy.pending.is_none()
+            && legacy.interface_settings.is_empty()
+            && legacy.pending_interface_settings.is_empty()
+        {
+            // Nothing was owned: forget the record without any kernel command.
+            self.store.clear()?;
+            self.legacy_v2 = None;
+            self.runtime = None;
+            self.runtime_restore = None;
+            return Ok(CleanupResponse {
+                cleaned: false,
+                diagnostics: vec![],
+            });
+        }
         // This intent precedes every deletion. Reads/refresh never resume it.
         legacy.cleanup_pending = true;
-        self.store.save(&StoredAppliedState { legacy_v2: Some(legacy.clone()), ..StoredAppliedState::default() })?;
+        self.store.save(&StoredAppliedState {
+            legacy_v2: Some(legacy.clone()),
+            ..StoredAppliedState::default()
+        })?;
         self.legacy_v2 = Some(legacy.clone());
         self.runtime = None;
         self.runtime_restore = None;
         let plans = || legacy.active.iter().chain(legacy.pending.iter());
-        for step in rollback_rule_order(plans()).into_iter().chain(rollback_table_order(plans())) {
+        for step in rollback_rule_order(plans())
+            .into_iter()
+            .chain(rollback_table_order(plans()))
+        {
             // Revalidate before every step; a foreign addition never becomes ours.
             verify_legacy_v2_live(&mut self.executor, &legacy)?;
-            run_routing_step(&mut self.executor, &step, "remove exact schema-2 RouteLane resource")
-                .map_err(|error| PrivilegedError::new(error.to_string()))?;
+            run_routing_step(
+                &mut self.executor,
+                &step,
+                "remove exact schema-2 RouteLane resource",
+            )
+            .map_err(|error| PrivilegedError::new(error.to_string()))?;
         }
         if verify_legacy_v2_live(&mut self.executor, &legacy)? {
-            run_nft_batch(&mut self.executor, b"delete table inet routelane\n".to_vec(), "delete exact schema-2 RouteLane nftables table")
-                .map_err(|error| PrivilegedError::new(error.to_string()))?;
+            run_nft_batch(
+                &mut self.executor,
+                b"delete table inet routelane\n".to_vec(),
+                "delete exact schema-2 RouteLane nftables table",
+            )
+            .map_err(|error| PrivilegedError::new(error.to_string()))?;
         }
         verify_exact_kernel_state(&mut self.executor, None, None)?;
         let mut receipts = legacy.interface_settings.clone();
         for receipt in &legacy.pending_interface_settings {
-            if !receipts.iter().any(|r| r.identity == receipt.identity) { receipts.push(receipt.clone()); }
+            if !receipts.iter().any(|r| r.identity == receipt.identity) {
+                receipts.push(receipt.clone());
+            }
         }
         let diagnostics = restore_setting_receipts(&mut *self.settings, &receipts);
         self.store.clear()?;
         self.legacy_v2 = None;
-        Ok(CleanupResponse { cleaned: true, diagnostics })
+        Ok(CleanupResponse {
+            cleaned: true,
+            diagnostics,
+        })
     }
 
     /// Removes exactly what a schema-1 helper proved it owned. The record is
@@ -1972,7 +2025,9 @@ where
         if self.legacy_v2.is_some() {
             return RuntimeStatus {
                 phase: RuntimePhase::NeedsReauthorization,
-                last_error: Some("schema-2 ownership requires authorized cleanup before activation".into()),
+                last_error: Some(
+                    "schema-2 ownership requires authorized cleanup before activation".into(),
+                ),
                 ..RuntimeStatus::default()
             };
         }
@@ -2605,21 +2660,31 @@ fn validate_setting_receipts(record: &StoredAppliedState) -> Result<(), Privileg
     Ok(())
 }
 
-fn legacy_v2_basis(plan: &LegacyPlanV2, lost: &BTreeSet<(u8,u32)>) -> LegacyPlanV2 {
+fn legacy_v2_basis(plan: &LegacyPlanV2, lost: &BTreeSet<(u8, u32)>) -> LegacyPlanV2 {
     let mut basis = plan.clone();
     for lane in &mut basis.lanes {
-        if lost.contains(&(4, lane.table)) { lane.route_v4 = None; }
-        if lost.contains(&(6, lane.table)) { lane.route_v6 = None; }
+        if lost.contains(&(4, lane.table)) {
+            lane.route_v4 = None;
+        }
+        if lost.contains(&(6, lane.table)) {
+            lane.route_v6 = None;
+        }
     }
     basis
 }
 
-fn legacy_v2_expected_nft(active: Option<&LegacyPlanV2>, pending: Option<&LegacyPlanV2>, guard: bool) -> Result<String,PrivilegedError> {
-    nft_document_fingerprint(&super::legacy_nft_v2::render_nft_document(active, pending, guard))
-        .map_err(|e| PrivilegedError::new(e.to_string()))
+fn legacy_v2_expected_nft(
+    active: Option<&LegacyPlanV2>,
+    pending: Option<&LegacyPlanV2>,
+    guard: bool,
+) -> Result<String, PrivilegedError> {
+    nft_document_fingerprint(&super::legacy_nft_v2::render_nft_document(
+        active, pending, guard,
+    ))
+    .map_err(|e| PrivilegedError::new(e.to_string()))
 }
 
-fn validate_legacy_v2_evidence(record: &LegacyJournalV2) -> Result<(),PrivilegedError> {
+fn validate_legacy_v2_evidence(record: &LegacyJournalV2) -> Result<(), PrivilegedError> {
     for plan in record.active.iter().chain(record.pending.iter()) {
         if plan.generation == 0 || plan.lanes.len() > 100 {
             return Err(PrivilegedError::new("invalid schema-2 plan bounds"));
@@ -2627,72 +2692,149 @@ fn validate_legacy_v2_evidence(record: &LegacyJournalV2) -> Result<(),Privileged
         let mut ids = BTreeSet::new();
         let mut tables = BTreeSet::new();
         for lane in &plan.lanes {
-            let slot = lane.table.checked_sub(TABLE_BASE).filter(|slot| *slot < 100)
-                .ok_or_else(||PrivilegedError::new("invalid schema-2 reserved table"))?;
-            if !tables.insert(lane.table) || lane.mark != MARK_BASE + slot
-                || lane.rule_priority != RULE_PRIORITY_BASE + slot || !ids.insert(&lane.id)
-                || !is_kernel_interface_name(&lane.interface) {
+            let slot = lane
+                .table
+                .checked_sub(TABLE_BASE)
+                .filter(|slot| *slot < 100)
+                .ok_or_else(|| PrivilegedError::new("invalid schema-2 reserved table"))?;
+            if !tables.insert(lane.table)
+                || lane.mark != MARK_BASE + slot
+                || lane.rule_priority != RULE_PRIORITY_BASE + slot
+                || !ids.insert(&lane.id)
+                || !is_kernel_interface_name(&lane.interface)
+            {
                 return Err(PrivilegedError::new("invalid schema-2 reserved lane tuple"));
             }
         }
     }
     match (&record.active, &record.active_nft_fingerprint) {
-        (Some(_),Some(fp)) if *fp == legacy_v2_expected_nft(record.active.as_ref(),None,false)? => {},
-        (None,None) => {},
-        _ => return Err(PrivilegedError::new("schema-2 committed fingerprint does not match frozen policy")),
+        (Some(_), Some(fp))
+            if *fp == legacy_v2_expected_nft(record.active.as_ref(), None, false)? => {}
+        (None, None) => {}
+        _ => {
+            return Err(PrivilegedError::new(
+                "schema-2 committed fingerprint does not match frozen policy",
+            ))
+        }
     }
     match (&record.pending, &record.pending_expectations) {
-        (None,None) => {},
-        (Some(pending),Some(e)) => {
-            let basis = record.active.as_ref().map(|p|legacy_v2_basis(p,&e.lost_unicast));
-            let encoded = serde_json::to_vec(&(ROUTING_CRASH_MODEL_VERSION,
-                basis.as_ref().map(LegacyPlanV2::content_hash), pending.content_hash()))
-                .map_err(|err| PrivilegedError::new(err.to_string()))?;
-            if e.guard_nft_fingerprint != legacy_v2_expected_nft(record.active.as_ref(),Some(pending),true)?
-                || e.guardless_transaction_nft_fingerprint != legacy_v2_expected_nft(record.active.as_ref(),Some(pending),false)?
-                || e.activated_nft_fingerprint != legacy_v2_expected_nft(Some(pending),None,true)?
-                || e.committed_nft_fingerprint != legacy_v2_expected_nft(Some(pending),None,false)?
-                || e.committed_routing_fingerprint != routing_ownership_fingerprint(&plan_routing_ownership(pending))?
-                || e.routing_model_fingerprint != blake3::hash(&encoded).to_hex().as_str() {
-                return Err(PrivilegedError::new("schema-2 pending expectations do not match frozen policy"));
+        (None, None) => {}
+        (Some(pending), Some(e)) => {
+            let basis = record
+                .active
+                .as_ref()
+                .map(|p| legacy_v2_basis(p, &e.lost_unicast));
+            let encoded = serde_json::to_vec(&(
+                ROUTING_CRASH_MODEL_VERSION,
+                basis.as_ref().map(LegacyPlanV2::content_hash),
+                pending.content_hash(),
+            ))
+            .map_err(|err| PrivilegedError::new(err.to_string()))?;
+            if e.guard_nft_fingerprint
+                != legacy_v2_expected_nft(record.active.as_ref(), Some(pending), true)?
+                || e.guardless_transaction_nft_fingerprint
+                    != legacy_v2_expected_nft(record.active.as_ref(), Some(pending), false)?
+                || e.activated_nft_fingerprint != legacy_v2_expected_nft(Some(pending), None, true)?
+                || e.committed_nft_fingerprint
+                    != legacy_v2_expected_nft(Some(pending), None, false)?
+                || e.committed_routing_fingerprint
+                    != routing_ownership_fingerprint(&plan_routing_ownership(pending))?
+                || e.routing_model_fingerprint != blake3::hash(&encoded).to_hex().as_str()
+            {
+                return Err(PrivilegedError::new(
+                    "schema-2 pending expectations do not match frozen policy",
+                ));
             }
-        },
-        _ => return Err(PrivilegedError::new("schema-2 pending plan/expectations are incomplete")),
+        }
+        _ => {
+            return Err(PrivilegedError::new(
+                "schema-2 pending plan/expectations are incomplete",
+            ))
+        }
     }
     Ok(())
 }
 
-fn verify_legacy_v2_live(executor: &mut impl CommandExecutor, record: &LegacyJournalV2) -> Result<bool,PrivilegedError> {
-    let captured = capture_snapshot(executor).map_err(|e|PrivilegedError::new(e.to_string()))?;
+fn verify_legacy_v2_live(
+    executor: &mut impl CommandExecutor,
+    record: &LegacyJournalV2,
+) -> Result<bool, PrivilegedError> {
+    let captured = capture_snapshot(executor).map_err(|e| PrivilegedError::new(e.to_string()))?;
     let live = live_routing_ownership(&captured)?;
-    let present = captured.snapshot.has_nft_table("inet","routelane");
-    if !present && record.cleanup_pending && live == RoutingOwnership::default() { return Ok(false); }
-    let fingerprint = if present { Some(live_nft_fingerprint(executor).map_err(|e|PrivilegedError::new(e.to_string()))?) } else { None };
-    let mut phase = if fingerprint.as_ref() == record.active_nft_fingerprint.as_ref() && fingerprint.is_some() {
-        Some(PendingNftPhase::Untouched)
-    } else { None };
-    if let Some(e) = &record.pending_expectations {
-        for (fp,p) in [(&e.guard_nft_fingerprint,PendingNftPhase::Guard),
-            (&e.guardless_transaction_nft_fingerprint,PendingNftPhase::GuardlessTransaction),
-            (&e.activated_nft_fingerprint,PendingNftPhase::Activated),
-            (&e.committed_nft_fingerprint,PendingNftPhase::Committed)] {
-            if fingerprint.as_ref() == Some(fp) { phase = Some(p); }
-        }
-        if fingerprint.is_none() { phase = Some(PendingNftPhase::RollbackAbsent); }
+    let present = captured.snapshot.has_nft_table("inet", "routelane");
+    if !present && record.cleanup_pending && live == RoutingOwnership::default() {
+        return Ok(false);
     }
-    let phase = phase.ok_or_else(||PrivilegedError::new("schema-2 journal does not exactly own the live nftables state"))?;
+    // A record that owns nothing proves nothing: an absent table and no
+    // reserved routing is consistent; anything live is not ours to adopt.
+    if record.active.is_none() && record.pending.is_none() {
+        if !present && live == RoutingOwnership::default() {
+            return Ok(false);
+        }
+        return Err(PrivilegedError::new("schema-2 journal owns no plan, but RouteLane resources are live; refusing to adopt them"));
+    }
+    let fingerprint = if present {
+        Some(live_nft_fingerprint(executor).map_err(|e| PrivilegedError::new(e.to_string()))?)
+    } else {
+        None
+    };
+    let mut phase = if fingerprint.as_ref() == record.active_nft_fingerprint.as_ref()
+        && fingerprint.is_some()
+    {
+        Some(PendingNftPhase::Untouched)
+    } else {
+        None
+    };
+    if let Some(e) = &record.pending_expectations {
+        for (fp, p) in [
+            (&e.guard_nft_fingerprint, PendingNftPhase::Guard),
+            (
+                &e.guardless_transaction_nft_fingerprint,
+                PendingNftPhase::GuardlessTransaction,
+            ),
+            (&e.activated_nft_fingerprint, PendingNftPhase::Activated),
+            (&e.committed_nft_fingerprint, PendingNftPhase::Committed),
+        ] {
+            if fingerprint.as_ref() == Some(fp) {
+                phase = Some(p);
+            }
+        }
+        if fingerprint.is_none() {
+            phase = Some(PendingNftPhase::RollbackAbsent);
+        }
+    }
+    let phase = phase.ok_or_else(|| {
+        PrivilegedError::new("schema-2 journal does not exactly own the live nftables state")
+    })?;
     let valid = if let Some(pending) = &record.pending {
-        let lost = &record.pending_expectations.as_ref().expect("validated pending expectations").lost_unicast;
-        let active = record.active.as_ref().map(|p|legacy_v2_basis(p,lost));
+        let lost = &record
+            .pending_expectations
+            .as_ref()
+            .expect("validated pending expectations")
+            .lost_unicast;
+        let active = record.active.as_ref().map(|p| legacy_v2_basis(p, lost));
         if phase == PendingNftPhase::RollbackAbsent && record.cleanup_pending {
-            build_absent_rollback_states(active.as_ref()).iter().any(|state| *state == live
-                || rollback_prefix_reaches(state,active.as_ref(),pending,&live))
-        } else { routing_state_reachable_for_phase(&live,active.as_ref(),pending,phase)? }
+            build_absent_rollback_states(active.as_ref())
+                .iter()
+                .any(|state| {
+                    *state == live
+                        || rollback_prefix_reaches(state, active.as_ref(), pending, &live)
+                })
+        } else {
+            routing_state_reachable_for_phase(&live, active.as_ref(), pending, phase)?
+        }
     } else if let Some(active) = &record.active {
         let initial = plan_routing_ownership(active);
-        live == initial || (record.cleanup_pending && rollback_prefix_reaches(&initial,None,active,&live))
-    } else { live == RoutingOwnership::default() };
-    if !valid { return Err(PrivilegedError::new("schema-2 cleanup is outside an exact owned command prefix")); }
+        live == initial
+            || (record.cleanup_pending && rollback_prefix_reaches(&initial, None, active, &live))
+    } else {
+        live == RoutingOwnership::default()
+    };
+    if !valid {
+        return Err(PrivilegedError::new(
+            "schema-2 cleanup is outside an exact owned command prefix",
+        ));
+    }
     Ok(present)
 }
 
@@ -3620,7 +3762,9 @@ fn build_forward_routing_states<P: RoutingPlan>(
 }
 
 /// Rules a rollback removes, in the exact order `restore` removes them.
-fn rollback_rule_order<'a, P: RoutingPlan + 'a>(plans: impl IntoIterator<Item = &'a P>) -> Vec<RoutingStep> {
+fn rollback_rule_order<'a, P: RoutingPlan + 'a>(
+    plans: impl IntoIterator<Item = &'a P>,
+) -> Vec<RoutingStep> {
     let mut rules = Vec::new();
     for plan in plans {
         for step in install_steps(plan) {
@@ -3647,7 +3791,9 @@ fn rollback_rule_order<'a, P: RoutingPlan + 'a>(plans: impl IntoIterator<Item = 
 }
 
 /// Tables a rollback flushes, in the exact order `restore` flushes them.
-fn rollback_table_order<'a, P: RoutingPlan + 'a>(plans: impl IntoIterator<Item = &'a P>) -> Vec<RoutingStep> {
+fn rollback_table_order<'a, P: RoutingPlan + 'a>(
+    plans: impl IntoIterator<Item = &'a P>,
+) -> Vec<RoutingStep> {
     let mut tables = Vec::new();
     for plan in plans {
         for lane in plan.lanes() {
@@ -9167,13 +9313,20 @@ mod tests {
     #[test]
     fn journal_versions_are_explicit_and_strict() {
         let current = serde_json::to_vec(&StoredAppliedState::default()).unwrap();
-        assert!(String::from_utf8_lossy(&current).contains("\"journal_version\":2"));
+        assert!(String::from_utf8_lossy(&current).contains("\"journal_version\":3"));
         assert_eq!(
             super::decode_journal(&current).unwrap(),
             StoredAppliedState::default()
         );
+        // Schema 2 is read only into the frozen cleanup-only wrapper.
+        let schema2 = super::decode_journal(
+            br#"{"journal_version":2,"active":null,"active_nft_fingerprint":null,"pending":null,"restore_receipt":null}"#,
+        )
+        .unwrap();
+        assert!(schema2.legacy_v2.is_some());
+        assert!(schema2.active.is_none() && schema2.pending.is_none());
         let future =
-            br#"{"journal_version":3,"active":null,"active_nft_fingerprint":null,"pending":null}"#;
+            br#"{"journal_version":4,"active":null,"active_nft_fingerprint":null,"pending":null}"#;
         assert!(super::decode_journal(future).is_err());
         // An unversioned record carrying current-schema fields is not schema 1.
         let mut plan = serde_json::to_value(fixture_valid_plan()).unwrap();
@@ -9420,35 +9573,62 @@ mod tests {
         let fixture = RuntimeFixture::new();
         let record = super::decode_journal(bytes).expect("read frozen v2 journal for safe cleanup");
         *fixture.store.state.lock().unwrap() = Some(record);
-        let nft: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/legacy-v2/active-nft.json")).unwrap();
-        let evidence: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/legacy-v2/evidence.json")).unwrap();
+        let nft: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-v2/active-nft.json"
+        ))
+        .unwrap();
+        let evidence: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/legacy-v2/evidence.json"))
+                .unwrap();
         let mut kernel = fixture.kernel.lock().unwrap();
         kernel.has_table = true;
         kernel.marker = evidence["state_chain_name"].as_str().map(str::to_owned);
-        kernel.nft_objects = Some(nft["nftables"].as_array().unwrap().iter()
-            .filter(|o| !o.as_object().unwrap().is_empty()).cloned().collect());
+        kernel.nft_objects = Some(
+            nft["nftables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|o| !o.as_object().unwrap().is_empty())
+                .cloned()
+                .collect(),
+        );
         for route in evidence["routing"]["routes"].as_array().unwrap() {
-            let family = if route["family"] == 4 { IpFamily::V4 } else { IpFamily::V6 };
+            let family = if route["family"] == 4 {
+                IpFamily::V4
+            } else {
+                IpFamily::V6
+            };
             let mut object = serde_json::json!({"dst":"default","table":route["table"],"flags":[]});
             if route["terminal"] == true {
                 object["type"] = serde_json::json!("unreachable");
                 object["metric"] = serde_json::json!(TERMINAL_ROUTE_METRIC);
             } else {
                 object["dev"] = route["interface"].clone();
-                if !route["gateway"].is_null() { object["gateway"] = route["gateway"].clone(); }
-                if family == IpFamily::V6 { object["metric"] = serde_json::json!(1024); }
+                if !route["gateway"].is_null() {
+                    object["gateway"] = route["gateway"].clone();
+                }
+                if family == IpFamily::V6 {
+                    object["metric"] = serde_json::json!(1024);
+                }
             }
             kernel.extra_routes.push((family, object));
         }
         for rule in evidence["routing"]["rules"].as_array().unwrap() {
-            let family = if rule["family"] == 4 { IpFamily::V4 } else { IpFamily::V6 };
+            let family = if rule["family"] == 4 {
+                IpFamily::V4
+            } else {
+                IpFamily::V6
+            };
             // This executor represents the first IPv4 rule with its legacy flag.
             if family == IpFamily::V4 && rule["priority"] == 10000 {
                 kernel.has_rule = true;
                 continue;
             }
-            kernel.extra_rules.push((family, serde_json::json!({"src":"all","priority":rule["priority"],
-                "table":rule["table"],"fwmark":format!("{:#010x}",rule["mark"].as_u64().unwrap())})));
+            kernel.extra_rules.push((
+                family,
+                serde_json::json!({"src":"all","priority":rule["priority"],
+                "table":rule["table"],"fwmark":format!("{:#010x}",rule["mark"].as_u64().unwrap())}),
+            ));
         }
         drop(kernel);
         fixture.observe(&up());
@@ -9457,35 +9637,69 @@ mod tests {
 
     #[test]
     fn v2_inspect_and_refresh_never_mutate() {
-        for bytes in [include_bytes!("../../tests/fixtures/legacy-v2/committed.json").as_slice(),
+        for bytes in [
+            include_bytes!("../../tests/fixtures/legacy-v2/committed.json").as_slice(),
             include_bytes!("../../tests/fixtures/legacy-v2/pending.json").as_slice(),
-            include_bytes!("../../tests/fixtures/legacy-v2/cleanup-pending.json").as_slice()] {
+            include_bytes!("../../tests/fixtures/legacy-v2/cleanup-pending.json").as_slice(),
+        ] {
             let fixture = v2_fixture(bytes);
             let mut backend = fixture.backend();
             let status = backend.inspect().unwrap();
             assert!(status.applied_plan.is_none());
-            assert_eq!(status.runtime.phase, super::RuntimePhase::NeedsReauthorization);
-            backend.refresh_runtime(&fixture.observe(&up()), Duration::ZERO).unwrap();
+            assert_eq!(
+                status.runtime.phase,
+                super::RuntimePhase::NeedsReauthorization
+            );
+            backend
+                .refresh_runtime(&fixture.observe(&up()), Duration::ZERO)
+                .unwrap();
             assert_eq!(fixture.mutations(), 0);
         }
     }
 
     #[test]
     fn v2_activation_is_refused_before_kernel_commands() {
-        let fixture = v2_fixture(include_bytes!("../../tests/fixtures/legacy-v2/committed.json"));
+        let fixture = v2_fixture(include_bytes!(
+            "../../tests/fixtures/legacy-v2/committed.json"
+        ));
         let mut backend = fixture.backend();
-        let error = backend.activate_runtime(&activation(0), 1000, &fixture.observe(&up()), Duration::ZERO).unwrap_err();
+        let error = backend
+            .activate_runtime(
+                &activation(0),
+                1000,
+                &fixture.observe(&up()),
+                Duration::ZERO,
+            )
+            .unwrap_err();
         assert!(error.to_string().contains("cleanup"));
         assert_eq!(fixture.mutations(), 0);
     }
 
     #[test]
     fn v2_exact_cleanup_preserves_foreign_sentinels() {
-        let fixture = v2_fixture(include_bytes!("../../tests/fixtures/legacy-v2/committed.json"));
-        let foreign_route = (IpFamily::V4, serde_json::json!({"dst":"default","table":100,"dev":"vpn0","gateway":"10.200.0.1"}));
-        let foreign_rule = (IpFamily::V4, serde_json::json!({"src":"all","priority":9000,"table":100,"fwmark":42}));
-        fixture.kernel.lock().unwrap().extra_routes.push(foreign_route.clone());
-        fixture.kernel.lock().unwrap().extra_rules.push(foreign_rule.clone());
+        let fixture = v2_fixture(include_bytes!(
+            "../../tests/fixtures/legacy-v2/committed.json"
+        ));
+        let foreign_route = (
+            IpFamily::V4,
+            serde_json::json!({"dst":"default","table":100,"dev":"vpn0","gateway":"10.200.0.1"}),
+        );
+        let foreign_rule = (
+            IpFamily::V4,
+            serde_json::json!({"src":"all","priority":9000,"table":100,"fwmark":42}),
+        );
+        fixture
+            .kernel
+            .lock()
+            .unwrap()
+            .extra_routes
+            .push(foreign_route.clone());
+        fixture
+            .kernel
+            .lock()
+            .unwrap()
+            .extra_rules
+            .push(foreign_rule.clone());
         assert!(fixture.backend().cleanup().unwrap().cleaned);
         assert!(fixture.store.state.lock().unwrap().is_none());
         let kernel = fixture.kernel.lock().unwrap();
@@ -9497,10 +9711,20 @@ mod tests {
     #[test]
     fn v2_cleanup_resumes_only_an_exact_prefix() {
         for priority in [10000, 10001] {
-            let fixture = v2_fixture(include_bytes!("../../tests/fixtures/legacy-v2/cleanup-pending.json"));
-            if priority == 10000 { fixture.kernel.lock().unwrap().has_rule = false; }
-            fixture.kernel.lock().unwrap().extra_rules.retain(|(family, rule)|
-                !(*family == IpFamily::V4 && rule["priority"] == priority));
+            let fixture = v2_fixture(include_bytes!(
+                "../../tests/fixtures/legacy-v2/cleanup-pending.json"
+            ));
+            if priority == 10000 {
+                fixture.kernel.lock().unwrap().has_rule = false;
+            }
+            fixture
+                .kernel
+                .lock()
+                .unwrap()
+                .extra_rules
+                .retain(|(family, rule)| {
+                    !(*family == IpFamily::V4 && rule["priority"] == priority)
+                });
             let result = fixture.backend().cleanup();
             if priority == 10000 {
                 assert!(result.unwrap().cleaned);
@@ -9516,13 +9740,23 @@ mod tests {
     fn v2_pending_frozen_nft_phases_can_be_cleaned() {
         let bytes = include_bytes!("../../tests/fixtures/legacy-v2/pending.json");
         let old = super::LegacyJournalV2::decode(bytes).unwrap();
-        for (active,pending,guard) in [(old.active.as_ref(),old.pending.as_ref(),true),
-            (old.active.as_ref(),old.pending.as_ref(),false),
-            (old.pending.as_ref(),None,true),(old.pending.as_ref(),None,false)] {
+        for (active, pending, guard) in [
+            (old.active.as_ref(), old.pending.as_ref(), true),
+            (old.active.as_ref(), old.pending.as_ref(), false),
+            (old.pending.as_ref(), None, true),
+            (old.pending.as_ref(), None, false),
+        ] {
             let fixture = v2_fixture(bytes);
-            let nft = super::super::legacy_nft_v2::render_nft_document(active,pending,guard);
-            fixture.kernel.lock().unwrap().nft_objects = Some(nft["nftables"].as_array().unwrap()
-                .iter().filter(|o|!o.as_object().unwrap().is_empty()).cloned().collect());
+            let nft = super::super::legacy_nft_v2::render_nft_document(active, pending, guard);
+            fixture.kernel.lock().unwrap().nft_objects = Some(
+                nft["nftables"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|o| !o.as_object().unwrap().is_empty())
+                    .cloned()
+                    .collect(),
+            );
             assert!(fixture.backend().cleanup().unwrap().cleaned);
             assert!(fixture.store.state.lock().unwrap().is_none());
         }
@@ -9530,16 +9764,40 @@ mod tests {
 
     #[test]
     fn v2_changed_identity_or_fingerprint_is_not_deleted() {
-        for case in ["identity","nft","pending"] {
-            let fixture = v2_fixture(include_bytes!("../../tests/fixtures/legacy-v2/pending.json"));
+        for case in ["identity", "nft", "pending"] {
+            let fixture = v2_fixture(include_bytes!(
+                "../../tests/fixtures/legacy-v2/pending.json"
+            ));
             match case {
-                "identity" => fixture.identities.lock().unwrap().get_mut("eth0").unwrap().ifindex = 42,
+                "identity" => {
+                    fixture
+                        .identities
+                        .lock()
+                        .unwrap()
+                        .get_mut("eth0")
+                        .unwrap()
+                        .ifindex = 42
+                }
                 "nft" => fixture.kernel.lock().unwrap().extra_nft_rule = true,
-                _ => fixture.store.state.lock().unwrap().as_mut().unwrap().legacy_v2.as_mut().unwrap()
-                    .pending_expectations.as_mut().unwrap().guard_nft_fingerprint = "tampered".into(),
+                _ => {
+                    fixture
+                        .store
+                        .state
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .legacy_v2
+                        .as_mut()
+                        .unwrap()
+                        .pending_expectations
+                        .as_mut()
+                        .unwrap()
+                        .guard_nft_fingerprint = "tampered".into()
+                }
             }
             assert!(fixture.backend().cleanup().is_err());
-            assert_eq!(fixture.mutations(),0);
+            assert_eq!(fixture.mutations(), 0);
             assert!(fixture.store.state.lock().unwrap().is_some());
         }
     }
@@ -9549,8 +9807,29 @@ mod tests {
         let fixture = RuntimeFixture::new();
         *fixture.store.state.lock().unwrap() = Some(super::decode_journal(br#"{"journal_version":2,"active":null,"active_nft_fingerprint":null,"pending":null,"restore_receipt":null}"#).unwrap());
         assert!(!fixture.backend().cleanup().unwrap().cleaned);
-        assert_eq!(fixture.mutations(),0);
+        assert_eq!(fixture.mutations(), 0);
         assert!(fixture.store.state.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn v2_empty_journal_never_adopts_live_routelane_resources() {
+        let fixture = RuntimeFixture::new();
+        *fixture.store.state.lock().unwrap() = Some(super::decode_journal(br#"{"journal_version":2,"active":null,"active_nft_fingerprint":null,"pending":null,"restore_receipt":null}"#).unwrap());
+        fixture.kernel.lock().unwrap().has_table = true;
+        let before = fixture.mutations();
+        assert!(fixture.backend().cleanup().is_err());
+        assert_eq!(
+            fixture.mutations(),
+            before,
+            "an unowned table is never deleted"
+        );
+        assert!(fixture
+            .store
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|record| record.legacy_v2.is_some()));
     }
 
     fn lane_exit(id: &str) -> crate::backend::FamilyExit {
