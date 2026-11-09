@@ -844,6 +844,7 @@ mod tests {
 
     fn plan() -> KernelPlan {
         KernelPlan {
+            unmatched_traffic: crate::domain::UnmatchedTraffic::UsePrimary,
             primary: Default::default(),
             local_networks: vec![],
             local_addresses: vec![],

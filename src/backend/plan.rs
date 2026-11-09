@@ -5,7 +5,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 use super::{InterfaceIdentity, IpFamily, PrimaryDecision};
-use crate::domain::{LaneFailurePolicy, LaneId, ProfileId, RuleId};
+use crate::domain::{LaneFailurePolicy, LaneId, ProfileId, RuleId, UnmatchedTraffic};
 
 pub const TABLE_BASE: u32 = 20_000;
 pub const TABLE_MAX: u32 = 20_099;
@@ -16,6 +16,9 @@ pub const RULE_PRIORITY_MAX: u32 = 10_099;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KernelPlan {
+    /// What happens to new traffic that no enabled rule matches. Required:
+    /// a plan without it is never read as either mode.
+    pub unmatched_traffic: UnmatchedTraffic,
     pub primary: PrimaryDecision,
     pub local_networks: Vec<IpNet>,
     pub local_addresses: Vec<IpAddr>,
@@ -29,6 +32,7 @@ impl KernelPlan {
     pub fn content_hash(&self) -> PlanHash {
         #[derive(Serialize)]
         struct PolicyContent<'a> {
+            unmatched_traffic: UnmatchedTraffic,
             primary: &'a PrimaryDecision,
             local_networks: &'a [IpNet],
             local_addresses: &'a [IpAddr],
@@ -38,6 +42,7 @@ impl KernelPlan {
         }
 
         let content = PolicyContent {
+            unmatched_traffic: self.unmatched_traffic,
             primary: &self.primary,
             local_networks: &self.local_networks,
             local_addresses: &self.local_addresses,

@@ -1652,6 +1652,7 @@ mod tests {
                     DaemonResult::Applied(routelane::ipc::ApplyProfileResult {
                         generation: 1,
                         plan_hash: routelane::backend::KernelPlan {
+                            unmatched_traffic: routelane::domain::UnmatchedTraffic::UsePrimary,
                             primary: Default::default(),
                             local_networks: vec![],
                             local_addresses: vec![],

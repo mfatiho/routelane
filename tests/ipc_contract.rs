@@ -410,6 +410,7 @@ fn restarted_service(helper: FakeHelper, config: MemoryConfig) -> Arc<TestServic
 
 fn applied_fixture_plan(generation: u64) -> KernelPlan {
     KernelPlan {
+        unmatched_traffic: routelane::domain::UnmatchedTraffic::UsePrimary,
         primary: Default::default(),
         local_networks: vec![],
         local_addresses: vec![],

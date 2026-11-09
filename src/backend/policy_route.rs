@@ -393,6 +393,7 @@ mod tests {
 
     fn plan(lanes: Vec<LanePlan>) -> KernelPlan {
         KernelPlan {
+            unmatched_traffic: crate::domain::UnmatchedTraffic::UsePrimary,
             primary: Default::default(),
             local_networks: vec![],
             local_addresses: vec![],

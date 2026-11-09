@@ -70,7 +70,7 @@ fn fixture_snapshot_with<'a>(
 #[test]
 fn reports_healthy_when_table_rules_routes_and_interfaces_match() {
     let path = "tests/fixtures/health/healthy";
-    let plan = fixture_plan(&format!("{path}/plan.json"));
+    let plan = fixture_plan(&format!("{path}/plan-v3.json"));
     let snapshot = fixture_snapshot(path, &plan);
 
     let report = evaluate_health(Some(&plan), &snapshot);
@@ -85,6 +85,7 @@ fn reports_healthy_when_table_rules_routes_and_interfaces_match() {
 
 fn gatewayless_plan() -> KernelPlan {
     KernelPlan {
+        unmatched_traffic: routelane::domain::UnmatchedTraffic::UsePrimary,
         primary: Default::default(),
         local_networks: vec![],
         local_addresses: vec![],
@@ -162,7 +163,7 @@ fn missing_managed_gatewayless_route_is_degraded_not_gateway_unreachable() {
 #[test]
 fn reports_missing_lane_without_collapsing_other_lane_health() {
     let path = "tests/fixtures/health/missing-lane";
-    let plan = fixture_plan(&format!("{path}/plan.json"));
+    let plan = fixture_plan(&format!("{path}/plan-v3.json"));
     let snapshot = fixture_snapshot(path, &plan);
 
     let report = evaluate_health(Some(&plan), &snapshot);
@@ -188,7 +189,7 @@ fn reports_missing_lane_without_collapsing_other_lane_health() {
 #[test]
 fn diagnostic_ipc_shape_uses_typed_severity_subject_and_optional_action() {
     let path = "tests/fixtures/health/missing-lane";
-    let plan = fixture_plan(&format!("{path}/plan.json"));
+    let plan = fixture_plan(&format!("{path}/plan-v3.json"));
     let snapshot = fixture_snapshot(path, &plan);
     let diagnostic = &evaluate_health(Some(&plan), &snapshot).diagnostics[0];
 
@@ -205,7 +206,7 @@ fn diagnostic_ipc_shape_uses_typed_severity_subject_and_optional_action() {
 #[test]
 fn reports_inactive_without_a_plan_even_when_kernel_resources_exist() {
     let path = "tests/fixtures/health/healthy";
-    let plan = fixture_plan(&format!("{path}/plan.json"));
+    let plan = fixture_plan(&format!("{path}/plan-v3.json"));
     let snapshot = fixture_snapshot(path, &plan);
 
     let report = evaluate_health(None, &snapshot);
@@ -249,7 +250,7 @@ fn aggregate_precedence_is_failed_authorization_degraded_applying_healthy_inacti
 #[test]
 fn unavailable_lane_stays_degraded_when_its_interface_later_appears() {
     let path = "tests/fixtures/health/healthy";
-    let mut plan = fixture_plan(&format!("{path}/plan.json"));
+    let mut plan = fixture_plan(&format!("{path}/plan-v3.json"));
     plan.lanes[1].availability = LaneAvailability::Unavailable;
     let snapshot = fixture_snapshot(path, &plan);
 
@@ -268,7 +269,7 @@ fn unavailable_lane_stays_degraded_when_its_interface_later_appears() {
 #[test]
 fn available_lane_without_a_supported_gateway_is_degraded() {
     let path = "tests/fixtures/health/healthy";
-    let mut plan = fixture_plan(&format!("{path}/plan.json"));
+    let mut plan = fixture_plan(&format!("{path}/plan-v3.json"));
     plan.lanes[1].route_v4 = None;
     plan.lanes[1].route_v6 = None;
     let snapshot = fixture_snapshot(path, &plan);
@@ -286,7 +287,7 @@ fn available_lane_without_a_supported_gateway_is_degraded() {
 #[test]
 fn missing_ipv4_route_is_reported_even_when_ipv6_route_and_both_rules_are_exact() {
     let path = "tests/fixtures/health/healthy";
-    let plan = fixture_plan(&format!("{path}/plan.json"));
+    let plan = fixture_plan(&format!("{path}/plan-v3.json"));
     let ipv4_routes = fixture("tests/fixtures/health/missing-lane", "ipv4-routes.json");
     let ipv6_rules = fixture(path, "ipv6-rules.json");
     let snapshot = fixture_snapshot_with(path, &plan, &ipv4_routes, &ipv6_rules);
@@ -304,7 +305,7 @@ fn missing_ipv4_route_is_reported_even_when_ipv6_route_and_both_rules_are_exact(
 #[test]
 fn missing_ipv6_rule_is_reported_even_when_both_routes_and_ipv4_rules_are_exact() {
     let path = "tests/fixtures/health/healthy";
-    let plan = fixture_plan(&format!("{path}/plan.json"));
+    let plan = fixture_plan(&format!("{path}/plan-v3.json"));
     let ipv4_routes = fixture(path, "ipv4-routes.json");
     let ipv6_rules = fixture("tests/fixtures/health/missing-lane", "ipv6-rules.json");
     let snapshot = fixture_snapshot_with(path, &plan, &ipv4_routes, &ipv6_rules);

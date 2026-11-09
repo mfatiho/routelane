@@ -674,6 +674,7 @@ mod tests {
 
     fn applied_response(id: &str, generation: u64) -> DaemonResponse {
         let hash = KernelPlan {
+            unmatched_traffic: routelane::domain::UnmatchedTraffic::UsePrimary,
             primary: Default::default(),
             local_networks: vec![],
             local_addresses: vec![],

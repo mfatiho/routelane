@@ -844,6 +844,7 @@ fn scenario_plan(
         lanes[index].availability = LaneAvailability::Unavailable;
     }
     KernelPlan {
+        unmatched_traffic: routelane::domain::UnmatchedTraffic::UsePrimary,
         primary: PrimaryDecision {
             preferred: FamilyPair {
                 v4: Some(LANE_IDS[0].into()),

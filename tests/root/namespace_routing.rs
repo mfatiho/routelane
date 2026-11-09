@@ -754,6 +754,7 @@ fn plan(
         "10.10.1.1"
     };
     KernelPlan {
+        unmatched_traffic: routelane::domain::UnmatchedTraffic::UsePrimary,
         primary: routelane::backend::PrimaryDecision {
             preferred: routelane::backend::FamilyPair {
                 v4: Some("lane-b".into()),

@@ -143,6 +143,7 @@ fn compile_profile_inner(
     compiled_rules.retain(|rule| verdicts.insert(rule.routing_key()));
 
     Ok(KernelPlan {
+        unmatched_traffic: profile.routing.unmatched_traffic,
         primary: primary.clone(),
         local_networks: topology.connected_networks(),
         local_addresses: topology.assigned_addresses(),

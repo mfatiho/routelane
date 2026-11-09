@@ -3,6 +3,8 @@
 use ipnet::IpNet;
 use serde_json::{json, Value};
 
+use crate::domain::UnmatchedTraffic;
+
 use super::{
     CompiledAction, CompiledRule, CompiledTarget, FamilyExit, IpFamily, KernelPlan,
     LaneAvailability, LanePlan, MARK_BASE, MARK_MAX,
@@ -369,7 +371,9 @@ fn primary_mark(plan: &KernelPlan, f: IpFamily) -> Option<u32> {
     }
 }
 
-pub(super) fn explicit_rule(plan: &KernelPlan, rule: &CompiledRule) -> Vec<Value> {
+/// The match part of an explicit rule. The explicit verdict and the
+/// transaction guard both build on it, so they cannot disagree on scope.
+fn rule_predicates(rule: &CompiledRule) -> Vec<Value> {
     // IP payload predicates already encode their family. nft removes a
     // redundant nfproto dependency when dumping them; emit the canonical form.
     let mut expr = if matches!(rule.target, CompiledTarget::Network(_)) {
@@ -385,17 +389,46 @@ pub(super) fn explicit_rule(plan: &KernelPlan, rule: &CompiledRule) -> Vec<Value
             path.clone(),
         )),
     }
-    expr.push(json!({"counter":null}));
+    expr
+}
+
+/// The lane mark an explicit rule steers to, or `None` when it rejects.
+fn rule_mark(plan: &KernelPlan, rule: &CompiledRule) -> Option<u32> {
     let mark = match rule.action {
         CompiledAction::Mark(m) => Some(m),
         CompiledAction::Direct => primary_mark(plan, rule.family),
         CompiledAction::Block => None,
     };
-    expr.push(match mark {
-        Some(m) if plan.lanes.iter().any(|l| l.mark == m) => goto(&selection_name(rule.family, m)),
-        _ => reject(Some(rule.family)),
+    mark.filter(|m| plan.lanes.iter().any(|l| l.mark == *m))
+}
+
+pub(super) fn explicit_rule(plan: &KernelPlan, rule: &CompiledRule) -> Vec<Value> {
+    let mut expr = rule_predicates(rule);
+    expr.push(json!({"counter":null}));
+    expr.push(match rule_mark(plan, rule) {
+        Some(m) => goto(&selection_name(rule.family, m)),
+        None => reject(Some(rule.family)),
     });
     expr
+}
+
+/// Selective mode: a matched Route/Direct rule cannot claim a packet that
+/// another tool already marked. Reject that match without touching the mark;
+/// unmatched foreign-marked traffic is left alone.
+fn foreign_mark_conflicts(plan: &KernelPlan, rule: &CompiledRule) -> Vec<Vec<Value>> {
+    if rule_mark(plan, rule).is_none() {
+        return vec![];
+    }
+    [meta("mark"), ct("mark")]
+        .into_iter()
+        .map(|key| {
+            let mut expr = rule_predicates(rule);
+            expr.push(matches(key.clone(), "!=", json!(0)));
+            expr.push(matches(key, "!=", json!({"range":[MARK_BASE,MARK_MAX]})));
+            expr.push(reject(Some(rule.family)));
+            expr
+        })
+        .collect()
 }
 
 pub fn render_nft_document(
@@ -444,17 +477,25 @@ pub fn render_nft_document(
         }
         let mut output = Chain::base("output", "route", "output", -150);
         controls(&mut output, &plan.local_networks);
-        // Never erase VPN/foreign policy marks. Fail explicitly rather than
-        // silently presenting those packets as RouteLane-managed internet.
-        for key in [meta("mark"), ct("mark")] {
-            output.rule(vec![
-                matches(key.clone(), "!=", json!(0)),
-                matches(key.clone(), "<", json!(MARK_BASE)),
-                reject(None),
-            ]);
-            output.rule(vec![matches(key, ">", json!(MARK_MAX)), reject(None)]);
+        let selective = plan.unmatched_traffic == UnmatchedTraffic::PreserveSystem;
+        if !selective {
+            // Never erase VPN/foreign policy marks. Fail explicitly rather than
+            // silently presenting those packets as RouteLane-managed internet.
+            for key in [meta("mark"), ct("mark")] {
+                output.rule(vec![
+                    matches(key.clone(), "!=", json!(0)),
+                    matches(key.clone(), "<", json!(MARK_BASE)),
+                    reject(None),
+                ]);
+                output.rule(vec![matches(key, ">", json!(MARK_MAX)), reject(None)]);
+            }
         }
         for rule in &plan.rules {
+            if selective {
+                for conflict in foreign_mark_conflicts(plan, rule) {
+                    output.rule(conflict);
+                }
+            }
             output.rule(explicit_rule(plan, rule));
         }
         for f in [IpFamily::V4, IpFamily::V6] {
@@ -467,15 +508,19 @@ pub fn render_nft_document(
         for n in &plan.local_networks {
             output.rule(vec![destination(n), ret()]);
         }
-        for f in [IpFamily::V4, IpFamily::V6] {
-            output.rule(vec![
-                family(f),
-                json!({"counter":null}),
-                match primary_mark(plan, f) {
-                    Some(mark) => goto(&selection_name(f, mark)),
-                    None => reject(Some(f)),
-                },
-            ]);
+        // Selective mode ends here: unmatched new traffic keeps the system's
+        // own routing (the base chain's accept policy); no mark, no NAT.
+        if !selective {
+            for f in [IpFamily::V4, IpFamily::V6] {
+                output.rule(vec![
+                    family(f),
+                    json!({"counter":null}),
+                    match primary_mark(plan, f) {
+                        Some(mark) => goto(&selection_name(f, mark)),
+                        None => reject(Some(f)),
+                    },
+                ]);
+            }
         }
         chains.push(output);
 

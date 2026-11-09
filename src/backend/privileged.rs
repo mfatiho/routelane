@@ -5451,6 +5451,7 @@ mod tests {
 
     fn fixture_valid_plan() -> KernelPlan {
         KernelPlan {
+            unmatched_traffic: crate::domain::UnmatchedTraffic::UsePrimary,
             primary: Default::default(),
             local_networks: vec![],
             local_addresses: vec![],

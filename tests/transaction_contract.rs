@@ -279,6 +279,7 @@ impl KernelRunner for InMemoryKernel {
 
 fn fixture_kernel_plan(generation: u64) -> KernelPlan {
     KernelPlan {
+        unmatched_traffic: routelane::domain::UnmatchedTraffic::UsePrimary,
         primary: Default::default(),
         local_networks: vec![],
         local_addresses: vec![],
