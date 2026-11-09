@@ -270,3 +270,15 @@ fn package_upgrade_preserves_private_config_and_journal() {
     assert!(preun.contains("if [ \"$1\" -eq 0 ]; then"));
     assert!(deb.contains("    remove)\n        systemctl stop routelane-helper.service"));
 }
+
+#[test]
+fn native_packages_build_all_binaries_with_the_lockfile() {
+    for script in ["packaging/deb/build-deb.sh", "packaging/rpm/build-rpm.sh"] {
+        assert!(
+            read(script)
+                .lines()
+                .any(|line| line == "cargo build --release --bins --locked"),
+            "{script}"
+        );
+    }
+}

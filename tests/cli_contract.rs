@@ -525,3 +525,83 @@ fn fixtures_encode_the_public_health_and_profile_shapes() {
     let profile: &Profile = &document.profiles[0];
     assert_eq!(profile.id, "work".into());
 }
+
+#[tokio::test]
+async fn doctor_json_lists_every_check_and_only_requests_daemon_status() {
+    let runtime = TempDir::new().unwrap();
+    serve_once(
+        runtime.path(),
+        |request| assert_eq!(request, &DaemonRequest::GetStatus),
+        Ok(DaemonResult::Status(inactive_status())),
+    )
+    .await;
+
+    let output = run_cli(runtime.path(), &["doctor", "--json"]).await;
+    assert!(matches!(output.status.code(), Some(0 | 5)), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks = json.as_array().unwrap();
+    assert_eq!(
+        checks
+            .iter()
+            .map(|check| check["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "helper_binary",
+            "client_binaries",
+            "integration_files",
+            "polkit_action",
+            "dbus_activation",
+            "kernel_tools",
+            "cgroup_v2",
+            "app_cgroup",
+            "user_daemon"
+        ]
+    );
+    for check in checks {
+        assert!(matches!(
+            check["status"].as_str(),
+            Some("PASS" | "WARN" | "FAIL")
+        ));
+        assert!(check["detail"].is_string());
+        if check["status"] == "PASS" {
+            assert!(check["hint"].is_null());
+        } else {
+            assert!(!check["hint"].as_str().unwrap().is_empty());
+        }
+    }
+    assert_eq!(checks[8]["status"], "PASS");
+    assert!(checks[8]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("generation=7"));
+    assert_eq!(
+        output.status.code(),
+        Some(if checks.iter().any(|c| c["status"] == "FAIL") {
+            5
+        } else {
+            0
+        })
+    );
+}
+
+#[tokio::test]
+async fn doctor_text_prints_summary_and_rejects_unknown_options() {
+    let runtime = TempDir::new().unwrap();
+    let output = run_cli(runtime.path(), &["doctor"]).await;
+    assert!(matches!(output.status.code(), Some(0 | 5)), "{output:?}");
+    assert!(output.stderr.is_empty());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("helper_binary"));
+    assert!(text.lines().last().unwrap().starts_with("doctor: "));
+
+    for args in [
+        vec!["doctor", "--unknown"],
+        vec!["doctor", "--json", "extra"],
+    ] {
+        let output = run_cli(runtime.path(), &args).await;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("routelanectl doctor [--json]"));
+    }
+}

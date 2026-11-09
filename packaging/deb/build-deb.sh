@@ -54,7 +54,7 @@ PACKAGE_ROOT="${BUILD_ROOT}/root"
 OUTPUT_DEB="$(mktemp -p "${OUTPUT_DIR}" "${PACKAGE_NAME}_${VERSION}_${DEB_ARCH}.XXXXXX.deb")"
 
 echo "Building release binaries..."
-cargo build --release --bins
+cargo build --release --bins --locked
 
 echo "Assembling package root: ${PACKAGE_ROOT}"
 install -d -m 0755 \

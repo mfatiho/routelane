@@ -3,6 +3,7 @@ pub mod backend;
 pub mod config;
 pub mod daemon;
 pub mod dns;
+pub mod doctor;
 pub mod domain;
 pub mod health;
 pub mod ipc;

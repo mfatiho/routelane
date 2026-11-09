@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use routelane::config::{load_config_file, ConfigV4};
+use routelane::doctor::{any_failed, render_text, run_checks, SystemProbe};
 use routelane::domain::{validate_profile, Profile};
 use routelane::ipc::{
     socket_path, DaemonClient, DaemonEnvelope, DaemonRequest, DaemonResponse, DaemonResult,
@@ -11,16 +12,17 @@ use routelane::ipc::{
 const EXIT_USAGE: i32 = 2;
 const EXIT_CONFIG: i32 = 3;
 const EXIT_DAEMON: i32 = 4;
+const EXIT_DOCTOR: i32 = 5;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ERROR_CHARS: usize = 768;
-const USAGE: &str = "Usage:\n  routelanectl status [--json]\n  routelanectl apply-profile <config.json> [--profile <id-or-name>]\n  routelanectl deactivate";
+const USAGE: &str = "Usage:\n  routelanectl status [--json]\n  routelanectl apply-profile <config.json> [--profile <id-or-name>]\n  routelanectl deactivate\n  routelanectl doctor [--json]";
 
 #[tokio::main]
 async fn main() {
     let code = match run(std::env::args().skip(1).collect()).await {
-        Ok(output) => {
+        Ok((output, code)) => {
             println!("{output}");
-            0
+            code
         }
         Err(error) => {
             eprintln!("{}", bounded(&error.message));
@@ -32,7 +34,31 @@ async fn main() {
     }
 }
 
-async fn run(args: Vec<String>) -> Result<String, CliError> {
+async fn run(args: Vec<String>) -> Result<(String, i32), CliError> {
+    if args.first().is_some_and(|command| command == "doctor") {
+        let json = match args.as_slice() {
+            [_] => false,
+            [_, option] if option == "--json" => true,
+            _ => return Err(CliError::usage()),
+        };
+        // The synchronous probe owns short-lived runtimes for its bus/socket checks.
+        let checks = tokio::task::spawn_blocking(|| run_checks(&SystemProbe))
+            .await
+            .map_err(|error| CliError {
+                code: EXIT_DOCTOR,
+                message: format!("doctor failed: {error}"),
+            })?;
+        let code = if any_failed(&checks) { EXIT_DOCTOR } else { 0 };
+        let output = if json {
+            serde_json::to_string_pretty(&checks).map_err(|error| CliError {
+                code: EXIT_DOCTOR,
+                message: format!("doctor JSON encoding failed: {error}"),
+            })?
+        } else {
+            render_text(&checks)
+        };
+        return Ok((output, code));
+    }
     let deadline = tokio::time::Instant::now() + OPERATION_TIMEOUT;
     let (request, output) = parse_command(&args, deadline).await?;
     let path = socket_path().map_err(|error| CliError::daemon(error.to_string()))?;
@@ -42,7 +68,7 @@ async fn run(args: Vec<String>) -> Result<String, CliError> {
         .await
         .map_err(|_| CliError::daemon("IPC_TIMEOUT: daemon request timed out"))?
         .map_err(|error| CliError::daemon(error.to_string()))?;
-    format_response(response, output)
+    format_response(response, output).map(|output| (output, 0))
 }
 
 #[derive(Debug, Clone, Copy)]

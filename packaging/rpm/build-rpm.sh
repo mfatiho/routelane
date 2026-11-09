@@ -46,7 +46,7 @@ BUILD_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/routelane-rpm.XXXXXX")"
 trap 'rm -rf -- "${BUILD_ROOT}"' EXIT
 
 echo "Building release binaries..."
-cargo build --release --bins
+cargo build --release --bins --locked
 
 echo "Building rpm in ${BUILD_ROOT}"
 rpmbuild -bb \

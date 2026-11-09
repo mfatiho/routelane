@@ -183,15 +183,92 @@ and
 
 ## Build
 
-Build requirements:
-
-- Rust stable
-- GTK4 and Libadwaita development packages
-- `dpkg-deb` only when producing the development `.deb`
+From a source checkout, install RouteLane as your normal user:
 
 ```bash
-cargo build --release --bins
+./scripts/install-from-source.sh
 ```
+
+The script detects Ubuntu/Debian or Fedora, lists missing build dependencies
+and asks before installing them. It builds the native `.deb` or `.rpm` as your
+user, asks before installing that package, then runs `routelanectl doctor`.
+Only package manager commands use sudo. Other distributions should use the
+manual build steps below and provide equivalent native packaging.
+Ubuntu 22.04/24.04/26.04, Debian 12/13 and Fedora 43/44 are the validation
+targets; other releases print a warning and continue. This does not replace
+the release validation gate below.
+
+Options can be combined:
+
+| Option | Effect |
+| --- | --- |
+| `--yes` | Accept dependency and package installation prompts |
+| `--dry-run` | Query the system and print planned commands without running builds, installs or doctor |
+| `--skip-deps` | Skip build dependency detection and installation |
+| `--build-only` | Build the native package without installing or running doctor |
+| `--help` | Show usage |
+
+Install Rust stable with rustup before running the script. The minimum
+supported Rust version (MSRV) is **1.87**, declared in `Cargo.toml`.
+The installer checks `cargo` and `rustc` on PATH and prints instructions if
+Rust is missing or too old; it never downloads or runs rustup for you.
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# Open a new shell after installation so cargo and rustc are on PATH.
+rustup update stable
+```
+
+For a manual build, install the build dependencies for your distribution:
+
+```bash
+# Ubuntu / Debian
+sudo apt-get update && sudo apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev
+# Fedora
+sudo dnf install -y gcc pkgconf-pkg-config gtk4-devel libadwaita-devel rpm-build
+```
+
+Build all four binaries with the checked-in lockfile, then use the packaging
+script for your distribution (it also performs the locked release build):
+
+```bash
+cargo build --release --bins --locked
+./packaging/deb/build-deb.sh  # Ubuntu / Debian
+# Or: ./packaging/rpm/build-rpm.sh  # Fedora
+```
+
+Each packaging script reports `Created <path>` for its artifact under `dist/`.
+Install that exact path with `sudo apt install -y /absolute/path/to/package.deb`
+or `sudo dnf install -y /absolute/path/to/package.rpm`. Runtime dependencies
+are installed by the package manager. Then check the installation:
+
+```bash
+routelanectl doctor
+routelanectl doctor --json
+```
+
+Doctor is read-only and needs no root access. It checks installed binaries,
+integration files, Polkit, D-Bus activation registration, kernel tools, cgroup
+v2, and the user daemon. Doctor itself sends only `GetStatus` to the daemon,
+never calls a helper method, and changes nothing. The daemon answers through
+its normal read-only helper `Inspect` path, the same as `routelanectl status`
+and the GUI, which may D-Bus-activate the helper.
+Text output includes fixes and a summary; JSON is an array of checks.
+Exit 0 means no FAIL results (warnings may remain); exit 5 means at least one
+installation check failed. The installer preserves doctor's exit code after
+installation, so a failed check does not mean the package was not installed.
+
+Remove the package with `sudo apt remove routelane` (Ubuntu/Debian) or
+`sudo dnf remove routelane` (Fedora). Deactivate routing first; see the removal
+notes below. Package managers own installation, upgrades and removal.
+
+RouteLane itself is not supported as a Flatpak or Snap: its root helper,
+system D-Bus/Polkit integration and host network access require native system
+integration. `cargo install` only installs binaries and cannot supply that
+integration. The helper must be installed at the fixed root-managed path
+`/usr/lib/routelane/routelane-helper`, referenced by the D-Bus service,
+systemd units, Polkit policy and tmpfiles integration; copying binaries alone
+is insufficient.
 
 The four binaries are:
 
@@ -199,7 +276,7 @@ The four binaries are:
 | --- | --- |
 | `routelane` | GTK desktop application |
 | `routelane-daemon` | per-user routing daemon |
-| `routelanectl` | minimal Phase 1 command-line client |
+| `routelanectl` | command-line client and installation checks |
 | `routelane-helper` | privileged system D-Bus helper |
 
 ## Development `.deb`
@@ -254,13 +331,15 @@ manual testing:
 systemctl --user start routelane-daemon.service
 routelanectl status
 routelanectl status --json
+routelanectl doctor
+routelanectl doctor --json
 routelanectl apply-profile ./profile.json
 routelanectl apply-profile ./config.json --profile Work
 routelanectl deactivate
 ```
 
-`routelanectl` uses the same canonical daemon IPC client as the GUI. Its Phase
-1 surface is intentionally limited to the commands above. `status` also prints
+`routelanectl` uses the same canonical daemon IPC client as the GUI for routing
+commands; `doctor` runs local installation checks. Its Phase 1 surface is intentionally limited to the commands above. `status` also prints
 the runtime phase and the preferred and effective exit for each address
 family.
 
