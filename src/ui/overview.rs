@@ -104,6 +104,30 @@ fn primary_lines(
         PrimarySelection::Lane(id) => lane_name(id),
     };
     let mut lines = vec![format!("{}: {preferred}", texts.primary.preferred)];
+    // The saved scope and the helper-verified one are never merged.
+    let scope = crate::ui::primary::scope_overview(profile, status);
+    let mode_name = |mode| match mode {
+        routelane::domain::UnmatchedTraffic::PreserveSystem => texts.primary.scope_selective,
+        routelane::domain::UnmatchedTraffic::UsePrimary => texts.primary.scope_use_primary,
+    };
+    lines.push(format!(
+        "{}: {}",
+        texts.primary.saved_scope,
+        mode_name(scope.saved)
+    ));
+    lines.push(format!(
+        "{}: {}",
+        texts.primary.applied_scope,
+        scope
+            .applied
+            .map_or(texts.primary.scope_not_applied, mode_name)
+    ));
+    if let Some(applied) = scope.applied {
+        lines.push(crate::ui::window::scope_line(applied, texts.primary).to_owned());
+    }
+    if scope.differs() {
+        lines.push(texts.ux.saved_unapplied.to_owned());
+    }
     match &overview.effective {
         None => lines.push(texts.primary.not_active.to_owned()),
         Some((v4, v6)) => {

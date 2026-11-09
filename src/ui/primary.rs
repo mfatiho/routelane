@@ -2,9 +2,9 @@
 //! a manual primary change, and the Overview's saved-versus-effective model.
 //! Pure logic; widgets live in `connections.rs` and `overview.rs`.
 
-use routelane::backend::{FamilyExit, RuntimePhase};
+use routelane::backend::{FamilyExit, RoutingPreview, RoutingWarning, RuntimePhase};
 use routelane::domain::{
-    validate_profile, LaneId, PrimarySelection, Profile, ProfileId, RoutingPolicy,
+    validate_profile, LaneId, PrimarySelection, Profile, ProfileId, RoutingPolicy, UnmatchedTraffic,
 };
 use routelane::ipc::DaemonStatus;
 
@@ -14,6 +14,9 @@ pub struct PrimaryDraft {
     pub primary: PrimarySelection,
     pub backups: Vec<LaneId>,
     pub automatic_failover: bool,
+    /// Which new traffic the policy manages; changed only through the
+    /// confirmation gate.
+    pub unmatched_traffic: UnmatchedTraffic,
 }
 
 impl PrimaryDraft {
@@ -23,6 +26,7 @@ impl PrimaryDraft {
             primary: profile.routing.primary.clone(),
             backups: profile.routing.backups.clone(),
             automatic_failover: profile.routing.automatic_failover,
+            unmatched_traffic: profile.routing.unmatched_traffic,
         }
     }
 }
@@ -56,7 +60,7 @@ pub fn validate_primary_draft(
     }
     let mut candidate = profile.clone();
     candidate.routing = RoutingPolicy {
-        unmatched_traffic: profile.routing.unmatched_traffic,
+        unmatched_traffic: draft.unmatched_traffic,
         primary: draft.primary.clone(),
         backups: draft.backups.clone(),
         automatic_failover: draft.automatic_failover,
@@ -146,11 +150,69 @@ pub fn primary_overview(saved: &Profile, status: Option<&DaemonStatus>) -> Prima
     }
 }
 
+/// The saved routing scope next to the one the helper verified. They differ
+/// after a saved-but-unapplied change or a failed apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeOverview {
+    pub saved: UnmatchedTraffic,
+    /// From the helper's armed runtime only; never from configuration.
+    pub applied: Option<UnmatchedTraffic>,
+}
+
+impl ScopeOverview {
+    pub fn differs(&self) -> bool {
+        self.applied.is_some_and(|applied| applied != self.saved)
+    }
+}
+
+pub fn scope_overview(saved: &Profile, status: Option<&DaemonStatus>) -> ScopeOverview {
+    ScopeOverview {
+        saved: saved.routing.unmatched_traffic,
+        applied: status
+            .map(|status| &status.primary)
+            .filter(|runtime| runtime.grant.is_some())
+            .and_then(|runtime| runtime.unmatched_traffic),
+    }
+}
+
+/// What must be disclosed and explicitly confirmed before an activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationReason {
+    /// The configuration was migrated from an older schema.
+    Migrated,
+    /// All new traffic that no rule matches goes through the primary.
+    UsePrimary,
+    Warning(RoutingWarning),
+}
+
+pub fn activation_reasons(
+    profile: &Profile,
+    migrated: bool,
+    preview: &RoutingPreview,
+) -> Vec<ActivationReason> {
+    let mut reasons = Vec::new();
+    if migrated {
+        reasons.push(ActivationReason::Migrated);
+    }
+    if profile.routing.unmatched_traffic == UnmatchedTraffic::UsePrimary {
+        reasons.push(ActivationReason::UsePrimary);
+    }
+    reasons.extend(
+        preview
+            .warnings
+            .iter()
+            .cloned()
+            .map(ActivationReason::Warning),
+    );
+    reasons
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ui::connections::{delete_candidate, LaneEditError};
     use routelane::backend::{FamilyPair, PrimaryDecision, RuntimeStatus};
+    use routelane::domain::UnmatchedTraffic;
     use routelane::domain::{InterfaceSelector, Lane, LaneFailurePolicy};
 
     fn profile() -> Profile {
@@ -321,5 +383,109 @@ mod tests {
             vec![LaneId::from("default")]
         );
         assert_eq!(proposed_backups(&profile, None), Vec::<LaneId>::new());
+    }
+
+    #[test]
+    fn mode_cancel_is_side_effect_free() {
+        let profile = profile();
+        assert_eq!(
+            PrimaryDraft::of(&profile).unmatched_traffic,
+            UnmatchedTraffic::PreserveSystem
+        );
+        let mut change = PrimaryChange::default();
+        change.request(PrimaryDraft {
+            unmatched_traffic: UnmatchedTraffic::UsePrimary,
+            ..PrimaryDraft::of(&profile)
+        });
+        // Cancel, Escape and window close all take this path.
+        assert!(change.cancel().is_empty());
+        assert_eq!(change.confirm(&profile).unwrap(), vec![]);
+
+        // Confirming is the only way the mode reaches a saved candidate.
+        change.request(PrimaryDraft {
+            unmatched_traffic: UnmatchedTraffic::UsePrimary,
+            ..PrimaryDraft::of(&profile)
+        });
+        let effects = change.confirm(&profile).unwrap();
+        let [PrimaryEffect::Save(saved)] = effects.as_slice() else {
+            panic!("one save expected: {effects:?}");
+        };
+        assert_eq!(
+            saved.routing.unmatched_traffic,
+            UnmatchedTraffic::UsePrimary
+        );
+        assert_eq!(saved.rules, profile.rules, "no rule is touched");
+    }
+
+    #[test]
+    fn saved_mode_is_not_presented_as_applied() {
+        let mut saved = profile();
+        saved.routing.unmatched_traffic = UnmatchedTraffic::UsePrimary;
+        // The broader mode was saved but its apply failed: the helper still
+        // reports the selective runtime it verified.
+        let status = DaemonStatus {
+            generation: 3,
+            event_sequence: 9,
+            health: routelane::health::HealthReport::inactive(),
+            desired_profile_id: Some(saved.id.clone()),
+            applied_profile_id: Some(saved.id.clone()),
+            last_error: None,
+            primary: RuntimeStatus {
+                grant: Some(routelane::backend::RuntimeGrant {
+                    owner_uid: 1000,
+                    boot_id: "boot".into(),
+                    network_namespace: 1,
+                    policy_hash: routelane::backend::policy_hash(
+                        &profile(),
+                        &routelane::backend::ResolutionSnapshot::empty(),
+                    ),
+                    interfaces: Default::default(),
+                }),
+                generation: 3,
+                phase: RuntimePhase::Armed,
+                unmatched_traffic: Some(UnmatchedTraffic::PreserveSystem),
+                ..RuntimeStatus::default()
+            },
+        };
+        let scope = scope_overview(&saved, Some(&status));
+        assert_eq!(scope.saved, UnmatchedTraffic::UsePrimary);
+        let applied_scope_after_failed_apply = scope.applied;
+        assert_eq!(
+            applied_scope_after_failed_apply,
+            Some(UnmatchedTraffic::PreserveSystem)
+        );
+        assert!(scope.differs());
+        // Without a verified runtime nothing is presented as applied.
+        assert_eq!(scope_overview(&saved, None).applied, None);
+        let mut unverified = status.clone();
+        unverified.primary.grant = None;
+        assert_eq!(scope_overview(&saved, Some(&unverified)).applied, None);
+    }
+
+    #[test]
+    fn activation_reasons_disclose_scope_changes_before_action() {
+        use routelane::backend::{RoutingPreview, RoutingWarning};
+        let mut current = profile();
+        let preview = |warnings| RoutingPreview {
+            policy_hash: routelane::backend::policy_hash(
+                &profile(),
+                &routelane::backend::ResolutionSnapshot::empty(),
+            ),
+            warnings,
+        };
+        assert!(activation_reasons(&current, false, &preview(vec![])).is_empty());
+        let lab = RoutingWarning::LocalNetworkRule {
+            rule_id: "lab".into(),
+            network: "10.65.201.0/24".parse().unwrap(),
+        };
+        assert_eq!(
+            activation_reasons(&current, false, &preview(vec![lab.clone()])),
+            vec![ActivationReason::Warning(lab)]
+        );
+        current.routing.unmatched_traffic = UnmatchedTraffic::UsePrimary;
+        assert_eq!(
+            activation_reasons(&current, true, &preview(vec![])),
+            vec![ActivationReason::Migrated, ActivationReason::UsePrimary]
+        );
     }
 }

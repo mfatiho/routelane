@@ -1,4 +1,5 @@
 use crate::models::{DaemonToUi, UiRequest};
+use routelane::backend::RoutingPreview;
 use routelane::config::{ConfigV4, PersistenceRequest};
 use routelane::domain::{HealthState, Profile, Rule, RuleSource};
 use routelane::ipc::{
@@ -16,6 +17,8 @@ pub enum OperationKind {
     Recover,
     SaveOnly,
     ChangeLanguage,
+    /// Read-only activation preview; changes no save state.
+    Preview,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationStage {
@@ -40,6 +43,8 @@ pub enum UiGateError {
     ReadOnlyConfig,
     UnappliedProfile,
     DisabledRule,
+    /// No current preview covers this exact draft on this connection.
+    StalePreview,
 }
 #[derive(Debug)]
 pub enum AfterSave {
@@ -82,6 +87,16 @@ pub struct UiSession {
     save_state: SaveState,
     profiles: Vec<Profile>,
     result: Option<DaemonResult>,
+    preview: Option<BoundPreview>,
+}
+
+/// A preview approves only the exact draft it was computed for, on the
+/// daemon connection it came from, until the next daemon event.
+#[derive(Debug)]
+struct BoundPreview {
+    epoch: u64,
+    profile: Profile,
+    preview: RoutingPreview,
 }
 
 impl UiSession {
@@ -101,7 +116,61 @@ impl UiSession {
             save_state: SaveState::Clean,
             profiles: vec![],
             result: None,
+            preview: None,
         }
+    }
+
+    /// Asks the daemon for the read-only impact of `profile`.
+    pub fn begin_preview(&mut self, profile: Profile) -> Result<Vec<UiEffect>, UiGateError> {
+        if self.is_busy() {
+            return Err(UiGateError::Busy);
+        }
+        if !self.known {
+            return Err(UiGateError::StateUnknown);
+        }
+        let mut request_profile = profile.clone();
+        request_profile.enabled = true;
+        let tracked = UiRequest::new(DaemonRequest::PreviewProfile(request_profile));
+        self.pending = Some(Pending {
+            kind: OperationKind::Preview,
+            stage: OperationStage::AwaitingReply,
+            request_id: Some(tracked.request_id.clone()),
+            save_generation: None,
+            candidate: Some(profile),
+            follow_up: AfterSave::None,
+            expected_generation: None,
+        });
+        self.preview = None;
+        self.error = None;
+        Ok(vec![UiEffect::Send(tracked)])
+    }
+
+    pub fn preview_for(&self, profile: &Profile) -> Option<&RoutingPreview> {
+        self.preview
+            .as_ref()
+            .filter(|bound| bound.epoch == self.epoch && same_profile(&bound.profile, profile))
+            .map(|bound| &bound.preview)
+    }
+
+    /// Saves `profile` and applies it, consuming the preview that covers it.
+    /// A second confirmation finds no preview and sends nothing.
+    pub fn confirm_activation(
+        &mut self,
+        config: ConfigV4,
+        profile: Profile,
+    ) -> Result<Vec<UiEffect>, UiGateError> {
+        if self.preview_for(&profile).is_none() {
+            return Err(UiGateError::StalePreview);
+        }
+        let mut request_profile = profile.clone();
+        request_profile.enabled = true;
+        let effects = self.begin_save(
+            config,
+            profile,
+            AfterSave::Request(DaemonRequest::ApplyProfile(request_profile)),
+        )?;
+        self.preview = None;
+        Ok(effects)
     }
 
     pub fn snapshot_known(&self) -> bool {
@@ -355,6 +424,7 @@ impl UiSession {
                 }
                 self.epoch = epoch;
                 self.known = false;
+                self.preview = None;
                 self.accepted_revision = None;
                 self.applied_revision = None;
                 if self
@@ -417,6 +487,8 @@ impl UiSession {
                 return self.handle_response(response)
             }
             DaemonToUi::Event { epoch, event } if epoch == self.epoch => {
+                // Topology or runtime moved on: the observed facts may differ.
+                self.preview = None;
                 if let DaemonEvent::PrimaryChanged {
                     generation,
                     sequence,
@@ -466,6 +538,7 @@ impl UiSession {
                     return vec![];
                 }
                 self.known = false;
+                self.preview = None;
                 self.applied_revision = None;
                 self.error = Some(error);
                 if self
@@ -512,6 +585,26 @@ impl UiSession {
             return vec![];
         }
         let mut pending = self.pending.take().expect("matched request");
+        if pending.kind == OperationKind::Preview
+            && response.protocol_version == IPC_PROTOCOL_VERSION
+        {
+            // Read-only: neither outcome touches the save state or snapshot.
+            match (response.result, response.error, pending.candidate) {
+                (Some(DaemonResult::Preview(preview)), None, Some(profile)) => {
+                    self.preview = Some(BoundPreview {
+                        epoch: self.epoch,
+                        profile,
+                        preview,
+                    });
+                }
+                (_, error, _) => {
+                    self.error = Some(error.unwrap_or_else(|| {
+                        IpcError::new("IPC_INVALID_RESPONSE", "unexpected preview reply")
+                    }));
+                }
+            }
+            return vec![];
+        }
         if response.protocol_version != IPC_PROTOCOL_VERSION {
             self.error = Some(IpcError::new(
                 "IPC_INVALID_RESPONSE",
@@ -1031,5 +1124,120 @@ mod tests {
         assert!(s.needs_reapply(&profile()));
         assert_eq!(s.save_state(), SaveState::SavedUnapplied);
         assert!(s.begin_request(DaemonRequest::Deactivate, None).is_ok());
+    }
+
+    fn preview_response(
+        id: &str,
+        warnings: Vec<routelane::backend::RoutingWarning>,
+    ) -> DaemonResponse {
+        DaemonResponse::success(
+            id,
+            DaemonResult::Preview(routelane::backend::RoutingPreview {
+                policy_hash: routelane::backend::policy_hash(
+                    &profile(),
+                    &routelane::backend::ResolutionSnapshot::empty(),
+                ),
+                warnings,
+            }),
+        )
+    }
+
+    fn previewed(session: &mut UiSession, candidate: &Profile) {
+        let request = sent(session.begin_preview(candidate.clone()).unwrap());
+        assert!(matches!(request.request, DaemonRequest::PreviewProfile(_)));
+        session.handle_daemon(DaemonToUi::Response {
+            epoch: session.connection_epoch(),
+            response: preview_response(&request.request_id, vec![]),
+        });
+    }
+
+    #[test]
+    fn stale_preview_cannot_approve_an_edited_profile() {
+        let mut s = session(true, true);
+        let candidate = profile();
+        previewed(&mut s, &candidate);
+        assert!(s.preview_for(&candidate).is_some());
+        assert!(!s.is_busy(), "a preview reply ends the read-only operation");
+
+        // An edited draft is not covered by that preview.
+        let mut edited = candidate.clone();
+        edited.rules[0].priority = 20;
+        assert!(s.preview_for(&edited).is_none());
+        assert_eq!(
+            s.confirm_activation(ConfigV4::default(), edited)
+                .unwrap_err(),
+            UiGateError::StalePreview
+        );
+
+        // A daemon event (helper restart, failover) or a reconnect voids it.
+        s.handle_daemon(DaemonToUi::Event {
+            epoch: 1,
+            event: DaemonEvent::PrimaryChanged {
+                sequence: 9,
+                generation: 7,
+                primary: Default::default(),
+            },
+        });
+        assert!(s.preview_for(&candidate).is_none());
+        previewed(&mut s, &candidate);
+        s.handle_daemon(DaemonToUi::ConnectionEstablished { epoch: 2 });
+        assert!(s.preview_for(&candidate).is_none());
+
+        // A reply that arrives for an older connection approves nothing.
+        let mut s = session(true, true);
+        let request = sent(s.begin_preview(candidate.clone()).unwrap());
+        s.handle_daemon(DaemonToUi::ConnectionEstablished { epoch: 2 });
+        s.handle_daemon(DaemonToUi::Response {
+            epoch: 1,
+            response: preview_response(&request.request_id, vec![]),
+        });
+        assert!(s.preview_for(&candidate).is_none());
+    }
+
+    #[test]
+    fn preview_failure_is_not_an_approval_and_changes_no_save_state() {
+        let mut s = session(true, true);
+        let before = s.save_state();
+        let request = sent(s.begin_preview(profile()).unwrap());
+        s.handle_daemon(DaemonToUi::Response {
+            epoch: 1,
+            response: DaemonResponse::failure(
+                &request.request_id,
+                IpcError::new("DAEMON_PREVIEW_UNAVAILABLE", "not observed"),
+            ),
+        });
+        assert!(s.preview_for(&profile()).is_none());
+        assert_eq!(s.last_error().unwrap().code, "DAEMON_PREVIEW_UNAVAILABLE");
+        assert_eq!(s.save_state(), before);
+        assert!(s.snapshot_known(), "a read-only failure keeps the snapshot");
+    }
+
+    #[test]
+    fn double_confirmation_sends_one_apply() {
+        let mut s = session(true, true);
+        let candidate = profile();
+        previewed(&mut s, &candidate);
+        let mut apply_requests_after_double_confirm = 0;
+        for _ in 0..2 {
+            let Ok(effects) = s.confirm_activation(ConfigV4::default(), candidate.clone()) else {
+                continue;
+            };
+            for effect in effects {
+                let UiEffect::Persist(request) = effect else {
+                    continue;
+                };
+                for effect in s.handle_persistence(request.generation, Ok(())) {
+                    if let UiEffect::Send(UiRequest {
+                        request: DaemonRequest::ApplyProfile(applied),
+                        ..
+                    }) = effect
+                    {
+                        assert!(applied.enabled);
+                        apply_requests_after_double_confirm += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(apply_requests_after_double_confirm, 1);
     }
 }

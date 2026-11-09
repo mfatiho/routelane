@@ -48,6 +48,36 @@ fn empty_default_profile() -> Profile {
     }
 }
 
+/// The approved lane order, primary first, by display name.
+fn failover_order(profile: &Profile, texts: crate::ui::i18n::PrimaryTexts) -> String {
+    let lane_name = |id: &routelane::domain::LaneId| {
+        profile
+            .lanes
+            .iter()
+            .find(|lane| &lane.id == id)
+            .map_or_else(|| id.as_str().to_owned(), |lane| lane.name.clone())
+    };
+    let primary = match &profile.routing.primary {
+        routelane::domain::PrimarySelection::FollowSystemDefault => texts.system_default.to_owned(),
+        routelane::domain::PrimarySelection::Lane(id) => lane_name(id),
+    };
+    std::iter::once(primary)
+        .chain(profile.routing.backups.iter().map(lane_name))
+        .collect::<Vec<_>>()
+        .join(" → ")
+}
+
+/// What happens to traffic that no rule matches, in the given mode.
+pub(crate) fn scope_line(
+    mode: routelane::domain::UnmatchedTraffic,
+    texts: crate::ui::i18n::PrimaryTexts,
+) -> &'static str {
+    match mode {
+        routelane::domain::UnmatchedTraffic::PreserveSystem => texts.other_traffic_system,
+        routelane::domain::UnmatchedTraffic::UsePrimary => texts.other_traffic_primary,
+    }
+}
+
 fn store_profile(document: &mut ConfigV4, current: Profile) {
     if let Some(stored) = document
         .profiles
@@ -122,12 +152,13 @@ impl WindowUi {
         let aligned = !session.needs_reapply(&self.profile.borrow());
         drop(session);
         let follow_up = if active_here {
-            if let Some((id, enabled)) = enabled_change.filter(|_| aligned) {
-                AfterSave::Request(set_rule_enabled_request(candidate.id.clone(), id, enabled))
-            } else {
-                let mut request_profile = candidate.clone();
-                request_profile.enabled = true;
-                AfterSave::Request(DaemonRequest::ApplyProfile(request_profile))
+            match enabled_change.filter(|_| aligned) {
+                // Disabling a rule only narrows the managed scope.
+                Some((id, false)) => {
+                    AfterSave::Request(set_rule_enabled_request(candidate.id.clone(), id, false))
+                }
+                // Anything else can widen it: preview, disclose, then apply.
+                _ => return self.preview_then_activate(candidate, false),
             }
         } else {
             AfterSave::None
@@ -152,73 +183,130 @@ impl WindowUi {
             .confirmed_status()
             .is_none_or(|status| status.applied_profile_id.is_none());
         let fails_over = profile.routing.automatic_failover && !profile.routing.backups.is_empty();
-        if self.document.borrow().routing_notice_pending || (first_activation && fails_over) {
-            self.disclose_then_apply(&profile);
-        } else {
-            self.apply_now(false);
-        }
+        self.preview_then_activate(profile, first_activation && fails_over);
     }
 
-    /// The disclosure before automatic failover is armed. Declining saves
-    /// and activates nothing.
-    fn disclose_then_apply(self: &Rc<Self>, profile: &Profile) {
+    /// Every GUI activation asks the daemon for a read-only preview first.
+    /// Nothing is saved or applied until it returns for this exact draft; an
+    /// unavailable preview stops here.
+    fn preview_then_activate(
+        self: &Rc<Self>,
+        candidate: Profile,
+        failover_disclosure: bool,
+    ) -> bool {
+        let weak = Rc::downgrade(self);
+        let previewed = candidate.clone();
+        self.controller.preview(
+            candidate,
+            Box::new(move |result| {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                match result {
+                    Ok(preview) => ui.confirm_impact(previewed, preview, failover_disclosure),
+                    Err(error) => {
+                        let message = if error.code == "DAEMON_PREVIEW_UNAVAILABLE" {
+                            ui.texts.primary.preview_unavailable.to_owned()
+                        } else {
+                            format!("{} ({})", ui.texts.primary.preview_unavailable, error.code)
+                        };
+                        ui.toast.add_toast(&adw::Toast::new(&message));
+                        ui.render();
+                    }
+                }
+            }),
+        )
+    }
+
+    /// Discloses the scope, the migration notice, automatic failover and
+    /// every preview warning before any save or apply. Declining (Cancel,
+    /// Escape or closing) saves and activates nothing.
+    fn confirm_impact(
+        self: &Rc<Self>,
+        candidate: Profile,
+        preview: routelane::backend::RoutingPreview,
+        failover_disclosure: bool,
+    ) {
+        use crate::ui::primary::{activation_reasons, ActivationReason};
+        use routelane::backend::RoutingWarning;
+        let migrated = self.document.borrow().routing_notice_pending;
+        let reasons = activation_reasons(&candidate, migrated, &preview);
+        if reasons.is_empty() && !failover_disclosure {
+            self.activate_now(candidate, false);
+            return;
+        }
         let Some(window) = self.window.upgrade() else {
             return;
         };
-        let lane_name = |id: &routelane::domain::LaneId| {
-            profile
-                .lanes
-                .iter()
-                .find(|lane| &lane.id == id)
-                .map_or_else(|| id.as_str().to_owned(), |lane| lane.name.clone())
+        let texts = self.texts.primary;
+        let mut paragraphs = vec![];
+        if failover_disclosure {
+            paragraphs.push(
+                texts
+                    .activation_order
+                    .replace("{}", &failover_order(&candidate, texts)),
+            );
+            paragraphs.push(texts.activation_body.to_owned());
+        }
+        paragraphs.push(scope_line(candidate.routing.unmatched_traffic, texts).to_owned());
+        for reason in &reasons {
+            paragraphs.push(match reason {
+                ActivationReason::Migrated => texts.impact_migrated.to_owned(),
+                ActivationReason::UsePrimary => texts.impact_use_primary.to_owned(),
+                ActivationReason::Warning(RoutingWarning::LocalNetworkRule {
+                    rule_id,
+                    network,
+                }) => texts
+                    .impact_local_network
+                    .replace("{rule}", rule_id.as_str())
+                    .replace("{network}", &network.to_string()),
+                ActivationReason::Warning(RoutingWarning::AllTrafficRule { rule_id }) => {
+                    texts.impact_all_traffic.replace("{rule}", rule_id.as_str())
+                }
+            });
+        }
+        paragraphs.push(texts.impact_footer.to_owned());
+        let heading = if reasons.is_empty() {
+            texts.activation_heading
+        } else {
+            texts.impact_heading
         };
-        let primary = match &profile.routing.primary {
-            routelane::domain::PrimarySelection::FollowSystemDefault => {
-                self.texts.primary.system_default.to_owned()
-            }
-            routelane::domain::PrimarySelection::Lane(id) => lane_name(id),
-        };
-        let order = std::iter::once(primary)
-            .chain(profile.routing.backups.iter().map(lane_name))
-            .collect::<Vec<_>>()
-            .join(" → ");
-        let body = format!(
-            "{}\n\n{}",
-            self.texts.primary.activation_order.replace("{}", &order),
-            self.texts.primary.activation_body
-        );
         let weak = Rc::downgrade(self);
+        let cancelled = Rc::downgrade(self);
         confirm_destructive_action_with_label(
             &window,
             self.texts,
-            self.texts.primary.activation_heading,
-            &body,
+            heading,
+            &paragraphs.join("\n\n"),
             self.texts.enable_routing,
             Rc::new(move || {
                 if let Some(ui) = weak.upgrade() {
-                    ui.apply_now(true);
+                    ui.activate_now(candidate.clone(), true);
                 }
             }),
-            Rc::new(|| {}),
+            Rc::new(move || {
+                if let Some(ui) = cancelled.upgrade() {
+                    ui.render();
+                }
+            }),
         );
     }
 
-    fn apply_now(self: &Rc<Self>, acknowledged: bool) {
-        let candidate = self.profile.borrow().clone();
-        let mut request_profile = candidate.clone();
-        request_profile.enabled = true;
+    /// Saves and applies the previewed draft; a stale preview sends nothing.
+    fn activate_now(self: &Rc<Self>, candidate: Profile, acknowledged: bool) {
         let mut document = self.document.borrow().clone();
         if acknowledged {
             document.routing_notice_pending = false;
         }
         store_profile(&mut document, candidate.clone());
-        if self.controller.save(
-            document.clone(),
-            candidate,
-            AfterSave::Request(DaemonRequest::ApplyProfile(request_profile)),
-        ) {
+        if self
+            .controller
+            .confirm_activation(document.clone(), candidate.clone())
+        {
             *self.document.borrow_mut() = document;
+            *self.profile.borrow_mut() = candidate;
         }
+        self.render();
     }
 
     /// Announces each verified change of the effective IPv4 exit once, as a
@@ -1634,11 +1722,15 @@ mod tests {
             .unwrap();
         primary.emit_clicked();
         primary.emit_clicked();
-        wait_for(|| !requests.is_empty());
-        let apply = match requests.try_recv().unwrap() {
-            UiToDaemon::Request(r) => r,
-            _ => panic!("apply expected"),
-        };
+        // A read-only preview always comes first, and only once.
+        let preview = next_request(&requests);
+        assert!(matches!(preview.request, DaemonRequest::PreviewProfile(_)));
+        assert!(
+            requests.try_recv().is_err(),
+            "double activation previews once"
+        );
+        reply_preview(&events, 1, &preview, vec![]);
+        let apply = next_request(&requests);
         assert!(matches!(apply.request, DaemonRequest::ApplyProfile(_)));
         assert!(
             requests.try_recv().is_err(),
@@ -1777,6 +1869,270 @@ mod tests {
         window.destroy();
         drain();
         assert_primary_selection_is_confirmed_cancel_safe_and_reopens(&app, texts);
+        for language in [
+            routelane::config::Language::Tr,
+            routelane::config::Language::En,
+        ] {
+            assert_routing_scope_and_activation_preview(&app, language);
+        }
+    }
+
+    fn next_request(requests: &Receiver<UiToDaemon>) -> crate::models::UiRequest {
+        wait_for(|| !requests.is_empty());
+        match requests.try_recv().unwrap() {
+            UiToDaemon::Request(request) => request,
+            _ => panic!("a daemon request was expected"),
+        }
+    }
+
+    fn reply_preview(
+        events: &Sender<DaemonToUi>,
+        epoch: u64,
+        request: &crate::models::UiRequest,
+        warnings: Vec<routelane::backend::RoutingWarning>,
+    ) {
+        let DaemonRequest::PreviewProfile(profile) = &request.request else {
+            panic!("a preview was expected");
+        };
+        events
+            .try_send(DaemonToUi::Response {
+                epoch,
+                response: routelane::ipc::DaemonResponse::success(
+                    request.request_id.clone(),
+                    DaemonResult::Preview(routelane::backend::RoutingPreview {
+                        policy_hash: routelane::backend::policy_hash(
+                            profile,
+                            &routelane::backend::ResolutionSnapshot::empty(),
+                        ),
+                        warnings,
+                    }),
+                ),
+            })
+            .unwrap();
+        drain();
+    }
+
+    /// Writes a PNG of `widget` when ROUTELANE_SMOKE_SHOTS names a directory.
+    fn screenshot(widget: &impl IsA<gtk::Widget>, name: &str) {
+        let Some(directory) = std::env::var_os("ROUTELANE_SMOKE_SHOTS") else {
+            return;
+        };
+        let widget = widget.as_ref();
+        wait_for(|| widget.width() > 0 && widget.height() > 0);
+        let paintable = gtk::WidgetPaintable::new(Some(widget));
+        // The paintable has content only after the widget drew a frame.
+        let mut node = None;
+        for _ in 0..200 {
+            let snapshot = gtk::Snapshot::new();
+            paintable.snapshot(&snapshot, widget.width() as f64, widget.height() as f64);
+            node = snapshot.to_node();
+            if node.is_some() {
+                break;
+            }
+            widget.queue_draw();
+            drain();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let Some(node) = node else {
+            eprintln!("screenshot {name}: NOT CAPTURED (no rendered frame)");
+            return;
+        };
+        let renderer = widget.native().expect("a native surface").renderer();
+        let texture = renderer.render_texture(&node, None);
+        texture
+            .save_to_png(std::path::Path::new(&directory).join(name))
+            .unwrap();
+    }
+
+    fn visible_dialog(window: &adw::ApplicationWindow) -> Option<gtk::Window> {
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+            .find(|dialog| {
+                dialog.is_visible() && dialog.transient_for().as_ref() == Some(window.upcast_ref())
+            })
+    }
+
+    /// Scope selection and the preview gate on a profile with a lab rule.
+    fn assert_routing_scope_and_activation_preview(
+        app: &adw::Application,
+        language: routelane::config::Language,
+    ) {
+        use routelane::backend::RoutingWarning;
+        use routelane::domain::{
+            InterfaceSelector, Lane, LaneFailurePolicy, RuleTarget, UnmatchedTraffic,
+        };
+        let texts = language.texts();
+        let tag = format!("{language:?}").to_lowercase();
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        let mut document = ConfigV4 {
+            language,
+            ..ConfigV4::default()
+        };
+        let mut profile = empty_default_profile();
+        profile.lanes = [("ethernet", "eth0"), ("vinn", "usb0")]
+            .into_iter()
+            .map(|(id, interface)| Lane {
+                id: id.into(),
+                name: id.to_owned(),
+                interface: InterfaceSelector::from(interface),
+                fallback_lane: None,
+                failure_policy: LaneFailurePolicy::Block,
+            })
+            .collect();
+        profile.rules.push(Rule {
+            id: "lab-route".into(),
+            enabled: true,
+            priority: 10,
+            source: RuleSource::Any,
+            target: RuleTarget::Cidr("10.65.201.0/24".parse().unwrap()),
+            action: RuleAction::Route("ethernet".into()),
+        });
+        document.profiles.push(profile);
+        ConfigRepository::new(&path).save(&document).unwrap();
+        let stored = || std::fs::read(&path).unwrap();
+        let before = stored();
+
+        let (sender, requests) = async_channel::unbounded();
+        let (events, receiver) = async_channel::unbounded();
+        let window =
+            build_window_with_repository(app, sender, receiver, ConfigRepository::new(&path));
+        let snapshot = |epoch| {
+            events
+                .try_send(DaemonToUi::ConnectionEstablished { epoch })
+                .unwrap();
+            events
+                .try_send(DaemonToUi::Snapshot {
+                    epoch,
+                    status: DaemonStatus {
+                        generation: 0,
+                        event_sequence: 0,
+                        health: HealthReport::inactive(),
+                        desired_profile_id: None,
+                        applied_profile_id: None,
+                        last_error: None,
+                        primary: Default::default(),
+                    },
+                    profiles: vec![],
+                })
+                .unwrap();
+            drain();
+        };
+        snapshot(1);
+        find_named(window.upcast_ref(), "connections")
+            .unwrap()
+            .downcast::<gtk::ToggleButton>()
+            .unwrap()
+            .emit_clicked();
+        drain();
+        let scope = find_named(window.upcast_ref(), "routing-scope")
+            .unwrap()
+            .downcast::<adw::ComboRow>()
+            .unwrap();
+        assert_eq!(scope.selected(), 0, "selective is the default scope");
+        assert!(
+            scope.is_focusable() || scope.can_focus(),
+            "keyboard reachable"
+        );
+        screenshot(&window, &format!("connections-scope-{tag}.png"));
+
+        // Escape on the scope confirmation changes nothing.
+        scope.set_selected(1);
+        drain();
+        let dialog = transient(&window);
+        assert_eq!(
+            dialog.title().as_deref(),
+            Some(texts.primary.scope_change_heading)
+        );
+        screenshot(&dialog, &format!("scope-confirmation-{tag}.png"));
+        escape(&dialog);
+        drain();
+        assert_eq!(scope.selected(), 0, "Escape restores the saved scope");
+        assert_eq!(stored(), before);
+        assert!(requests.try_recv().is_err());
+
+        let activate = || {
+            find_named(window.upcast_ref(), "routing-primary")
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap()
+                .emit_clicked();
+            let request = next_request(&requests);
+            assert!(matches!(request.request, DaemonRequest::PreviewProfile(_)));
+            request
+        };
+
+        // The lab rule is disclosed before any save; Cancel sends nothing.
+        let preview = activate();
+        reply_preview(
+            &events,
+            1,
+            &preview,
+            vec![RoutingWarning::LocalNetworkRule {
+                rule_id: "lab-route".into(),
+                network: "10.65.201.0/24".parse().unwrap(),
+            }],
+        );
+        let dialog = transient(&window);
+        assert_eq!(
+            dialog.title().as_deref(),
+            Some(texts.primary.impact_heading)
+        );
+        screenshot(&dialog, &format!("impact-confirmation-{tag}.png"));
+        escape(&dialog);
+        drain();
+        assert!(
+            requests.try_recv().is_err(),
+            "cancelled impact applies nothing"
+        );
+        assert_eq!(stored(), before, "and saves nothing");
+
+        // A helper that cannot observe the networks: no dialog, no apply.
+        let preview = activate();
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: routelane::ipc::DaemonResponse::failure(
+                    preview.request_id.clone(),
+                    routelane::ipc::IpcError::new("DAEMON_PREVIEW_UNAVAILABLE", "not observed"),
+                ),
+            })
+            .unwrap();
+        drain();
+        assert!(visible_dialog(&window).is_none());
+        assert!(requests.try_recv().is_err());
+
+        // A reply from before a reconnect approves nothing.
+        let preview = activate();
+        snapshot(2);
+        reply_preview(&events, 1, &preview, vec![]);
+        assert!(visible_dialog(&window).is_none());
+        assert!(requests.try_recv().is_err());
+        assert_eq!(stored(), before);
+
+        // A current preview without warnings activates exactly once.
+        let preview = activate();
+        reply_preview(&events, 2, &preview, vec![]);
+        let apply = next_request(&requests);
+        let DaemonRequest::ApplyProfile(applied) = &apply.request else {
+            panic!("ApplyProfile expected after a current preview");
+        };
+        assert_eq!(
+            applied.routing.unmatched_traffic,
+            UnmatchedTraffic::PreserveSystem
+        );
+        assert!(requests.try_recv().is_err());
+
+        find_named(window.upcast_ref(), "overview")
+            .unwrap()
+            .downcast::<gtk::ToggleButton>()
+            .unwrap()
+            .emit_clicked();
+        drain();
+        screenshot(&window, &format!("overview-scope-{tag}.png"));
+        window.destroy();
+        drain();
     }
 
     fn assert_primary_selection_is_confirmed_cancel_safe_and_reopens(

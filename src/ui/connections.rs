@@ -13,7 +13,7 @@ use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
 use routelane::domain::{
     canonical_lane_name, validate_profile, Lane, LaneFailurePolicy, LaneId, PrimarySelection,
-    Profile, RoutingPolicy, RuleAction, RuleSource,
+    Profile, RoutingPolicy, RuleAction, RuleSource, UnmatchedTraffic,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -316,6 +316,8 @@ type PrimaryRenderKey = (RoutingPolicy, Vec<Lane>, Option<String>);
 struct PrimaryControls {
     group: adw::PreferencesGroup,
     combo: adw::ComboRow,
+    /// Which new traffic the policy manages (`routing-scope`).
+    scope: adw::ComboRow,
     backups: adw::PreferencesGroup,
     automatic: gtk::Switch,
     backup_rows: RefCell<Vec<adw::ActionRow>>,
@@ -338,6 +340,15 @@ impl PrimaryControls {
             .build();
         let combo = adw::ComboRow::builder().title(texts.primary.row).build();
         combo.set_widget_name("primary-selector");
+        let scope = adw::ComboRow::builder()
+            .title(texts.primary.scope_row)
+            .build();
+        scope.set_widget_name("routing-scope");
+        scope.set_model(Some(&gtk::StringList::new(&[
+            texts.primary.scope_selective,
+            texts.primary.scope_use_primary,
+        ])));
+        scope.update_property(&[gtk::accessible::Property::Label(texts.primary.scope_row)]);
         let automatic = gtk::Switch::builder().valign(gtk::Align::Center).build();
         automatic.set_widget_name("primary-automatic");
         automatic.update_property(&[gtk::accessible::Property::Label(texts.primary.automatic)]);
@@ -347,6 +358,7 @@ impl PrimaryControls {
             .activatable_widget(&automatic)
             .build();
         automatic_row.add_suffix(&automatic);
+        group.add(&scope);
         group.add(&combo);
         group.add(&automatic_row);
         let backups = adw::PreferencesGroup::builder()
@@ -362,6 +374,7 @@ impl PrimaryControls {
         Self {
             group,
             combo,
+            scope,
             backups,
             automatic,
             backup_rows: RefCell::new(vec![]),
@@ -542,46 +555,47 @@ impl ConnectionsPage {
                 backups,
                 ..PrimaryDraft::of(&current)
             });
-            let Some(window) = parent.upgrade() else {
-                controls.change.borrow_mut().cancel();
-                return;
-            };
-            let confirm = {
-                let controls = controls.clone();
-                let profile = profile.clone();
-                let on_save = on_save.clone();
-                Rc::new(move || {
-                    let outcome = controls.change.borrow_mut().confirm(&profile.borrow());
-                    let saved = match outcome {
-                        Ok(effects) => effects.into_iter().all(|effect| {
-                            let PrimaryEffect::Save(candidate) = effect;
-                            on_save(candidate)
-                        }),
-                        Err(_) => false,
-                    };
-                    controls.feedback.set_label(texts.ux.request_failed);
-                    controls.feedback.set_visible(!saved);
-                    // A failed or stale save shows the stored preference again.
-                    controls.rendered.borrow_mut().take();
-                    render_primary(&controls);
-                })
-            };
-            let cancel = {
-                let controls = controls.clone();
-                Rc::new(move || {
-                    controls.change.borrow_mut().cancel();
-                    controls.rendered.borrow_mut().take();
-                    render_primary(&controls);
-                })
-            };
-            confirm_destructive_action_with_label(
-                &window,
-                texts,
+            confirm_primary_change(
+                &controls,
+                &parent,
+                &profile,
+                &on_save,
                 texts.primary.change_heading,
                 &texts.primary.change_body.replace("{}", &name),
-                texts.confirm,
-                confirm,
-                cancel,
+            );
+        });
+        let controls = self.primary.clone();
+        let profile = self.profile.clone();
+        let parent = self.parent.clone();
+        let on_save = self.on_save.clone();
+        self.primary.scope.connect_selected_notify(move |scope| {
+            if controls.updating.get() {
+                return;
+            }
+            let current = profile.borrow().clone();
+            let mode = match scope.selected() {
+                0 => UnmatchedTraffic::PreserveSystem,
+                1 => UnmatchedTraffic::UsePrimary,
+                _ => return,
+            };
+            if mode == current.routing.unmatched_traffic {
+                return;
+            }
+            controls.change.borrow_mut().request(PrimaryDraft {
+                unmatched_traffic: mode,
+                ..PrimaryDraft::of(&current)
+            });
+            let body = match mode {
+                UnmatchedTraffic::PreserveSystem => texts.primary.scope_to_selective_body,
+                UnmatchedTraffic::UsePrimary => texts.primary.scope_to_primary_body,
+            };
+            confirm_primary_change(
+                &controls,
+                &parent,
+                &profile,
+                &on_save,
+                texts.primary.scope_change_heading,
+                body,
             );
         });
         let controls = self.primary.clone();
@@ -726,6 +740,60 @@ fn save_primary_draft(controls: &Rc<PrimaryControls>, current: &Profile, draft: 
 
 /// Rebuilds the controls only when the policy, lanes or OS default changed;
 /// programmatic selection never triggers the change dialog.
+/// The confirmation gate for a pending primary or scope change. Only Confirm
+/// saves; Cancel, Escape and closing the dialog discard the draft.
+fn confirm_primary_change(
+    controls: &Rc<PrimaryControls>,
+    parent: &glib::WeakRef<adw::ApplicationWindow>,
+    profile: &Rc<RefCell<Profile>>,
+    on_save: &Rc<dyn Fn(Profile) -> bool>,
+    heading: &str,
+    body: &str,
+) {
+    let texts = controls.texts;
+    let Some(window) = parent.upgrade() else {
+        controls.change.borrow_mut().cancel();
+        return;
+    };
+    let confirm = {
+        let controls = controls.clone();
+        let profile = profile.clone();
+        let on_save = on_save.clone();
+        Rc::new(move || {
+            let outcome = controls.change.borrow_mut().confirm(&profile.borrow());
+            let saved = match outcome {
+                Ok(effects) => effects.into_iter().all(|effect| {
+                    let PrimaryEffect::Save(candidate) = effect;
+                    on_save(candidate)
+                }),
+                Err(_) => false,
+            };
+            controls.feedback.set_label(texts.ux.request_failed);
+            controls.feedback.set_visible(!saved);
+            // A failed or stale save shows the stored preference again.
+            controls.rendered.borrow_mut().take();
+            render_primary(&controls);
+        })
+    };
+    let cancel = {
+        let controls = controls.clone();
+        Rc::new(move || {
+            controls.change.borrow_mut().cancel();
+            controls.rendered.borrow_mut().take();
+            render_primary(&controls);
+        })
+    };
+    confirm_destructive_action_with_label(
+        &window,
+        texts,
+        heading,
+        body,
+        texts.confirm,
+        confirm,
+        cancel,
+    );
+}
+
 fn render_primary(controls: &Rc<PrimaryControls>) {
     let profile = controls.live.borrow().clone();
     let profile = &profile;
@@ -759,6 +827,14 @@ fn render_primary(controls: &Rc<PrimaryControls>) {
     controls
         .automatic
         .set_active(profile.routing.automatic_failover);
+    let mode = profile.routing.unmatched_traffic;
+    controls.scope.set_selected(match mode {
+        UnmatchedTraffic::PreserveSystem => 0,
+        UnmatchedTraffic::UsePrimary => 1,
+    });
+    controls
+        .scope
+        .set_subtitle(crate::ui::window::scope_line(mode, texts.primary));
     for row in controls.backup_rows.borrow_mut().drain(..) {
         controls.backups.remove(&row);
     }

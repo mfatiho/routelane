@@ -1,6 +1,7 @@
 use crate::models::{DaemonToUi, UiToDaemon};
 use crate::ui::session::{AfterSave, UiEffect, UiSession};
 use async_channel::Sender;
+use routelane::backend::RoutingPreview;
 use routelane::config::{ConfigV4, PersistenceRequest, PersistenceWorker};
 use routelane::domain::Profile;
 use routelane::ipc::{DaemonRequest, DaemonResult, IpcError};
@@ -19,6 +20,16 @@ pub struct UiController {
     retry_after_refresh: Cell<bool>,
     completed_id: RefCell<Option<String>>,
     quit: RefCell<Option<Rc<dyn Fn()>>>,
+    /// The outstanding preview request, its draft and the caller's callback.
+    preview_ready: RefCell<Option<PreviewWait>>,
+}
+
+type PreviewCallback = Box<dyn FnOnce(Result<RoutingPreview, IpcError>)>;
+
+struct PreviewWait {
+    request_id: String,
+    profile: Profile,
+    on_ready: PreviewCallback,
 }
 
 impl UiController {
@@ -39,6 +50,7 @@ impl UiController {
             retry_after_refresh: Cell::new(false),
             completed_id: RefCell::new(None),
             quit: RefCell::new(None),
+            preview_ready: RefCell::new(None),
         });
         if let Some(worker) = persistence {
             let weak = Rc::downgrade(&controller);
@@ -139,6 +151,51 @@ impl UiController {
             Err(_) => false,
         }
     }
+    /// Requests a read-only preview of `profile`; `on_ready` runs once with
+    /// the preview bound to this draft and connection, or with the error.
+    pub fn preview(self: &Rc<Self>, profile: Profile, on_ready: PreviewCallback) -> bool {
+        let result = self.session.borrow_mut().begin_preview(profile.clone());
+        let Ok(effects) = result else {
+            return false;
+        };
+        let request_id = effects.iter().find_map(|effect| match effect {
+            UiEffect::Send(request) => Some(request.request_id.clone()),
+            _ => None,
+        });
+        if let Some(request_id) = request_id {
+            *self.preview_ready.borrow_mut() = Some(PreviewWait {
+                request_id,
+                profile,
+                on_ready,
+            });
+        }
+        self.execute(effects);
+        self.notify();
+        true
+    }
+
+    /// Saves and applies `profile` only while its preview is still current.
+    pub fn confirm_activation(self: &Rc<Self>, config: ConfigV4, profile: Profile) -> bool {
+        if self.persistence.is_none() {
+            return false;
+        }
+        let result = self
+            .session
+            .borrow_mut()
+            .confirm_activation(config, profile);
+        match result {
+            Ok(effects) => {
+                self.retry_used.set(false);
+                self.recovery_started.set(false);
+                self.recovery.borrow_mut().take();
+                self.execute(effects);
+                self.notify();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     pub fn refresh(self: &Rc<Self>) {
         self.execute(vec![UiEffect::RefreshSnapshot]);
     }
@@ -193,7 +250,31 @@ impl UiController {
             }
         }
         let disconnect = matches!(message, DaemonToUi::DaemonUnavailable { .. });
+        let preview_reply = match &message {
+            DaemonToUi::Response { epoch, response } => self
+                .preview_ready
+                .borrow()
+                .as_ref()
+                .is_some_and(|wait| wait.request_id == response.request_id)
+                .then_some(*epoch),
+            _ => None,
+        };
+        let reconnect = matches!(message, DaemonToUi::ConnectionEstablished { .. });
         let effects = self.session.borrow_mut().handle_daemon(message);
+        if preview_reply.is_some() || reconnect || disconnect {
+            if let Some(wait) = self.preview_ready.borrow_mut().take() {
+                let outcome = {
+                    let session = self.session.borrow();
+                    match session.preview_for(&wait.profile) {
+                        Some(preview) if preview_reply.is_some() => Ok(preview.clone()),
+                        _ => Err(session.last_error().cloned().unwrap_or_else(|| {
+                            IpcError::new("UI_PREVIEW_STALE", "the preview is no longer current")
+                        })),
+                    }
+                };
+                (wait.on_ready)(outcome);
+            }
+        }
         // The bridge already retries failed transport with bounded backoff.
         // Do not create an unbounded UI refresh -> failure -> refresh loop.
         if !disconnect {
