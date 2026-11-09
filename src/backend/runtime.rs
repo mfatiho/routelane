@@ -16,10 +16,11 @@ use super::{
     InterfaceIdentity, KernelPlan, PlanHash, PrimaryDecision, PrivilegedError, ResolutionSnapshot,
     TopologySnapshot,
 };
-use crate::domain::{LaneId, Profile};
+use crate::domain::{LaneId, Profile, UnmatchedTraffic};
 
 /// GUI/daemon/helper runtime protocol. Older peers fail closed.
-pub const RUNTIME_PROTOCOL_VERSION: u32 = 2;
+/// 3: the routing mode (`UnmatchedTraffic`) is part of the granted policy.
+pub const RUNTIME_PROTOCOL_VERSION: u32 = 3;
 /// Upper bound for an activation request (profile plus resolutions).
 pub const MAX_ACTIVATION_JSON_BYTES: usize = 1024 * 1024;
 
@@ -75,6 +76,10 @@ pub struct RuntimeStatus {
     /// held-back retry of a failed transition), from the last refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failback_in_ms: Option<u64>,
+    /// The routing mode the helper armed, from its own journaled profile.
+    /// `None` for an inactive runtime or older ownership: never a claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unmatched_traffic: Option<UnmatchedTraffic>,
 }
 
 impl Default for RuntimeStatus {
@@ -92,6 +97,7 @@ impl RuntimeStatus {
             phase: RuntimePhase::Inactive,
             last_error: None,
             failback_in_ms: None,
+            unmatched_traffic: None,
         }
     }
 }

@@ -9,7 +9,7 @@ use routelane::backend::{
     compile_profile, policy_hash, ApplyResponse, CleanupResponse, InspectResponse, KernelPlan,
     KernelSnapshot, OrphanRecoveryResponse, ResolutionSnapshot, RestoreResponse, RuntimeActivation,
     RuntimeApplyResponse, RuntimeGrant, RuntimePhase, RuntimeStatus, SnapshotInput,
-    TopologySnapshot,
+    TopologySnapshot, RUNTIME_PROTOCOL_VERSION,
 };
 use routelane::daemon::{
     AtomicJsonConfigRepository, ConfigRepository, DaemonError, DaemonService,
@@ -152,6 +152,10 @@ impl FakeHelper {
 
 #[async_trait]
 impl PrivilegedHelperClient for FakeHelper {
+    async fn runtime_protocol_version(&self) -> Result<u32, DaemonError> {
+        Ok(RUNTIME_PROTOCOL_VERSION)
+    }
+
     /// Helper2 emulation over the Helper1 bookkeeping: the helper compiles
     /// and owns the plan, and every injected behavior still applies.
     async fn activate_runtime(
@@ -182,6 +186,7 @@ impl PrivilegedHelperClient for FakeHelper {
             phase: RuntimePhase::Armed,
             last_error: None,
             failback_in_ms: None,
+            unmatched_traffic: Some(plan.unmatched_traffic),
         };
         *self.runtime.lock().unwrap() = RuntimeStatus {
             generation: plan.generation,

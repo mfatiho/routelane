@@ -5,7 +5,8 @@ use crate::domain::{Profile, ProfileId, RuleId};
 use crate::health::HealthReport;
 
 /// 2: runtime authority (helper-owned primary/backup decisions).
-pub const IPC_PROTOCOL_VERSION: u32 = 2;
+/// 3: selective routing; status reports the helper's applied routing mode.
+pub const IPC_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonEnvelope {

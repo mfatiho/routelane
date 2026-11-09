@@ -2040,6 +2040,7 @@ where
                 phase: runtime.phase,
                 last_error: runtime.last_error.clone(),
                 failback_in_ms: runtime.failback_in_ms,
+                unmatched_traffic: Some(runtime.record.profile.routing.unmatched_traffic),
             },
         }
     }
@@ -10016,6 +10017,42 @@ mod tests {
             .refresh_runtime(&fixture.observe(&replaced), Duration::from_secs(60))
             .unwrap();
         assert_eq!(effective(&later), lane_exit("vinn"));
+    }
+
+    #[test]
+    fn automatic_refresh_keeps_authorized_mode() {
+        use crate::domain::UnmatchedTraffic;
+        let fixture = RuntimeFixture::new();
+        let mut backend = fixture.backend();
+        let mut selective = activation(0);
+        selective.profile.routing.unmatched_traffic = UnmatchedTraffic::PreserveSystem;
+        let armed = backend
+            .activate_runtime(&selective, 1000, &fixture.observe(&up()), Duration::ZERO)
+            .unwrap();
+        assert_eq!(
+            armed.status.unmatched_traffic,
+            Some(UnmatchedTraffic::PreserveSystem)
+        );
+        // Failover and failback recompile only the authorized policy: the
+        // runtime can never broaden PreserveSystem into UsePrimary.
+        for (topology, second) in [(ethernet_down(), 1), (up(), 10)] {
+            let status = backend
+                .refresh_runtime(&fixture.observe(&topology), Duration::from_secs(second))
+                .unwrap();
+            assert_eq!(
+                status.unmatched_traffic,
+                Some(UnmatchedTraffic::PreserveSystem)
+            );
+            assert_eq!(status.grant, armed.status.grant);
+            let inspected = backend.inspect().unwrap();
+            assert_eq!(
+                inspected.applied_plan.unwrap().unmatched_traffic,
+                UnmatchedTraffic::PreserveSystem
+            );
+            assert_eq!(inspected.runtime, status);
+        }
+        backend.cleanup().unwrap();
+        assert_eq!(backend.runtime_status().unwrap().unmatched_traffic, None);
     }
 
     #[test]

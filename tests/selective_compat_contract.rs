@@ -17,8 +17,12 @@ struct LegacyHelper {
     fail_cleanup: bool,
 }
 
+/// A current (protocol 3) helper still holding schema-2 ownership.
 #[async_trait]
 impl PrivilegedHelperClient for LegacyHelper {
+    async fn runtime_protocol_version(&self) -> Result<u32, DaemonError> {
+        Ok(routelane::backend::RUNTIME_PROTOCOL_VERSION)
+    }
     async fn apply(&self, _: &KernelPlan) -> Result<ApplyResponse, DaemonError> {
         panic!("legacy plan cannot be applied")
     }

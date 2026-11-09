@@ -8,7 +8,7 @@ use routelane::backend::{
     forward_kernel_notifications, validate_privileged_plan, ApplicationCgroupManager, KernelPlan,
     MonitorTiming, PrivilegedService, ProcessIdentity, RuntimeActivation, RuntimePhase,
     RuntimeRefresher, RuntimeStatus, ServiceError, SystemPolkitAuthorizer, SystemPrivilegedBackend,
-    TopologySnapshot, MAX_PLAN_JSON_BYTES,
+    TopologySnapshot, MAX_PLAN_JSON_BYTES, RUNTIME_PROTOCOL_VERSION,
 };
 use routelane::domain::RuleSource;
 use serde::Serialize;
@@ -49,6 +49,12 @@ struct DbusHelper2 {
 
 #[zbus::interface(name = "io.github.routelane.Helper2")]
 impl DbusHelper2 {
+    /// Read-only capability query: the daemon checks it before it saves a
+    /// desired profile or asks for any mutation. Needs no authorization.
+    async fn get_runtime_protocol(&self) -> u32 {
+        RUNTIME_PROTOCOL_VERSION
+    }
+
     async fn activate_runtime(
         &self,
         activation_json: &str,

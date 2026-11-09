@@ -9,14 +9,18 @@ use routelane::backend::{
     ResolutionSnapshot, RuntimeActivation, RuntimeGrant, RuntimePhase, RuntimeStatus,
     RUNTIME_PROTOCOL_VERSION,
 };
+use routelane::domain::{Profile, UnmatchedTraffic};
 
 fn grant_for(topology: &routelane::backend::TopologySnapshot) -> RuntimeGrant {
-    let profile = fixtures::profile();
+    grant_with(&fixtures::profile(), topology)
+}
+
+fn grant_with(profile: &Profile, topology: &routelane::backend::TopologySnapshot) -> RuntimeGrant {
     RuntimeGrant {
         owner_uid: 1000,
         boot_id: "boot".into(),
         network_namespace: 1,
-        policy_hash: policy_hash(&profile, &ResolutionSnapshot::empty()),
+        policy_hash: policy_hash(profile, &ResolutionSnapshot::empty()),
         interfaces: profile
             .lanes
             .iter()
@@ -65,7 +69,7 @@ fn activation_schema_is_strict_and_versioned() {
         resolutions: ResolutionSnapshot::empty(),
         expected_generation: 0,
     };
-    assert_eq!(RUNTIME_PROTOCOL_VERSION, 2);
+    assert_eq!(RUNTIME_PROTOCOL_VERSION, 3);
     let mut value = serde_json::to_value(&activation).unwrap();
     value["owner_uid"] = 0.into();
     assert!(
@@ -89,4 +93,32 @@ fn grant_identity_is_the_full_kernel_identity() {
     let usb: &InterfaceIdentity = &grant.interfaces[&"vinn".into()];
     assert_eq!((usb.ifindex, usb.name.as_str()), (3, "usb0"));
     let _: PlanHash = grant.policy_hash;
+}
+
+#[test]
+fn mode_change_requires_a_new_policy_grant() {
+    let topology = fixtures::topology(true, true);
+    let mut selective = fixtures::profile();
+    selective.routing.unmatched_traffic = UnmatchedTraffic::PreserveSystem;
+    let mut primary = fixtures::profile();
+    primary.routing.unmatched_traffic = UnmatchedTraffic::UsePrimary;
+    let selective_grant = grant_with(&selective, &topology);
+    let primary_grant = grant_with(&primary, &topology);
+    assert_ne!(selective_grant.policy_hash, primary_grant.policy_hash);
+
+    // Neither grant lets a new device behind an old name acquire authority.
+    let replaced = fixtures::topology_case(true, true, true, true, "usb0", 9);
+    for grant in [&selective_grant, &primary_grant] {
+        assert!(restrict_to_grant(&replaced, grant)
+            .interface("usb0")
+            .is_none());
+    }
+
+    // Only a verified modern runtime reports a mode; an inactive or older
+    // status never claims one.
+    assert_eq!(RuntimeStatus::inactive(0).unmatched_traffic, None);
+    let mut older = serde_json::to_value(RuntimeStatus::inactive(3)).unwrap();
+    older.as_object_mut().unwrap().remove("unmatched_traffic");
+    let decoded: RuntimeStatus = serde_json::from_value(older).unwrap();
+    assert_eq!(decoded.unmatched_traffic, None);
 }

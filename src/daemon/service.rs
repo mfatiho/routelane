@@ -61,7 +61,7 @@ impl DaemonError {
     pub fn protocol_mismatch() -> Self {
         Self::new(
             "DAEMON_HELPER_PROTOCOL_MISMATCH",
-            "the installed routelane-helper does not provide runtime protocol 2; install matching RouteLane daemon and helper versions",
+            format!("the installed routelane-helper does not provide runtime protocol {RUNTIME_PROTOCOL_VERSION}; install matching RouteLane daemon and helper versions"),
         )
     }
 
@@ -120,6 +120,11 @@ pub trait ResolutionProvider: Send + Sync {
 
 #[async_trait]
 pub trait PrivilegedHelperClient: Send + Sync {
+    /// The helper's runtime protocol (read-only Helper2 query). A peer that
+    /// cannot answer is incompatible; there is no assumed default.
+    async fn runtime_protocol_version(&self) -> Result<u32, DaemonError> {
+        Err(DaemonError::protocol_mismatch())
+    }
     async fn apply(&self, plan: &KernelPlan) -> Result<ApplyResponse, DaemonError>;
     async fn restore(
         &self,
@@ -421,6 +426,10 @@ where
             self.record_failure(error.clone()).await;
             return Err(error);
         }
+        if let Err(error) = self.require_helper_protocol().await {
+            self.record_failure(error.clone()).await;
+            return Err(error);
+        }
         // Saved desired configuration is distinct from what becomes active.
         if let Err(error) = self.config.save(Some(&profile)) {
             self.record_failure(error.clone()).await;
@@ -463,6 +472,8 @@ where
             .grant
             .as_ref()
             .is_some_and(|grant| grant.policy_hash == expected_policy)
+            && plan.unmatched_traffic == profile.routing.unmatched_traffic
+            && runtime_mode_pairs(&response.status, &plan)
             && plan.profile_id == profile.id
             && plan.generation > expected_generation
             && response.status.generation == plan.generation;
@@ -550,6 +561,7 @@ where
             Some(live.generation) == inspected.generation
                 && Some(live.content_hash()) == inspected.plan_hash
                 && inspected.runtime.generation == live.generation
+                && runtime_mode_pairs(&inspected.runtime, live)
                 && (live == plan || (same_grant && live.generation > plan.generation))
         });
         let Some(live) = live else {
@@ -628,6 +640,7 @@ where
             Some(live.generation) == inspected.generation
                 && Some(live.content_hash()) == inspected.plan_hash
                 && inspected.runtime.generation == live.generation
+                && runtime_mode_pairs(&inspected.runtime, live)
                 && announced_policy.is_none_or(|policy| {
                     inspected
                         .runtime
@@ -712,6 +725,10 @@ where
 
     pub async fn deactivate(&self) -> Result<(), DaemonError> {
         let _mutation = self.mutation.lock().await;
+        if let Err(error) = self.require_helper_protocol().await {
+            self.record_failure(error.clone()).await;
+            return Err(error);
+        }
         if let Err(error) = self.ensure_reconciled().await.result {
             // A validated plan with missing live resources must remain removable.
             // The authorized helper still checks exact ownership before deleting.
@@ -767,6 +784,7 @@ where
                 "orphan recovery requires a detected orphaned-resource conflict",
             ));
         }
+        self.require_helper_protocol().await?;
         let recovered = self.helper.recover_orphaned_resources().await?;
         {
             let mut gate = self.reconciliation.lock().await;
@@ -784,6 +802,15 @@ where
         Ok(OrphanRecoveryResult {
             cleaned: recovered.cleaned,
         })
+    }
+
+    /// Read-only preflight before any desired-profile save or helper
+    /// mutation. A mismatch is reported as is: no retry, no downgrade.
+    async fn require_helper_protocol(&self) -> Result<(), DaemonError> {
+        match self.helper.runtime_protocol_version().await? {
+            RUNTIME_PROTOCOL_VERSION => Ok(()),
+            _ => Err(DaemonError::protocol_mismatch()),
+        }
     }
 
     async fn record_failure(&self, error: DaemonError) {
@@ -1100,6 +1127,7 @@ where
 
         if inspected.generation != Some(plan.generation)
             || inspected.plan_hash != Some(plan.content_hash())
+            || !runtime_mode_pairs(&inspected.runtime, &plan)
         {
             return self
                 .record_reconciliation_drift(
@@ -1328,6 +1356,14 @@ impl SystemPrivilegedHelperClient {
 
 #[async_trait]
 impl PrivilegedHelperClient for SystemPrivilegedHelperClient {
+    async fn runtime_protocol_version(&self) -> Result<u32, DaemonError> {
+        let proxy = self.runtime_proxy().await?;
+        proxy
+            .call("GetRuntimeProtocol", &())
+            .await
+            .map_err(|error| runtime_call_error("GetRuntimeProtocol", error))
+    }
+
     async fn activate_runtime(
         &self,
         activation: &RuntimeActivation,
@@ -1461,6 +1497,12 @@ where
     S: zbus::export::futures_core::Stream + Unpin,
 {
     std::future::poll_fn(|context| std::pin::Pin::new(&mut *stream).poll_next(context)).await
+}
+
+/// A runtime status pairs with a plan only when a granted runtime reports
+/// exactly the plan's mode, and a status without a grant reports none.
+fn runtime_mode_pairs(runtime: &RuntimeStatus, plan: &KernelPlan) -> bool {
+    runtime.unmatched_traffic == runtime.grant.as_ref().map(|_| plan.unmatched_traffic)
 }
 
 /// An older helper without Helper2 is an incompatible peer, not a transient

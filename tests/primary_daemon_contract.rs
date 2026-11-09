@@ -1,5 +1,5 @@
-//! Daemon IPC v2: the helper owns runtime authority and generations; the
-//! daemon only verifies, pairs and reports them.
+//! Daemon IPC v3: the helper owns runtime authority, generations and the
+//! applied routing mode; the daemon only verifies, pairs and reports them.
 
 use std::sync::{Arc, Mutex};
 
@@ -8,7 +8,7 @@ use routelane::backend::{
     compile_profile, policy_hash, CleanupResponse, FamilyExit, InspectResponse, KernelPlan,
     KernelSnapshot, OrphanRecoveryResponse, ResolutionSnapshot, RestoreResponse, RuntimeActivation,
     RuntimeApplyResponse, RuntimeGrant, RuntimePhase, RuntimeStatus, SnapshotInput,
-    TopologySnapshot,
+    TopologySnapshot, RUNTIME_PROTOCOL_VERSION,
 };
 use routelane::daemon::{
     ConfigRepository, DaemonError, DaemonService, PrivilegedHelperClient, ResolutionProvider,
@@ -16,8 +16,11 @@ use routelane::daemon::{
 };
 use routelane::domain::{
     HealthState, Profile, ProfileId, Rule, RuleAction, RuleId, RuleSource, RuleTarget,
+    UnmatchedTraffic,
 };
-use routelane::ipc::{DaemonEnvelope, DaemonEvent, DaemonRequest, DaemonResult, DaemonStatus};
+use routelane::ipc::{
+    DaemonEnvelope, DaemonEvent, DaemonRequest, DaemonResult, DaemonStatus, IPC_PROTOCOL_VERSION,
+};
 
 #[derive(Clone, Default)]
 struct EmptyTopology;
@@ -47,6 +50,13 @@ struct HelperState {
     activations: usize,
     restores: Vec<String>,
     wrong_policy: bool,
+    /// Runtime protocol this helper reports; `None` is the current one.
+    protocol: Option<u32>,
+    protocol_queries: usize,
+    cleanups: usize,
+    fail_activation: bool,
+    /// Reports a mode other than the one its plan was compiled with.
+    wrong_mode: bool,
 }
 
 /// Helper2 emulation: compiles and owns the plan, issues receipts.
@@ -72,6 +82,12 @@ impl RuntimeHelper {
 
 #[async_trait]
 impl PrivilegedHelperClient for RuntimeHelper {
+    async fn runtime_protocol_version(&self) -> Result<u32, DaemonError> {
+        let mut state = self.0.lock().unwrap();
+        state.protocol_queries += 1;
+        Ok(state.protocol.unwrap_or(RUNTIME_PROTOCOL_VERSION))
+    }
+
     async fn apply(
         &self,
         _plan: &KernelPlan,
@@ -93,6 +109,9 @@ impl PrivilegedHelperClient for RuntimeHelper {
     ) -> Result<RuntimeApplyResponse, DaemonError> {
         let mut state = self.0.lock().unwrap();
         state.activations += 1;
+        if state.fail_activation {
+            return Err(DaemonError::helper("activation failed"));
+        }
         let generation = state.live.as_ref().map_or(0, |plan| plan.generation);
         if activation.expected_generation != generation {
             return Err(DaemonError::helper("stale expected generation"));
@@ -114,8 +133,16 @@ impl PrivilegedHelperClient for RuntimeHelper {
                 ),
             );
         }
+        let mut mode = activation.profile.routing.unmatched_traffic;
+        if state.wrong_mode {
+            mode = match mode {
+                UnmatchedTraffic::PreserveSystem => UnmatchedTraffic::UsePrimary,
+                UnmatchedTraffic::UsePrimary => UnmatchedTraffic::PreserveSystem,
+            };
+        }
         state.previous = Some((state.live.clone(), state.runtime.clone()));
         state.runtime = RuntimeStatus {
+            unmatched_traffic: Some(mode),
             grant: Some(RuntimeGrant {
                 owner_uid: 1000,
                 boot_id: "boot".into(),
@@ -179,6 +206,7 @@ impl PrivilegedHelperClient for RuntimeHelper {
 
     async fn cleanup(&self) -> Result<CleanupResponse, DaemonError> {
         let mut state = self.0.lock().unwrap();
+        state.cleanups += 1;
         state.live = None;
         state.runtime = RuntimeStatus::default();
         Ok(CleanupResponse {
@@ -195,7 +223,7 @@ impl PrivilegedHelperClient for RuntimeHelper {
     }
 }
 
-/// A Helper1-only peer: no runtime methods.
+/// A Helper1-only peer: no runtime methods, not even the protocol query.
 #[derive(Clone, Default)]
 struct LegacyHelper(RuntimeHelper);
 
@@ -405,15 +433,121 @@ async fn old_protocol_is_rejected_before_mutation() {
 }
 
 #[tokio::test]
-async fn new_helper_old_client_mismatch_is_actionable() {
-    let helper = LegacyHelper::default();
-    let service = service(helper.clone(), MemoryConfig::default());
+async fn protocol2_peers_are_rejected_before_mutation() {
+    assert_eq!((IPC_PROTOCOL_VERSION, RUNTIME_PROTOCOL_VERSION), (3, 3));
+    // A protocol-2 GUI/CLI request.
+    let helper = RuntimeHelper::default();
+    let config = MemoryConfig::default();
+    let response = service(helper.clone(), config.clone())
+        .handle(DaemonEnvelope {
+            protocol_version: 2,
+            request_id: "old".into(),
+            request: DaemonRequest::ApplyProfile(profile()),
+        })
+        .await;
+    assert_eq!(
+        response.error.unwrap().code,
+        "IPC_UNSUPPORTED_PROTOCOL_VERSION"
+    );
+    assert_eq!(config.0.lock().unwrap().1, 0);
+    assert_eq!(helper.0.lock().unwrap().activations, 0);
+
+    // A Helper1-only peer and a Helper2 peer that reports protocol 2 (or an
+    // unknown newer one): mismatch before the desired profile is saved or
+    // the kernel is touched, with no retry and no downgrade.
+    let legacy = LegacyHelper::default();
+    let reports_two = RuntimeHelper::default();
+    reports_two.0.lock().unwrap().protocol = Some(2);
+    let reports_four = RuntimeHelper::default();
+    reports_four.0.lock().unwrap().protocol = Some(4);
+    for (name, state) in [
+        ("legacy", rejected_before_mutation(legacy.clone()).await),
+        ("two", rejected_before_mutation(reports_two.clone()).await),
+        ("four", rejected_before_mutation(reports_four.clone()).await),
+    ] {
+        assert!(state.desired.is_none(), "{name}");
+        assert!(state.applied.is_none(), "{name}");
+    }
+    for helper in [&legacy.0, &reports_two, &reports_four] {
+        let helper = helper.0.lock().unwrap();
+        assert_eq!((helper.activations, helper.cleanups), (0, 0));
+    }
+    for helper in [&reports_two, &reports_four] {
+        assert_eq!(
+            helper.0.lock().unwrap().protocol_queries,
+            2,
+            "one per request"
+        );
+    }
+}
+
+/// Apply and deactivate against an incompatible helper.
+async fn rejected_before_mutation<H: PrivilegedHelperClient>(
+    helper: H,
+) -> routelane::daemon::DaemonState {
+    let config = MemoryConfig::default();
+    let service = service(helper, config.clone());
     let error = service.apply_profile(profile()).await.unwrap_err();
     assert_eq!(error.code(), "DAEMON_HELPER_PROTOCOL_MISMATCH");
     assert!(error.message().contains("routelane-helper"));
-    let state = service.state().await;
-    assert!(state.applied.is_none());
-    assert_eq!(state.desired.unwrap().id, ProfileId::from("default"));
+    let config_saves_after_request = config.0.lock().unwrap().1;
+    assert_eq!(config_saves_after_request, 0);
+    let error = service.deactivate().await.unwrap_err();
+    assert_eq!(error.code(), "DAEMON_HELPER_PROTOCOL_MISMATCH");
+    assert_eq!(config.0.lock().unwrap().1, 0);
+    service.state().await
+}
+
+#[tokio::test]
+async fn status_reports_applied_not_saved_mode() {
+    let helper = RuntimeHelper::default();
+    let config = MemoryConfig::default();
+    let service = service(helper.clone(), config.clone());
+    service.apply_profile(profile()).await.unwrap();
+    let armed = status(&service).await;
+    assert_eq!(
+        armed.primary.unmatched_traffic,
+        Some(UnmatchedTraffic::PreserveSystem)
+    );
+
+    // A broader mode is saved but its activation fails: the helper stays
+    // Armed with the mode it authorized.
+    helper.0.lock().unwrap().fail_activation = true;
+    let mut broad = profile();
+    broad.routing.unmatched_traffic = UnmatchedTraffic::UsePrimary;
+    service.apply_profile(broad).await.unwrap_err();
+    let saved = config.0.lock().unwrap().0.clone().unwrap();
+    assert_eq!(
+        saved.routing.unmatched_traffic,
+        UnmatchedTraffic::UsePrimary
+    );
+
+    // An automatic transition, a helper restart and a daemon restart keep it.
+    let automatic = helper.transition(RuntimePhase::Armed);
+    service.on_runtime_changed(automatic).await;
+    service.resync_runtime().await;
+    let restarted = self::service(helper.clone(), config);
+    for current in [status(&service).await, status(&restarted).await] {
+        assert_eq!(current.primary.phase, RuntimePhase::Armed);
+        assert_eq!(
+            current.primary.unmatched_traffic,
+            Some(UnmatchedTraffic::PreserveSystem)
+        );
+    }
+}
+
+#[tokio::test]
+async fn helper_mode_must_pair_with_its_plan() {
+    let helper = RuntimeHelper::default();
+    helper.0.lock().unwrap().wrong_mode = true;
+    let service = service(helper.clone(), MemoryConfig::default());
+    let error = service.apply_profile(profile()).await.unwrap_err();
+    assert_eq!(error.code(), "DAEMON_HELPER_RESPONSE_MISMATCH");
+    assert_eq!(
+        helper.0.lock().unwrap().restores,
+        vec!["receipt-0".to_owned()]
+    );
+    assert!(service.state().await.applied.is_none());
 }
 
 #[tokio::test]
