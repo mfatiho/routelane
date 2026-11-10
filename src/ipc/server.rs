@@ -139,10 +139,22 @@ where
         .as_mut()
         .expect("subscribe requests create an event receiver");
     loop {
-        match events.recv().await {
-            Ok(event) => write_frame(&mut stream, &event).await?,
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        tokio::select! {
+            event = events.recv() => match event {
+                Ok(event) => write_frame(&mut stream, &event).await?,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
+            ready = stream.readable() => {
+                ready.map_err(|error| IpcError::new("IPC_READ_FAILED", error.to_string()))?;
+                let mut byte = [0];
+                match stream.try_read(&mut byte) {
+                    // Subscriptions are server-to-client only after the acknowledgement.
+                    Ok(_) => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) => return Err(IpcError::new("IPC_READ_FAILED", error.to_string())),
+                }
+            }
         }
     }
 }

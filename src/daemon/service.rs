@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use tokio::process::Command;
 use tokio::sync::{broadcast, Mutex};
 
-use crate::application::{matching_processes, RunningProcess};
+use crate::application::{is_sandbox_launcher, matching_processes, RunningProcess};
 use crate::backend::{
     policy_hash, routing_preview, AppliedKernelState, ApplyResponse, CleanupResponse,
     InspectResponse, KernelPlan, OrphanRecoveryResponse, PlanHash, ResolutionSnapshot,
@@ -20,8 +20,8 @@ use crate::backend::{
 };
 use crate::dns::periodic::resolve_domain;
 use crate::domain::{
-    normalize_lane_names, validate_profile, HealthState, Profile, ProfileId, RuleId, RuleSource,
-    RuleTarget,
+    normalize_lane_names, validate_profile, HealthState, Lane, Profile, ProfileId, RuleId,
+    RuleSource, RuleTarget,
 };
 use crate::health::{
     evaluate_health, kernel_resources_match_plan, Diagnostic, DiagnosticCode, DiagnosticSubject,
@@ -170,6 +170,9 @@ pub trait PrivilegedHelperClient: Send + Sync {
 }
 
 pub trait ConfigRepository: Send + Sync {
+    fn saved_lanes(&self) -> Vec<Lane> {
+        vec![]
+    }
     fn language(&self) -> Language {
         Language::default()
     }
@@ -249,14 +252,7 @@ where
         let usage = self.usage()?;
         match request {
             DaemonRequest::GetUsage { fast_lane } => {
-                let lanes = self
-                    .state
-                    .lock()
-                    .await
-                    .desired
-                    .as_ref()
-                    .map(|profile| profile.lanes.clone())
-                    .unwrap_or_default();
+                let lanes = self.usage_lanes().await;
                 Ok(DaemonResult::Usage(usage.report(&lanes, fast_lane)))
             }
             DaemonRequest::SetQuota { lane_id, quota } => {
@@ -284,34 +280,38 @@ where
         }
     }
 
-    async fn require_usage_lane(&self, id: &crate::domain::LaneId) -> Result<(), DaemonError> {
-        if self
+    /// Desired lanes take precedence over other saved profiles with the same lane id.
+    pub async fn usage_lanes(&self) -> Vec<Lane> {
+        let mut lanes = self
             .state
             .lock()
             .await
             .desired
             .as_ref()
-            .is_some_and(|profile| profile.lanes.iter().any(|lane| &lane.id == id))
-        {
+            .map(|profile| profile.lanes.clone())
+            .unwrap_or_default();
+        for lane in self.config.saved_lanes() {
+            if !lanes.iter().any(|existing| existing.id == lane.id) {
+                lanes.push(lane);
+            }
+        }
+        lanes
+    }
+
+    async fn require_usage_lane(&self, id: &crate::domain::LaneId) -> Result<(), DaemonError> {
+        if self.usage_lanes().await.iter().any(|lane| &lane.id == id) {
             Ok(())
         } else {
             Err(DaemonError::validation(
-                "lane is not in the desired profile",
+                "lane is not in a desired or saved profile",
             ))
         }
     }
 
-    /// Samples only desired lanes. This never reconciles or takes the routing mutation lock.
+    /// Samples desired and saved lanes without reconciling or taking the routing mutation lock.
     pub async fn sample_usage(&self) {
         if let Some(usage) = &self.usage {
-            let lanes = self
-                .state
-                .lock()
-                .await
-                .desired
-                .as_ref()
-                .map(|profile| profile.lanes.clone())
-                .unwrap_or_default();
+            let lanes = self.usage_lanes().await;
             self.quota_crossings(usage.tick(&lanes)).await;
         }
     }
@@ -354,12 +354,12 @@ where
                     continue;
                 }
             }
-            let lane = state
-                .desired
-                .as_ref()
-                .and_then(|profile| profile.lanes.iter().find(|lane| lane.id == lane_id))
-                .cloned();
             drop(state);
+            let lane = self
+                .usage_lanes()
+                .await
+                .into_iter()
+                .find(|lane| lane.id == lane_id);
             if let Some(lane) = lane {
                 if let Some(quota) = usage
                     .report(std::slice::from_ref(&lane), None)
@@ -590,13 +590,10 @@ where
         for program in std::iter::once(&selector.executable_path)
             .chain(selector.launch.as_ref().map(|launch| &launch.executable))
         {
-            let resolved = fs::canonicalize(program).map_err(|error| {
+            fs::canonicalize(program).map_err(|error| {
                 DaemonError::validation(format!("application executable is unavailable: {error}"))
             })?;
-            if matches!(
-                resolved.file_name().and_then(|name| name.to_str()),
-                Some("snap" | "flatpak")
-            ) {
+            if is_sandbox_launcher(program) {
                 return Err(DaemonError::new(
                     "DAEMON_APPLICATION_SANDBOX_UNSUPPORTED",
                     "Snap/Flatpak application routing is not supported. Select an application installed directly on the host.",
@@ -1843,6 +1840,20 @@ impl AtomicJsonConfigRepository {
 }
 
 impl ConfigRepository for AtomicJsonConfigRepository {
+    fn saved_lanes(&self) -> Vec<Lane> {
+        self.path
+            .parent()
+            .and_then(|parent| crate::config::load_config_file(&parent.join("config.json")).ok())
+            .map(|document| {
+                document
+                    .profiles
+                    .into_iter()
+                    .flat_map(|profile| profile.lanes)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn language(&self) -> Language {
         // desired-profile.json holds routing intent only. The adjacent UI config
         // document owns the session language; reading it must never save/migrate it.

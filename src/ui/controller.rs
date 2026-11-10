@@ -8,9 +8,16 @@ use routelane::ipc::DaemonEvent;
 use routelane::ipc::{DaemonRequest, DaemonResult, IpcError};
 use routelane::usage::{events::EventCategory, quota::LaneQuota, store::QuotaCrossing};
 use std::cell::{Cell, Ref, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 type QuotaCallback = Rc<dyn Fn(&LaneId, &QuotaCrossing)>;
+type QuotaSaveCallback = Box<dyn FnOnce(Result<(), IpcError>)>;
+
+struct QuotaWait {
+    correction: Option<DaemonRequest>,
+    on_done: QuotaSaveCallback,
+}
 
 pub struct UiController {
     session: RefCell<UiSession>,
@@ -27,6 +34,7 @@ pub struct UiController {
     /// The outstanding preview request, its draft and the caller's callback.
     preview_ready: RefCell<Option<PreviewWait>>,
     quota_observers: RefCell<Vec<QuotaCallback>>,
+    quota_ready: RefCell<BTreeMap<String, QuotaWait>>,
     event_category: Cell<EventCategory>,
 }
 
@@ -58,6 +66,7 @@ impl UiController {
             quit: RefCell::new(None),
             preview_ready: RefCell::new(None),
             quota_observers: RefCell::new(vec![]),
+            quota_ready: RefCell::new(BTreeMap::new()),
             event_category: Cell::new(EventCategory::All),
         });
         if let Some(worker) = persistence {
@@ -207,23 +216,82 @@ impl UiController {
     pub fn refresh_usage(self: &Rc<Self>, fast_lane: Option<LaneId>) {
         self.request(DaemonRequest::GetUsage { fast_lane }, None);
     }
-    pub fn save_quota(self: &Rc<Self>, lane_id: LaneId, quota: Option<LaneQuota>) -> bool {
+    pub fn save_quota(
+        self: &Rc<Self>,
+        lane_id: LaneId,
+        quota: Option<LaneQuota>,
+        used: Option<u64>,
+        on_done: Box<dyn FnOnce(Result<(), IpcError>)>,
+    ) -> bool {
         if quota.as_ref().is_some_and(|q| q.validate().is_err()) {
             return false;
         }
-        self.request(DaemonRequest::SetQuota { lane_id, quota }, None)
-    }
-    pub fn clear_events(self: &Rc<Self>) -> bool {
-        self.request(DaemonRequest::ClearEvents, None)
-    }
-    pub fn correct_usage(self: &Rc<Self>, lane_id: LaneId, used_bytes: u64) -> bool {
-        self.request(
-            DaemonRequest::CorrectUsage {
-                lane_id,
-                used_bytes,
+        let result = self.session.borrow_mut().begin_request(
+            DaemonRequest::SetQuota {
+                lane_id: lane_id.clone(),
+                quota,
             },
             None,
-        )
+        );
+        let Ok(effects) = result else { return false };
+        let correction = used.map(|used_bytes| DaemonRequest::CorrectUsage {
+            lane_id,
+            used_bytes,
+        });
+        self.track_quota(
+            effects,
+            QuotaWait {
+                correction,
+                on_done,
+            },
+        );
+        true
+    }
+
+    fn track_quota(self: &Rc<Self>, effects: Vec<UiEffect>, wait: QuotaWait) {
+        let request_id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                UiEffect::Send(request) => Some(request.request_id.clone()),
+                _ => None,
+            })
+            .expect("quota mutations always send a request");
+        self.quota_ready.borrow_mut().insert(request_id, wait);
+        self.execute(effects);
+        self.notify();
+    }
+
+    fn finish_quota(self: &Rc<Self>, request_id: &str, result: Result<(), IpcError>) {
+        let wait = self.quota_ready.borrow_mut().remove(request_id);
+        let Some(wait) = wait else { return };
+        if result.is_ok() {
+            if let Some(correction) = wait.correction {
+                let effects = self.session.borrow_mut().begin_request(correction, None);
+                match effects {
+                    Ok(effects) => self.track_quota(
+                        effects,
+                        QuotaWait {
+                            correction: None,
+                            on_done: wait.on_done,
+                        },
+                    ),
+                    Err(_) => (wait.on_done)(Err(IpcError::new(
+                        "UI_REQUEST_REJECTED",
+                        "usage correction could not be sent",
+                    ))),
+                }
+                return;
+            }
+        }
+        let saved = result.is_ok();
+        (wait.on_done)(result);
+        if saved {
+            self.refresh_usage(None);
+        }
+    }
+
+    pub fn clear_events(self: &Rc<Self>) -> bool {
+        self.request(DaemonRequest::ClearEvents, None)
     }
     pub fn refresh_events(self: &Rc<Self>, category: EventCategory) {
         self.event_category.set(category);
@@ -292,7 +360,7 @@ impl UiController {
             _ => None,
         };
         let quota_saved = matches!(&message, DaemonToUi::Response { epoch, response }
-            if *epoch == self.session().connection_epoch() && response.error.is_none() && matches!(response.result, Some(DaemonResult::QuotaSaved)));
+            if *epoch == self.session().connection_epoch() && response.error.is_none() && matches!(response.result, Some(DaemonResult::QuotaSaved)) && !self.quota_ready.borrow().contains_key(&response.request_id));
         if let DaemonToUi::Response { epoch, response } = &message {
             let session = self.session.borrow();
             if session.accepts_reply(*epoch, &response.request_id) {
@@ -326,8 +394,43 @@ impl UiController {
                 .then_some(*epoch),
             _ => None,
         };
+        let quota_failures = match &message {
+            DaemonToUi::DaemonUnavailable {
+                epoch,
+                request_id,
+                error,
+            } if *epoch == self.session().connection_epoch() => self
+                .quota_ready
+                .borrow()
+                .keys()
+                .filter(|id| {
+                    request_id
+                        .as_ref()
+                        .is_none_or(|request_id| request_id == *id)
+                })
+                .map(|id| (id.clone(), error.clone()))
+                .collect::<Vec<_>>(),
+            DaemonToUi::ConnectionEstablished { epoch }
+                if *epoch > self.session().connection_epoch() =>
+            {
+                self.quota_ready
+                    .borrow()
+                    .keys()
+                    .map(|id| {
+                        (
+                            id.clone(),
+                            IpcError::new("UI_CONNECTION_CHANGED", "daemon connection changed"),
+                        )
+                    })
+                    .collect()
+            }
+            _ => vec![],
+        };
         let reconnect = matches!(message, DaemonToUi::ConnectionEstablished { .. });
         let effects = self.session.borrow_mut().handle_daemon(message);
+        for (request_id, error) in quota_failures {
+            self.finish_quota(&request_id, Err(error));
+        }
         if preview_reply.is_some() || reconnect || disconnect {
             if let Some(wait) = self.preview_ready.borrow_mut().take() {
                 let outcome = {
@@ -387,6 +490,9 @@ impl UiController {
     fn execute(self: &Rc<Self>, effects: Vec<UiEffect>) {
         for effect in effects {
             match effect {
+                UiEffect::QuotaFinished { request_id, result } => {
+                    self.finish_quota(&request_id, result)
+                }
                 UiEffect::QuitApplication => {
                     if let Some(quit) = self.quit.borrow().clone() {
                         quit();
@@ -516,6 +622,92 @@ mod tests {
                 test(controller, requests, written, results, &context);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn quota_save_reports_the_daemon_error_and_sends_correction_only_after_success() {
+        run(false, |controller, requests, _, _, context| {
+            let outcomes = Rc::new(RefCell::new(Vec::new()));
+            let quota = LaneQuota {
+                enabled: true,
+                limit_bytes: 20_000_000_000,
+                reset_day: 1,
+                warn_percent: 80,
+            };
+            for fail in [true, false] {
+                let done = outcomes.clone();
+                assert!(controller.save_quota(
+                    "vinn".into(),
+                    Some(quota.clone()),
+                    Some(16_000_000_000),
+                    Box::new(move |result| done.borrow_mut().push(result))
+                ));
+                drain(context);
+                let UiToDaemon::Request(set) = requests.try_recv().unwrap() else {
+                    panic!("expected SetQuota")
+                };
+                assert!(matches!(set.request, DaemonRequest::SetQuota { .. }));
+                assert!(
+                    requests.try_recv().is_err(),
+                    "correction waits for SetQuota success"
+                );
+                assert_eq!(outcomes.borrow().len(), usize::from(!fail));
+                controller.receive(DaemonToUi::Response {
+                    epoch: 1,
+                    response: if fail {
+                        DaemonResponse::failure(
+                            set.request_id,
+                            IpcError::new("DAEMON_PROFILE_INVALID", "quota rejected"),
+                        )
+                    } else {
+                        DaemonResponse::success(set.request_id, DaemonResult::QuotaSaved)
+                    },
+                });
+                drain(context);
+                if fail {
+                    assert_eq!(
+                        outcomes.borrow()[0].as_ref().unwrap_err().code,
+                        "DAEMON_PROFILE_INVALID"
+                    );
+                    assert_eq!(
+                        outcomes.borrow()[0].as_ref().unwrap_err().message,
+                        "quota rejected"
+                    );
+                    assert!(
+                        requests.try_recv().is_err(),
+                        "failure must not send CorrectUsage"
+                    );
+                } else {
+                    let mut correction = None;
+                    while let Ok(request) = requests.try_recv() {
+                        if let UiToDaemon::Request(request) = request {
+                            match request.request {
+                                DaemonRequest::CorrectUsage {
+                                    ref lane_id,
+                                    used_bytes,
+                                } => {
+                                    assert_eq!(lane_id.as_str(), "vinn");
+                                    assert_eq!(used_bytes, 16_000_000_000);
+                                    assert!(correction.replace(request).is_none());
+                                }
+                                DaemonRequest::GetUsage { .. } => {}
+                                other => panic!("unexpected request: {other:?}"),
+                            }
+                        }
+                    }
+                    assert_eq!(outcomes.borrow().len(), 1, "wait for correction reply");
+                    controller.receive(DaemonToUi::Response {
+                        epoch: 1,
+                        response: DaemonResponse::success(
+                            correction.unwrap().request_id,
+                            DaemonResult::QuotaSaved,
+                        ),
+                    });
+                    assert_eq!(outcomes.borrow().len(), 2);
+                    assert!(outcomes.borrow()[1].is_ok());
+                }
+            }
+        });
     }
 
     #[test]

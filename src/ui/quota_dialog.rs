@@ -125,14 +125,19 @@ pub fn open(
         }
         let new_used = (values[3].unwrap_or(0.0) * 1e9).round() as u64;
         let correction = enabled.is_active() && used.text().as_str() != original_used_text && new_used != original_used;
-        if !controller.save_quota(lane_id.clone(), enabled.is_active().then_some(quota)) {
+        let pending_form = form_copy.clone();
+        let focus = limit.clone();
+        if !controller.save_quota(
+            lane_id.clone(),
+            enabled.is_active().then_some(quota),
+            correction.then_some(new_used),
+            Box::new(move |result| match result {
+                Ok(()) => pending_form.dialog.close(),
+                Err(error) => pending_form.error(&error.message, &focus),
+            }),
+        ) {
             form_copy.error(texts.ux.request_failed, &limit);
-            return;
         }
-        if correction {
-            controller.correct_usage(lane_id.clone(), new_used);
-        }
-        form_copy.dialog.close();
     });
     form.disconnect_on_close(handler);
     form.dialog.present();

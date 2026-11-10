@@ -6,6 +6,7 @@ use routelane::{
     ipc::*,
     usage::{calendar::*, counters::*, events::*, service::*, store::*},
 };
+use std::os::unix::fs::PermissionsExt;
 use std::sync::{
     atomic::{AtomicI64, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -419,4 +420,189 @@ fn rates_use_elapsed_seconds_expire_and_clear_on_disconnect() {
         report.lanes[0].today,
         routelane::usage::UsageTotals { rx: 2000, tx: 200 }
     );
+}
+
+fn saved_profile(interface: &str) -> Profile {
+    let mut lane = lane("vinn");
+    lane.interface = interface.into();
+    Profile {
+        id: "saved".into(),
+        name: "Saved".into(),
+        enabled: false,
+        lanes: vec![lane],
+        rules: vec![],
+        routing: Default::default(),
+    }
+}
+
+fn saved_lane_daemon(
+    f: &Fixture,
+    desired: Option<&Profile>,
+    profiles: Vec<Profile>,
+) -> DaemonService<Forbidden, Forbidden, Forbidden, AtomicJsonConfigRepository> {
+    routelane::config::ConfigRepository::new(f._dir.path().join("config.json"))
+        .save(&routelane::config::ConfigV4 {
+            profiles,
+            ..Default::default()
+        })
+        .unwrap();
+    let repository = AtomicJsonConfigRepository::new(f._dir.path().join("desired-profile.json"));
+    if desired.is_some() {
+        repository.save(desired).unwrap();
+    }
+    DaemonService::new(
+        f.forbidden.clone(),
+        f.forbidden.clone(),
+        f.forbidden.clone(),
+        repository,
+    )
+    .unwrap()
+    .with_usage(f.usage.clone())
+}
+
+#[tokio::test]
+async fn saved_but_unapplied_lanes_are_sampled_and_accept_a_quota() {
+    let f = fixture();
+    let daemon = saved_lane_daemon(&f, None, vec![saved_profile("usb0")]);
+    let config_path = f._dir.path().join("config.json");
+    let before = std::fs::read(&config_path).unwrap();
+    assert!(daemon.state().await.desired.is_none());
+    *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+        ifindex: 1,
+        rx_bytes: 100,
+        tx_bytes: 10,
+    });
+    let response = daemon
+        .handle(DaemonEnvelope::new(
+            "read",
+            DaemonRequest::GetUsage { fast_lane: None },
+        ))
+        .await;
+    let Some(DaemonResult::Usage(report)) = response.result else {
+        panic!("{response:?}")
+    };
+    assert_eq!(report.lanes.len(), 1);
+    assert_eq!(report.lanes[0].interface, "usb0");
+    assert!(report.lanes[0].available);
+    let response = daemon
+        .handle(DaemonEnvelope::new(
+            "quota",
+            DaemonRequest::SetQuota {
+                lane_id: "vinn".into(),
+                quota: Some(quota()),
+            },
+        ))
+        .await;
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(matches!(response.result, Some(DaemonResult::QuotaSaved)));
+    daemon.sample_usage().await;
+    *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+        ifindex: 1,
+        rx_bytes: 1100,
+        tx_bytes: 110,
+    });
+    daemon.sample_usage().await;
+    let response = daemon
+        .handle(DaemonEnvelope::new(
+            "sampled",
+            DaemonRequest::GetUsage { fast_lane: None },
+        ))
+        .await;
+    let Some(DaemonResult::Usage(report)) = response.result else {
+        panic!("{response:?}")
+    };
+    assert_eq!(
+        report.lanes[0].today,
+        routelane::usage::UsageTotals { rx: 1000, tx: 100 }
+    );
+    let response = daemon
+        .handle(DaemonEnvelope::new(
+            "correct",
+            DaemonRequest::CorrectUsage {
+                lane_id: "vinn".into(),
+                used_bytes: 1200,
+            },
+        ))
+        .await;
+    assert!(
+        matches!(response.result, Some(DaemonResult::QuotaSaved)),
+        "{response:?}"
+    );
+    assert_eq!(
+        std::fs::read(config_path).unwrap(),
+        before,
+        "usage never rewrites UI config"
+    );
+    assert!(!f._dir.path().join("desired-profile.json").exists());
+    assert_eq!(f.forbidden.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn applied_lane_wins_over_a_saved_lane_with_the_same_id() {
+    let f = fixture();
+    let desired = saved_profile("usb0");
+    let mut second = saved_profile("wlan10");
+    second.id = "second".into();
+    second.name = "Second".into();
+    let daemon = saved_lane_daemon(&f, Some(&desired), vec![saved_profile("wlan9"), second]);
+    let response = daemon
+        .handle(DaemonEnvelope::new(
+            "read",
+            DaemonRequest::GetUsage { fast_lane: None },
+        ))
+        .await;
+    let Some(DaemonResult::Usage(report)) = response.result else {
+        panic!("{response:?}")
+    };
+    assert_eq!(report.lanes.len(), 1);
+    assert_eq!(report.lanes[0].lane_id.as_str(), "vinn");
+    assert_eq!(report.lanes[0].interface, "usb0");
+    assert_eq!(f.forbidden.0.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn saved_lane_discovery_is_read_only_and_tolerates_missing_or_invalid_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let repository = AtomicJsonConfigRepository::new(dir.path().join("desired-profile.json"));
+    assert!(repository.saved_lanes().is_empty());
+    assert!(!path.exists());
+    std::fs::write(&path, b"invalid config").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(repository.saved_lanes().is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), b"invalid config");
+    let legacy = br#"{"schema_version":2,"language":"tr","profiles":[]}"#;
+    std::fs::write(&path, legacy).unwrap();
+    assert!(repository.saved_lanes().is_empty());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        legacy,
+        "legacy config is never migrated on disk"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "no backup or replacement files"
+    );
+    let mut second = saved_profile("wlan9");
+    second.id = "second".into();
+    second.name = "Second".into();
+    routelane::config::ConfigRepository::new(&path)
+        .save(&routelane::config::ConfigV4 {
+            profiles: vec![saved_profile("usb0"), second],
+            ..Default::default()
+        })
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let lanes = repository.saved_lanes();
+    assert_eq!(lanes.len(), 2, "all saved profiles are read");
+    assert_eq!(lanes[0].interface.as_str(), "usb0");
+    assert_eq!(lanes[1].interface.as_str(), "wlan9");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        modified
+    );
+    assert!(!dir.path().join("desired-profile.json").exists());
 }

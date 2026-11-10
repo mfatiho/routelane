@@ -1323,3 +1323,34 @@ async fn write_frame_and_read_frame_round_trip_json() {
 
     assert_eq!(decoded, envelope);
 }
+
+#[tokio::test]
+async fn closed_subscriber_is_dropped_without_waiting_for_an_event() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("runtime/routelane.sock");
+    let (service, _, _) = service();
+    let server = UnixSocketServer::bind_at(path.clone(), service.clone())
+        .await
+        .unwrap();
+    let task = tokio::spawn(server.run());
+    let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+    write_frame(
+        &mut stream,
+        &DaemonEnvelope::new("idle", DaemonRequest::Subscribe),
+    )
+    .await
+    .unwrap();
+    let response: routelane::ipc::DaemonResponse = read_frame(&mut stream).await.unwrap();
+    assert!(matches!(response.result, Some(DaemonResult::Subscribed)));
+    assert_eq!(service.subscriber_count(), 1);
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while service.subscriber_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("closed subscriber must be dropped without an event");
+    assert_eq!(service.subscriber_count(), 0);
+    task.abort();
+}

@@ -130,6 +130,8 @@ struct WindowUi {
     settings: RefCell<Option<adw::PreferencesWindow>>,
     toast: adw::ToastOverlay,
     last_notice: RefCell<Option<String>>,
+    #[cfg(test)]
+    last_desktop_notice: RefCell<Option<String>>,
     /// Last verified effective exit, to announce each transition once.
     last_effective: RefCell<Option<routelane::backend::FamilyPair<routelane::backend::FamilyExit>>>,
     recovery_dialog_open: Cell<bool>,
@@ -1033,12 +1035,16 @@ fn build_window_with_repository(
         settings: RefCell::new(None),
         toast,
         last_notice: RefCell::new(None),
+        #[cfg(test)]
+        last_desktop_notice: RefCell::new(None),
         last_effective: RefCell::new(None),
         recovery_dialog_open: Cell::new(false),
         quick_application,
         preferences,
     });
     *weak_slot.borrow_mut() = Rc::downgrade(&ui);
+    #[cfg(test)]
+    tests::LAST_UI.with(|slot| *slot.borrow_mut() = Rc::downgrade(&ui));
     let weak = Rc::downgrade(&ui);
     controller.connect_changed(Rc::new(move || {
         if let Some(ui) = weak.upgrade() {
@@ -1161,6 +1167,27 @@ fn build_window_with_repository(
             next_reset,
             texts.language,
         );
+        let Some(window) = ui.window.upgrade() else {
+            return;
+        };
+        if !(window.is_visible() && window.is_active()) {
+            if let Some(application) = window.application() {
+                let notification =
+                    gtk::gio::Notification::new(texts.usage.quota_notification_title);
+                notification.set_body(Some(&message));
+                #[cfg(test)]
+                ui.last_desktop_notice.replace(Some(message));
+                // The isolated smoke bus has no notification service. Record the
+                // attempted notice in tests without invoking its D-Bus transport.
+                if !cfg!(test) {
+                    application.send_notification(
+                        Some(&format!("quota-{}", lane_id.as_str())),
+                        &notification,
+                    );
+                }
+            }
+            return;
+        }
         let toast = adw::Toast::new(&glib::markup_escape_text(&message));
         toast.set_button_label(Some(texts.usage.detail));
         toast.set_action_name(Some("win.show-lane-detail"));
@@ -1340,6 +1367,10 @@ mod tests {
     use super::*;
     use routelane::health::HealthReport;
     use routelane::ipc::DaemonStatus;
+
+    thread_local! {
+        pub(super) static LAST_UI: RefCell<Weak<WindowUi>> = const { RefCell::new(Weak::new()) };
+    }
 
     fn find_named(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
         if widget.widget_name().as_str() == name {
@@ -2592,6 +2623,9 @@ mod tests {
             })
             .unwrap();
         wait_for(|| row_count(&page, "events-list") == 0);
+        let ui = LAST_UI.with(|slot| slot.borrow().upgrade().unwrap());
+        assert!(ui.last_desktop_notice.borrow().is_none());
+        let mut hidden_notice = None;
         for (sequence, crossing, expected) in [
             (
                 3,
@@ -2618,6 +2652,14 @@ mod tests {
                 },
             ),
         ] {
+            if sequence == 3 {
+                window.hide();
+                drain();
+                assert!(!window.is_visible());
+            } else {
+                window.present();
+                wait_for(|| window.is_visible() && window.is_active());
+            }
             events
                 .try_send(DaemonToUi::Event {
                     epoch: 1,
@@ -2628,7 +2670,22 @@ mod tests {
                     },
                 })
                 .unwrap();
+            if sequence == 3 {
+                wait_for(|| ui.last_desktop_notice.borrow().as_deref() == Some(expected));
+                hidden_notice = ui.last_desktop_notice.borrow().clone();
+                assert!(
+                    !has_text(window.upcast_ref(), expected),
+                    "hidden quota event sends no toast"
+                );
+                while requests.try_recv().is_ok() {}
+                continue;
+            }
             wait_for(|| has_text(window.upcast_ref(), expected));
+            assert_eq!(
+                *ui.last_desktop_notice.borrow(),
+                hidden_notice,
+                "visible active window only toasts"
+            );
             find_button(window.upcast_ref(), texts.usage.detail)
                 .unwrap()
                 .emit_clicked();
@@ -2662,6 +2719,7 @@ mod tests {
     fn assert_usage_screens(app: &adw::Application, language: routelane::config::Language) {
         use routelane::{
             domain::{Lane, LaneFailurePolicy},
+            ipc::DaemonResponse,
             usage::{
                 quota::LaneQuota,
                 service::{LaneUsage, QuotaStatus, UsageRate, UsageReport},
@@ -3023,6 +3081,43 @@ mod tests {
             before,
             "quota never changes the routing configuration"
         );
+        assert!(dialog.is_visible(), "quota dialog waits for daemon reply");
+        assert!(!save.is_sensitive(), "Save stays disabled while waiting");
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::failure(
+                    saved.request_id,
+                    routelane::ipc::IpcError::new(
+                        "DAEMON_PROFILE_INVALID",
+                        "quota rejected by daemon",
+                    ),
+                ),
+            })
+            .unwrap();
+        let feedback = find_named(dialog.upcast_ref(), "form-feedback")
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        wait_for(|| feedback.is_visible() && save.is_sensitive());
+        assert!(dialog.is_visible(), "daemon error keeps quota dialog open");
+        assert_eq!(feedback.text(), "quota rejected by daemon");
+        save.emit_clicked();
+        save.emit_clicked();
+        let retry = next_request(&requests);
+        assert!(matches!(retry.request, DaemonRequest::SetQuota { .. }));
+        assert!(
+            requests.try_recv().is_err(),
+            "retry still sends one SetQuota"
+        );
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(retry.request_id, DaemonResult::QuotaSaved),
+            })
+            .unwrap();
+        wait_for(|| !dialog.is_visible());
+        while requests.try_recv().is_ok() {}
         // An enabled quota with edited usage sends one correction after SetQuota.
         let dialog = open_quota();
         spin(&dialog, "quota-used").set_value(16.0);
@@ -3032,20 +3127,46 @@ mod tests {
             .unwrap();
         save.emit_clicked();
         save.emit_clicked();
+        let saved = next_request(&requests);
         assert!(
-            matches!(next_request(&requests).request, DaemonRequest::SetQuota { lane_id, quota: Some(_) } if lane_id.as_str() == "vinn")
+            matches!(saved.request, DaemonRequest::SetQuota { lane_id, quota: Some(_) } if lane_id.as_str() == "vinn")
         );
+        assert!(dialog.is_visible());
+        assert!(!save.is_sensitive());
+        assert!(
+            requests.try_recv().is_err(),
+            "correction waits for quota success"
+        );
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(saved.request_id, DaemonResult::QuotaSaved),
+            })
+            .unwrap();
+        let correction = next_request(&requests);
         assert_eq!(
-            next_request(&requests).request,
+            correction.request,
             DaemonRequest::CorrectUsage {
                 lane_id: "vinn".into(),
                 used_bytes: 16_000_000_000
             }
         );
         assert!(
+            dialog.is_visible(),
+            "dialog also waits for correction reply"
+        );
+        assert!(
             requests.try_recv().is_err(),
             "double Save sends one correction"
         );
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(correction.request_id, DaemonResult::QuotaSaved),
+            })
+            .unwrap();
+        wait_for(|| !dialog.is_visible());
+        while requests.try_recv().is_ok() {}
         let dialog = open_quota();
         spin(&dialog, "quota-used").set_value(17.0);
         find_named(dialog.upcast_ref(), "quota-enabled")
@@ -3059,8 +3180,9 @@ mod tests {
             .unwrap();
         save.emit_clicked();
         save.emit_clicked();
+        let saved = next_request(&requests);
         assert_eq!(
-            next_request(&requests).request,
+            saved.request,
             DaemonRequest::SetQuota {
                 lane_id: "vinn".into(),
                 quota: None
@@ -3070,6 +3192,14 @@ mod tests {
             requests.try_recv().is_err(),
             "disabled quota sends no correction"
         );
+        assert!(dialog.is_visible());
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(saved.request_id, DaemonResult::QuotaSaved),
+            })
+            .unwrap();
+        wait_for(|| !dialog.is_visible());
         detail.destroy();
         window.destroy();
         drain();

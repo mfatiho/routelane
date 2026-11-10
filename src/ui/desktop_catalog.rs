@@ -1,5 +1,5 @@
 use gtk4::{gio, prelude::*};
-use routelane::application::{discover_desktop_apps, DesktopApp};
+use routelane::application::{discover_desktop_apps, is_sandbox_launcher, DesktopApp};
 use routelane::domain::ApplicationSelector;
 
 #[derive(Debug, Clone)]
@@ -34,14 +34,7 @@ impl DesktopCatalog {
                 }
                 let unsupported_reason = [&app.executable_path, &app.launch.executable]
                     .into_iter()
-                    .any(|program| {
-                        let resolved =
-                            std::fs::canonicalize(program).unwrap_or_else(|_| program.clone());
-                        matches!(
-                            resolved.file_name().and_then(|name| name.to_str()),
-                            Some("snap" | "flatpak")
-                        )
-                    })
+                    .any(|program| is_sandbox_launcher(program))
                     .then_some("sandbox");
                 ApplicationChoice {
                     app,

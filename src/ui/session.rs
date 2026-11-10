@@ -63,6 +63,10 @@ pub enum UiEffect {
     Send(UiRequest),
     RefreshSnapshot,
     QuitApplication,
+    QuotaFinished {
+        request_id: String,
+        result: Result<(), IpcError>,
+    },
 }
 
 #[derive(Debug)]
@@ -645,6 +649,30 @@ impl UiSession {
 
     fn handle_response(&mut self, response: DaemonResponse) -> Vec<UiEffect> {
         if let Some(request) = self.usage_requests.remove(&response.request_id) {
+            if matches!(
+                request,
+                DaemonRequest::SetQuota { .. } | DaemonRequest::CorrectUsage { .. }
+            ) {
+                let result = if response.protocol_version != IPC_PROTOCOL_VERSION {
+                    Err(IpcError::new(
+                        "IPC_INVALID_RESPONSE",
+                        "unsupported response version",
+                    ))
+                } else if let Some(error) = response.error {
+                    Err(error)
+                } else if matches!(response.result, Some(DaemonResult::QuotaSaved)) {
+                    Ok(())
+                } else {
+                    Err(IpcError::new(
+                        "IPC_INVALID_RESPONSE",
+                        "unexpected quota reply",
+                    ))
+                };
+                return vec![UiEffect::QuotaFinished {
+                    request_id: response.request_id,
+                    result,
+                }];
+            }
             if response.protocol_version != IPC_PROTOCOL_VERSION {
                 return vec![];
             }
@@ -662,10 +690,6 @@ impl UiSession {
                 (DaemonRequest::ClearEvents, Some(DaemonResult::EventsCleared)) => {
                     self.events.clear()
                 }
-                (
-                    DaemonRequest::SetQuota { .. } | DaemonRequest::CorrectUsage { .. },
-                    Some(DaemonResult::QuotaSaved),
-                ) => {}
                 _ => {
                     self.error = Some(IpcError::new(
                         "IPC_INVALID_RESPONSE",
