@@ -119,9 +119,10 @@ import json,sys
 ca,cc,backups,extra=sys.argv[1],sys.argv[2],json.loads(sys.argv[3]),sys.argv[4]
 lane=lambda i,n:{"id":i,"name":i,"interface":n,"fallback_lane":None,"failure_policy":"Block"}
 lanes=[lane("lane-a",ca),lane("lane-c",cc)]+([lane("lane-x",extra)] if extra else [])
-print(json.dumps({"protocol_version":2,"profile":{"id":"sysbus","name":"SysBus","enabled":True,
+# Broad failover of unmatched traffic is the explicit UsePrimary opt-in.
+print(json.dumps({"protocol_version":3,"profile":{"id":"sysbus","name":"SysBus","enabled":True,
   "lanes":lanes,"rules":[],
-  "routing":{"primary":{"Lane":"lane-a"},"backups":backups,"automatic_failover":True}},
+  "routing":{"unmatched_traffic":"UsePrimary","primary":{"Lane":"lane-a"},"backups":backups,"automatic_failover":True}},
   "resolutions":{"rules":{}},"expected_generation":0}))
 PY
 }
@@ -130,9 +131,14 @@ d=json.loads(json.loads(sys.stdin.read())["data"][0])
 for k in sys.argv[1].split("."): d=d[k] if not isinstance(d,list) else d[int(k)]
 print(json.dumps(d))' "$1"; }
 
+# The read-only protocol query needs no authorization.
+PROTOCOL=$(as_user $BUS call $DEST GetRuntimeProtocol | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0])') || fail "GetRuntimeProtocol"
+[ "$PROTOCOL" = 3 ] || fail "runtime protocol is $PROTOCOL, expected 3"
+say "non-root $TESTUSER read GetRuntimeProtocol=3 without authorization"
 allow
 ARMED=$(as_user $BUS call $DEST ActivateRuntime s "$(activation '["lane-c"]')") || fail "authorized activation"
 [ "$(echo "$ARMED" | field status.phase)" = '"Armed"' ] || fail "activation not armed: $ARMED"
+[ "$(echo "$ARMED" | field status.unmatched_traffic)" = '"UsePrimary"' ] || fail "armed status does not report its mode: $ARMED"
 say "activation as $TESTUSER armed: effective $(echo "$ARMED" | field status.decision.effective.v4)"
 HELPER=$(systemctl show -p MainPID --value routelane-helper.service)
 [ "$(stat -L -c %i /proc/$HELPER/ns/net)" = "$(stat -L -c %i /run/netns/$NS_C)" ] || fail "helper is not confined to the test namespace"
