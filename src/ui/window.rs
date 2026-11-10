@@ -2752,6 +2752,7 @@ mod tests {
             ("ethernet", "Ethernet", "eth0"),
             ("vinn", "VINN", "usb0"),
             ("wifi", "Wi-Fi", "wlp2s0"),
+            ("offline", "Offline quota", "usb9"),
         ]
         .into_iter()
         .map(|(id, name, interface)| Lane {
@@ -2798,7 +2799,7 @@ mod tests {
         let read = next_request(&requests);
         assert_eq!(read.request, DaemonRequest::GetUsage { fast_lane: None });
         let date = |value| LocalDate::parse(value).unwrap();
-        let report = UsageReport {
+        let mut report = UsageReport {
             lanes: vec![
                 LaneUsage {
                     lane_id: "ethernet".into(),
@@ -2881,6 +2882,13 @@ mod tests {
                 },
             ],
         };
+        let mut offline = report.lanes[1].clone();
+        offline.lane_id = "offline".into();
+        offline.interface = "usb9".into();
+        offline.available = false;
+        offline.rate = None;
+        offline.recent_rates.clear();
+        report.lanes.push(offline);
         events
             .try_send(DaemonToUi::Response {
                 epoch: 1,
@@ -2905,6 +2913,22 @@ mod tests {
         let ethernet = row("ethernet");
         let vinn = row("vinn");
         let wifi = row("wifi");
+        let offline = row("offline");
+        assert_eq!(
+            offline.subtitle().as_deref(),
+            Some(if tr {
+                "usb9 · Bu dönem 12,4 / 20 GB · Bağlı değil"
+            } else {
+                "usb9 · This period 12.4 / 20 GB · Not connected"
+            })
+        );
+        assert!(has_label(
+            offline.upcast_ref(),
+            if tr { "Kota %62" } else { "Quota 62%" }
+        ));
+        let bar = find_named(offline.upcast_ref(), "quota-bar-offline").unwrap();
+        assert!(bar.is_visible());
+        assert!(bar.is::<gtk::DrawingArea>());
         assert_eq!(
             ethernet.subtitle().as_deref(),
             Some(if tr {
@@ -3024,6 +3048,20 @@ mod tests {
             .unwrap()
             .is_active());
         assert_eq!(spin(&dialog, "quota-limit").value(), 20.0);
+        assert_eq!(
+            spin(&dialog, "quota-limit").text(),
+            if tr { "20,0" } else { "20.0" }
+        );
+        for input in ["20,5", "20.5"] {
+            spin(&dialog, "quota-limit").set_text(input);
+            spin(&dialog, "quota-limit").update();
+            assert_eq!(spin(&dialog, "quota-limit").value(), 20.5);
+            assert_eq!(
+                spin(&dialog, "quota-limit").text(),
+                if tr { "20,5" } else { "20.5" }
+            );
+        }
+        spin(&dialog, "quota-limit").set_value(20.0);
         assert_eq!(spin(&dialog, "quota-reset-day").value(), 1.0);
         assert_eq!(spin(&dialog, "quota-warn").value(), 80.0);
         assert!((spin(&dialog, "quota-used").value() - 12.4).abs() < 0.001);

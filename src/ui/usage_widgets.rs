@@ -21,6 +21,36 @@ fn decimal(value: f64, language: Language) -> String {
         value
     }
 }
+/// GTK 0.5 uses Inhibit for output and Option<Result<f64, ()>> for input.
+pub fn localize_spin_button(spin: &gtk::SpinButton, language: Language) {
+    fn output(spin: &gtk::SpinButton, language: Language) {
+        let value = format!("{:.*}", spin.digits() as usize, spin.value());
+        spin.set_text(&if language == Language::Tr {
+            value.replace('.', ",")
+        } else {
+            value
+        });
+    }
+    // Let both separators reach our input handler, regardless of the process locale.
+    spin.set_numeric(false);
+    spin.connect_output(move |spin| {
+        output(spin, language);
+        glib::signal::Inhibit(true)
+    });
+    spin.connect_input(|spin| {
+        Some(
+            spin.text()
+                .trim()
+                .replace(',', ".")
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .ok_or(()),
+        )
+    });
+    output(spin, language);
+}
+
 pub fn format_gb(bytes: u64, language: Language) -> String {
     decimal(bytes as f64 / 1e9, language)
 }

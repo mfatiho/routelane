@@ -48,11 +48,13 @@ pub struct UsageRate {
 
 #[derive(Default)]
 struct Rates {
+    carry: UsageTotals,
     last: Option<i64>,
     recent: VecDeque<(i64, UsageRate)>,
 }
 struct State {
     store: UsageStore,
+    last_save: Option<i64>,
     settings: QuotaSettings,
     events: EventStore,
     fast_requested: Option<i64>,
@@ -90,6 +92,7 @@ impl UsageService {
         let service = Self {
             state: Mutex::new(State {
                 store,
+                last_save: None,
                 settings,
                 events,
                 fast_requested: None,
@@ -122,6 +125,7 @@ impl UsageService {
             if let Some(sample) = self.counters.sample(lane.interface.as_str()) {
                 let delta = state.store.record_sample(&lane.id, today, sample);
                 let rates = state.rates.entry(lane.id.clone()).or_default();
+                rates.carry = rates.carry.add(delta);
                 if let Some(elapsed) = rates
                     .last
                     .map(|last| now.saturating_sub(last))
@@ -130,12 +134,16 @@ impl UsageService {
                     rates.recent.push_back((
                         now,
                         UsageRate {
-                            rx_per_second: delta.rx / elapsed as u64,
-                            tx_per_second: delta.tx / elapsed as u64,
+                            rx_per_second: rates.carry.rx / elapsed as u64,
+                            tx_per_second: rates.carry.tx / elapsed as u64,
                         },
                     ));
+                    rates.carry = UsageTotals::default();
+                    rates.last = Some(now);
+                } else if rates.last.is_none() {
+                    rates.last = Some(now);
+                    rates.carry = UsageTotals::default();
                 }
-                rates.last = Some(now);
             } else {
                 state.rates.remove(&lane.id);
             }
@@ -152,10 +160,28 @@ impl UsageService {
         for rates in state.rates.values_mut() {
             rates.recent.retain(|(at, _)| *at > now.saturating_sub(60));
         }
-        if let Err(error) = state.store.save() {
-            log::warn!("save usage samples: {error}");
+        if state.store.is_dirty()
+            && (!crossings.is_empty()
+                || state
+                    .last_save
+                    .is_none_or(|last| now.saturating_sub(last) >= 30))
+        {
+            match state.store.save() {
+                Ok(()) => state.last_save = Some(now),
+                Err(error) => log::warn!("save usage samples: {error}"),
+            }
         }
         crossings
+    }
+
+    /// Persist unsaved samples now; errors leave the store dirty for a retry.
+    pub fn flush(&self) -> Result<(), DaemonError> {
+        let mut state = self.state.lock().unwrap();
+        if state.store.is_dirty() {
+            state.store.save().map_err(storage_error)?;
+            state.last_save = Some((self.clock)());
+        }
+        Ok(())
     }
 
     pub fn report(&self, lanes: &[Lane], fast_lane: Option<LaneId>) -> UsageReport {
@@ -276,6 +302,7 @@ impl UsageService {
         let crossings = store.crossings(lane, &quota, today);
         store.save().map_err(storage_error)?;
         state.store = store;
+        state.last_save = Some((self.clock)());
         Ok(crossings
             .into_iter()
             .map(|crossing| (lane.clone(), crossing))
@@ -324,13 +351,18 @@ impl UsageService {
     }
     pub fn interval(&self) -> Duration {
         let now = (self.clock)();
-        let fast = self
-            .state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        let fast = state
             .fast_requested
             .is_some_and(|at| (0..=5).contains(&now.saturating_sub(at)));
-        Duration::from_secs(if fast { 1 } else { 30 })
+        let mut seconds = if fast { 1 } else { 30 };
+        if state.store.is_dirty() {
+            let until_save = state.last_save.map_or(1, |last| {
+                30i64.saturating_sub(now.saturating_sub(last)).clamp(1, 30) as u64
+            });
+            seconds = seconds.min(until_save);
+        }
+        Duration::from_secs(seconds)
     }
     /// Wakes a sleeping sampler immediately when a detail request starts fast sampling.
     pub async fn sampling_requested(&self) {

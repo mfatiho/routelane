@@ -774,7 +774,9 @@ impl ConnectionsPage {
             let texts = self.texts.usage;
             let language = self.texts.language;
             let subtitle = match usage {
-                Some(usage) if !usage.available => texts.not_connected.to_owned(),
+                Some(usage) if !usage.available && usage.quota.is_none() => {
+                    texts.not_connected.to_owned()
+                }
                 Some(usage) => match &usage.quota {
                     Some(quota) => texts
                         .period_used
@@ -790,6 +792,11 @@ impl ConnectionsPage {
                 },
                 None => self.texts.ux.checking.to_owned(),
             };
+            let subtitle = if usage.is_some_and(|usage| !usage.available && usage.quota.is_some()) {
+                format!("{subtitle} · {}", texts.not_connected)
+            } else {
+                subtitle
+            };
             row.set_subtitle(&glib::markup_escape_text(&format!(
                 "{} · {subtitle}",
                 lane.interface.as_str()
@@ -797,7 +804,7 @@ impl ConnectionsPage {
             while let Some(child) = box_.first_child() {
                 box_.remove(&child);
             }
-            if let Some(quota) = usage.filter(|u| u.available).and_then(|u| u.quota.as_ref()) {
+            if let Some(quota) = usage.and_then(|u| u.quota.as_ref()) {
                 let percent = (quota.used_bytes as f64 / quota.settings.limit_bytes.max(1) as f64
                     * 100.0)
                     .round();
@@ -808,7 +815,9 @@ impl ConnectionsPage {
                 ));
                 badge.add_css_class("caption");
                 box_.append(&badge);
-                box_.append(&QuotaBar::new(quota, language).area);
+                let bar = QuotaBar::new(quota, language).area;
+                bar.set_widget_name(&format!("quota-bar-{}", id.as_str()));
+                box_.append(&bar);
             }
         }
     }

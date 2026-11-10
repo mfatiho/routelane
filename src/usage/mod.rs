@@ -36,6 +36,12 @@ pub fn usage_settings_path() -> anyhow::Result<PathBuf> {
     Ok(xdg_directory("XDG_CONFIG_HOME", ".config")?.join("routelane/usage-settings.json"))
 }
 
+/// Creates the usage state directory as a private (0700) real directory, or
+/// fails when the path exists as anything else.
+pub fn prepare_state_dir(path: &Path) -> anyhow::Result<()> {
+    crate::config::ensure_private_directory(path)
+}
+
 pub fn usage_state_dir() -> anyhow::Result<PathBuf> {
     Ok(xdg_directory("XDG_STATE_HOME", ".local/state")?.join("routelane"))
 }

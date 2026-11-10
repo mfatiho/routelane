@@ -2,7 +2,10 @@ use super::i18n::LanguageTexts;
 use routelane::{
     config::Language,
     domain::{LaneId, RuleId},
-    usage::events::{EventKind, UsageEvent},
+    usage::{
+        events::{EventKind, UsageEvent},
+        notify::turkish_percent_suffix,
+    },
 };
 use std::collections::BTreeMap;
 
@@ -89,6 +92,10 @@ pub fn event_text(
             .event_quota_warning
             .replace("{lane}", &names.lane(lane_id))
             .replace("{percent}", &percent(*used, *limit).to_string())
+            .replace(
+                "{suffix}",
+                turkish_percent_suffix(percent(*used, *limit).min(100) as u8),
+            )
             .replace("{used}", &format_gb(*used, language))
             .replace("{limit}", &format_limit(*limit, language)),
         EventKind::QuotaFull { lane_id, .. } => {
@@ -204,6 +211,10 @@ pub fn quota_toast_text(
             .map_or(u.quota_toast_warning_no_reset, |_| u.quota_toast_warning)
             .replace("{lane}", &names.lane(lane_id))
             .replace("{percent}", &percent(*used, *limit).to_string())
+            .replace(
+                "{suffix}",
+                turkish_percent_suffix(percent(*used, *limit).min(100) as u8),
+            )
             .replace("{used}", &format_gb(*used, language))
             .replace("{limit}", &format_limit(*limit, language))
             .replace(
@@ -660,6 +671,42 @@ mod tests {
                 quota_toast_text(&lane_id, &warning, &names, None, language),
                 without_reset
             );
+        }
+    }
+
+    #[test]
+    fn quota_titles_use_the_spoken_percent_suffix() {
+        use routelane::usage::store::QuotaCrossing;
+        let names = EventNames {
+            lanes: [("vinn".into(), "VINN".into())].into(),
+            rules: BTreeMap::new(),
+        };
+        let event = UsageEvent {
+            at_unix_ms: 0,
+            kind: EventKind::QuotaWarning {
+                lane_id: "vinn".into(),
+                used: 18,
+                limit: 20,
+            },
+        };
+        assert!(event_text(&event, &names, 0, Language::Tr)
+            .title
+            .starts_with("VINN kotasının %90'ı kullanıldı — "));
+        for reset in [
+            None,
+            Some(routelane::usage::LocalDate::parse("2026-12-01").unwrap()),
+        ] {
+            assert!(quota_toast_text(
+                &"vinn".into(),
+                &QuotaCrossing::Warning {
+                    used: 18,
+                    limit: 20
+                },
+                &names,
+                reset,
+                Language::Tr
+            )
+            .starts_with("VINN kotasının %90'ı doldu — "));
         }
     }
 

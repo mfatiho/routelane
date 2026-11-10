@@ -26,6 +26,7 @@ pub fn open(
         let spin = gtk::SpinButton::with_range(min, max, step);
         spin.set_digits(digits);
         spin.set_value(value);
+        super::usage_widgets::localize_spin_button(&spin, texts.language);
         spin.set_widget_name(name);
         form.field(label, &spin);
         spin

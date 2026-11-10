@@ -52,6 +52,26 @@ async fn send(summary: &str, body: &str) -> zbus::Result<()> {
     Ok(())
 }
 
+/// Possessive suffix of the last spoken word in a Turkish percentage.
+pub fn turkish_percent_suffix(percent: u8) -> &'static str {
+    match percent % 10 {
+        1 | 5 | 8 => "'i",
+        2 | 7 => "'si",
+        3 | 4 => "'ü",
+        6 => "'sı",
+        9 => "'u",
+        _ => match percent % 100 {
+            10 | 30 => "'u",
+            20 | 50 => "'si",
+            40 | 60 | 90 => "'ı",
+            70 | 80 => "'i",
+            // Zero (sıfır) and whole hundreds (yüz).
+            _ if percent == 0 => "'ı",
+            _ => "'ü",
+        },
+    }
+}
+
 pub fn quota_notification(
     lane: &str,
     crossing: &QuotaCrossing,
@@ -98,7 +118,8 @@ pub fn quota_notification(
                         9 | 10 => "de",
                         _ => "da",
                     };
-                    format!("{lane} kotasının %{percent}'i doldu — {used} / {limit} GB · {left} GB kaldı · {} {month}'{suffix} yenilenir", reset.day)
+                    let percent_suffix = turkish_percent_suffix(percent);
+                    format!("{lane} kotasının %{percent}{percent_suffix} doldu — {used} / {limit} GB · {left} GB kaldı · {} {month}'{suffix} yenilenir", reset.day)
                 }
                 Language::En => format!("{lane} quota is {percent}% used — {used} / {limit} GB · {left} GB left · renews on {} {month}", reset.day),
             }
@@ -119,6 +140,49 @@ fn gb(bytes: u64, language: Language, trim: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn turkish_percent_suffix_follows_the_spoken_number() {
+        for (n, suffix) in [
+            (80, "'i"),
+            (90, "'ı"),
+            (50, "'si"),
+            (75, "'i"),
+            (66, "'sı"),
+            (40, "'ı"),
+            (10, "'u"),
+            (99, "'u"),
+            (23, "'ü"),
+            (1, "'i"),
+            (2, "'si"),
+            (4, "'ü"),
+            (7, "'si"),
+            (8, "'i"),
+            (20, "'si"),
+            (30, "'u"),
+            (60, "'ı"),
+            (70, "'i"),
+        ] {
+            assert_eq!(turkish_percent_suffix(n), suffix, "{n}");
+        }
+        let settings = LaneQuota {
+            enabled: true,
+            limit_bytes: 20_000_000_000,
+            reset_day: 1,
+            warn_percent: 90,
+        };
+        let warning = QuotaCrossing::Warning {
+            used: 18_000_000_000,
+            limit: settings.limit_bytes,
+        };
+        assert!(quota_notification(
+            "VINN",
+            &warning,
+            &settings,
+            LocalDate::parse("2026-12-01").unwrap(),
+            Language::Tr
+        )
+        .starts_with("VINN kotasının %90'ı doldu — "));
+    }
     #[test]
     fn quota_notifications_match_both_languages() {
         let settings = LaneQuota {

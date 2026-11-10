@@ -606,3 +606,122 @@ fn saved_lane_discovery_is_read_only_and_tolerates_missing_or_invalid_config() {
     );
     assert!(!dir.path().join("desired-profile.json").exists());
 }
+
+#[test]
+fn same_second_samples_carry_into_the_next_rate() {
+    let f = fixture();
+    let lanes = [lane("vinn")];
+    for (at, rx, tx, expected_count) in [
+        (100, 0, 0, 0),
+        (101, 1000, 100, 1),
+        (101, 1500, 150, 1),
+        (102, 2000, 200, 2),
+    ] {
+        f.clock.store(at, Ordering::SeqCst);
+        *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+            ifindex: 1,
+            rx_bytes: rx,
+            tx_bytes: tx,
+        });
+        f.usage.tick(&lanes);
+        let report = f.usage.report(&lanes, None);
+        assert_eq!(report.lanes[0].recent_rates.len(), expected_count);
+        if expected_count > 0 {
+            assert_eq!(
+                report.lanes[0].rate,
+                Some(UsageRate {
+                    rx_per_second: 1000,
+                    tx_per_second: 100
+                })
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn fast_ticks_write_at_most_every_thirty_seconds_and_flush_on_demand() {
+    use std::os::unix::fs::MetadataExt;
+    let f = fixture();
+    let lanes = [lane("vinn")];
+    let path = f._dir.path().join("usage-v1.json");
+    let start = f.clock.load(Ordering::SeqCst);
+    let tick = |second: i64| {
+        f.clock.store(start + second, Ordering::SeqCst);
+        *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+            ifindex: 1,
+            rx_bytes: second as u64 * 1000,
+            tx_bytes: second as u64 * 100,
+        });
+        assert!(f.usage.tick(&lanes).is_empty());
+    };
+    let fingerprint = || {
+        let metadata = std::fs::metadata(&path).unwrap();
+        (metadata.ino(), metadata.modified().unwrap(), metadata.len())
+    };
+    tick(0);
+    let first = fingerprint();
+    let baseline = std::fs::read(&path).unwrap();
+    for second in 1..=29 {
+        tick(second);
+        assert_eq!(fingerprint(), first, "no rewrite at second {second}");
+        assert_eq!(std::fs::read(&path).unwrap(), baseline);
+    }
+    tick(30);
+    assert_ne!(
+        fingerprint(),
+        first,
+        "the thirty-second deadline saves accumulated usage"
+    );
+    let (store, _) = UsageStore::open(&path, "boot");
+    assert_eq!(store.lifetime_bytes(&"vinn".into()), 33_000);
+    tick(31);
+    f.usage.flush().unwrap();
+    let (store, _) = UsageStore::open(&path, "boot");
+    assert_eq!(
+        store.lifetime_bytes(&"vinn".into()),
+        34_100,
+        "flush persists the latest sample immediately"
+    );
+    let flushed = fingerprint();
+    f.usage.flush().unwrap();
+    assert_eq!(fingerprint(), flushed, "a clean flush does not write");
+    for second in 32..=60 {
+        tick(second);
+        assert_eq!(
+            fingerprint(),
+            flushed,
+            "flush restarts the thirty-second deadline"
+        );
+    }
+    tick(61);
+    assert_ne!(fingerprint(), flushed);
+}
+
+#[test]
+fn quota_crossings_save_immediately_and_are_not_replayed_after_restart() {
+    let f = fixture();
+    let lanes = [lane("vinn")];
+    let path = f._dir.path().join("usage-v1.json");
+    f.usage.set_quota(&"vinn".into(), Some(quota())).unwrap();
+    *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+        ifindex: 1,
+        rx_bytes: 0,
+        tx_bytes: 0,
+    });
+    f.usage.tick(&lanes);
+    f.clock.fetch_add(1, Ordering::SeqCst);
+    *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+        ifindex: 1,
+        rx_bytes: 16_000_000_000,
+        tx_bytes: 0,
+    });
+    assert_eq!(f.usage.tick(&lanes).len(), 1);
+    let (mut store, _) = UsageStore::open(&path, "boot");
+    let today = local_date(f.clock.load(Ordering::SeqCst));
+    assert_eq!(
+        store.used_bytes(&"vinn".into(), &quota(), today),
+        16_000_000_000
+    );
+    assert!(store.crossings(&"vinn".into(), &quota(), today).is_empty());
+    assert!(!store.is_dirty());
+}

@@ -310,3 +310,76 @@ fn daily_history_retains_400_calendar_days() {
         UsageTotals { rx: 100, tx: 10 }
     );
 }
+
+#[test]
+fn idle_samples_do_not_dirty_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("usage.json");
+    let lane = LaneId::from("vinn");
+    let (mut store, _) = UsageStore::open(&path, "boot");
+    assert!(!store.is_dirty());
+    store.record_sample(&lane, date(10), sample(3, 100, 10));
+    assert!(store.is_dirty(), "the first baseline must be persisted");
+    store.save().unwrap();
+    assert!(!store.is_dirty());
+    for day in [10, 10, 11] {
+        store.record_sample(&lane, date(day), sample(3, 100, 10));
+        assert!(
+            !store.is_dirty(),
+            "idle samples, including midnight, stay clean"
+        );
+    }
+    store.record_sample(&lane, date(11), sample(3, 101, 10));
+    assert!(store.is_dirty());
+    store.save().unwrap();
+    store.record_sample(&lane, date(11), sample(4, 0, 0));
+    assert!(
+        store.is_dirty(),
+        "an ifindex change with zero counters is still a new baseline"
+    );
+    store.save().unwrap();
+    let (mut store, _) = UsageStore::open(&path, "new-boot");
+    store.record_sample(&lane, date(11), sample(4, 0, 0));
+    assert!(
+        store.is_dirty(),
+        "a boot change with zero counters must be persisted"
+    );
+}
+
+#[test]
+fn corrections_and_changed_crossing_state_dirty_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _) = UsageStore::open(dir.path().join("usage.json"), "boot");
+    let lane = LaneId::from("vinn");
+    let quota = LaneQuota {
+        enabled: true,
+        limit_bytes: 100_000_000,
+        reset_day: 1,
+        warn_percent: 80,
+    };
+    assert!(store.crossings(&lane, &quota, date(10)).is_empty());
+    assert!(
+        store.is_dirty(),
+        "initializing the period changes crossing state"
+    );
+    store.save().unwrap();
+    assert!(store.crossings(&lane, &quota, date(10)).is_empty());
+    assert!(!store.is_dirty());
+    store.set_used(&lane, &quota, date(10), 80_000_000);
+    assert!(store.is_dirty());
+    store.save().unwrap();
+    assert!(matches!(
+        store.crossings(&lane, &quota, date(10)).as_slice(),
+        [QuotaCrossing::Warning { .. }]
+    ));
+    assert!(store.is_dirty());
+    store.save().unwrap();
+    assert!(store.crossings(&lane, &quota, date(11)).is_empty());
+    assert!(!store.is_dirty());
+    let december = LocalDate::parse("2026-12-01").unwrap();
+    assert!(store.crossings(&lane, &quota, december).is_empty());
+    assert!(
+        store.is_dirty(),
+        "rolling the period changes crossing state"
+    );
+}

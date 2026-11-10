@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -37,6 +38,7 @@ pub struct UsageStore {
     path: PathBuf,
     boot_id: String,
     state: UsageState,
+    dirty: Cell<bool>,
 }
 
 impl UsageStore {
@@ -44,6 +46,7 @@ impl UsageStore {
         let path = path.as_ref().to_owned();
         let mut store = Self {
             path,
+            dirty: Cell::new(false),
             boot_id: boot_id.to_owned(),
             state: UsageState {
                 version: 1,
@@ -113,6 +116,11 @@ impl UsageStore {
     ) -> UsageTotals {
         let boot_id = self.boot_id.clone();
         let lane = self.lane_mut(lane);
+        let baseline_changed = lane.boot_id != boot_id
+            || lane
+                .last_sample
+                .as_ref()
+                .is_none_or(|last| last.ifindex != sample.ifindex);
         let delta = if lane.boot_id != boot_id {
             UsageTotals {
                 rx: sample.rx_bytes,
@@ -121,12 +129,18 @@ impl UsageStore {
         } else {
             counter_delta(lane.last_sample.as_ref(), &sample)
         };
-        let daily = lane.daily.entry(today).or_default();
-        *daily = daily.add(delta);
-        lane.daily
-            .retain(|date, _| date.ordinal() >= today.ordinal() - 399);
+        let changed = baseline_changed || delta != UsageTotals::default();
+        if changed {
+            let daily = lane.daily.entry(today).or_default();
+            *daily = daily.add(delta);
+            lane.daily
+                .retain(|date, _| date.ordinal() >= today.ordinal() - 399);
+        }
         lane.last_sample = Some(sample);
         lane.boot_id = boot_id;
+        if changed {
+            self.dirty.set(true);
+        }
         delta
     }
 
@@ -185,6 +199,7 @@ impl UsageStore {
         let offset = (i128::from(used_bytes) - i128::from(measured))
             .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
         self.lane_mut(lane).correction = Some((start, offset));
+        self.dirty.set(true);
     }
 
     pub fn crossings(
@@ -199,6 +214,7 @@ impl UsageStore {
         let start = period_start(today, quota.reset_day);
         let used = self.used_bytes(lane, quota, today);
         let fired = &mut self.lane_mut(lane).fired;
+        let previous = *fired;
         if fired.map(|(period, _, _)| period) != Some(start) {
             *fired = Some((start, false, false));
         }
@@ -221,6 +237,9 @@ impl UsageStore {
                 limit: quota.limit_bytes,
             });
         }
+        if *fired != previous {
+            self.dirty.set(true);
+        }
         crossings
     }
 
@@ -236,7 +255,13 @@ impl UsageStore {
             .unwrap_or(0)
     }
 
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.get()
+    }
+
     pub fn save(&self) -> anyhow::Result<()> {
-        super::atomic_save(&self.path, &serde_json::to_vec_pretty(&self.state)?)
+        super::atomic_save(&self.path, &serde_json::to_vec_pretty(&self.state)?)?;
+        self.dirty.set(false);
+        Ok(())
     }
 }
