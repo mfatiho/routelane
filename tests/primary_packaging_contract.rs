@@ -141,6 +141,9 @@ fn readme_documents_selective_scope_and_protocol_versions() {
         "Ubuntu 22.04/24.04/26.04",
         "Debian 12/13",
         "Fedora 43/44",
+        "usage-settings.json",
+        "events-v1.jsonl",
+        "never stops or throttles traffic",
     ] {
         assert!(readme.contains(fact), "README must document {fact}");
     }

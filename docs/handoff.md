@@ -2,6 +2,23 @@
 
 Tarih: 22 Ekim 2026. Bu belge, devralan geliştiricinin geçmiş kararları bulması ve yarım kalan işi güvenli şekilde sürdürmesi içindir. Kalıcı devir kaydı `docs/handoff.md` dosyasıdır; `/tmp` kopyasına veya oturumlar arası asistan hafızasına bağımlı değildir. Ayrıntılı değişiklik geçmişinin kaynağı Git ve aşağıdaki depo belgeleridir.
 
+## En son kayıt — veri kullanımı, kota ve olay geçmişi Plan 1/3 (10 Kasım 2026)
+
+- Onaylı tasarım (`docs/superpowers/specs/2026-11-09-usage-and-events-design.md`) üç plana bölündü. Plan 1 (`docs/superpowers/plans/2026-11-10-usage-quota-events.md`, `c8afed1`) tamamlandı; kullanıcı `/sous-chef:fire` ile yürüttü: görevler Codex'e aşamalı biletlerle verildi, her aşama baş aşçı tarafından satır satır incelendi, testler/GTK smoke yerelde koşuldu, commit'ler baş aşçının. Karar defteri: `.superpowers/sdd/2026-11-10-usage-quota-events/progress.md` (yerel).
+  - `7d753c5` Task 1–3: `routelane::usage` takvim, kota ayarı, sysfs sayaç, kullanım deposu (yeniden başlatma/reboot güvenli delta, düzeltme, dönemde bir eşik), 30 gün/5.000 olay deposu.
+  - `fa8e059` Task 4–5: daemon IPC protocol 4 (runtime 3 kaldı), GetUsage/SetQuota/CorrectUsage/ListEvents/ClearEvents, örnekleyici (30 sn / ayrıntı açıkken 1 sn), olay kaydı, kota masaüstü bildirimi (UI açıkken toast olayı).
+  - `48b9250` Task 6–7: UI oturumu, kota çubuğu ve grafik, Bağlantılar satırları, hat ayrıntısı, kota penceresi.
+  - `e510b31` Task 8: Genel Bakış kullanım/son olaylar kartları, olay geçmişi sayfası, kota toast'u.
+  - Task 9: README “Data usage, quota and event history”, paket contract'ı, bu kayıt.
+- Doğrulama (10 Kasım, `e510b31` + Task 9): rootless suite 570 passed, 1 bilinen Snap hatası, 2 ignored; fmt, clippy (iki özellik seti), release build, root no-run, GTK smoke (TR/EN ekran görüntüleri `.superpowers/sdd/2026-11-10-usage-quota-events/screens/`) temiz.
+- NOT VERIFIED: gerçek oturumda masaüstü bildirimi, uzun süreli örnekleme doğruluğu ve operatör sayacıyla karşılaştırma, gerçek Wi-Fi arayüzü notu; kernel değişikliği yok (bu plan kernel'e yazmaz).
+- Ertelenen küçükler defterde: hızlı modda her saniye kayıt, TR yüzde eki ('i sabit), HOME yokken daemon açılmaz, bozuk usage-settings.json kenara alınmaz, kota penceresi TR'de nokta ondalık, ifindex değişiminde yeni kartın boot'tan beri sayacı bir kez eklenir.
+- Kullanıcının `Cargo.toml`/`Cargo.lock` (0.1.2) değişiklikleri hâlâ commit edilmedi; bu işe karışmadı. Push yapılmadı.
+
+### Sonraki adım
+
+Plan 2 (B: RouteLane'in yönlendirdiği adlı sayaçlar, grant sahibine açık helper sayaç metodu, yükseltme şartı) için `writing-plans`; ardından Plan 3 (canlı bağlantılar, NFLOG, resolved ad eşlemesi). İkisi de helper/nft değiştirir; kernel kanıtı için yeniden onaylı tek kullanımlık VM gerekir.
+
 ## En son kayıt — seçici yönlendirme Task 9–10 (10 Kasım 2026)
 
 - Kullanıcı açık onayıyla tek kullanımlık VM `routelane-test-u2404-20261109` (Ubuntu 24.04.5, 6.8.0-147) oluşturuldu; root testleri ve paket kurulumu yalnız onun içinde. Diğer Multipass VM'lerine, host ağına ve kurulu pakete dokunulmadı.

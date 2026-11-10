@@ -18,6 +18,8 @@ Current capabilities:
 - a per-user daemon and versioned Unix-socket IPC
 - a small system D-Bus helper authorized by Polkit
 - kernel-derived Connection Health reports
+- per-connection data usage, an optional monthly quota with notifications, and
+  a 30-day local event history
 - transactional apply, rollback, ownership checks, and conflict diagnostics
 - development `.deb` and `.rpm` packages
 
@@ -216,6 +218,46 @@ acceptance with a test Polkit rule. The interactive Polkit agent, Debian,
 Fedora and aarch64 are **NOT VERIFIED**; the record lists the remaining gaps. The [design](docs/superpowers/specs/2026-10-22-selective-routing-design.md)
 and [plan](docs/superpowers/plans/2026-10-22-selective-routing.md) describe the
 feature decisions.
+
+### Data usage, quota and event history
+
+Connections shows each connection's download and upload: today for a
+connection without a quota, the current period for one with a quota. Opening a
+connection shows its quota, period totals and a daily chart ("Bu dönem",
+"Son 7 gün", "Canlı hız"). The numbers are the network interface's own
+counters (`/sys/class/net/<interface>/statistics`), sampled by the user
+daemon every 30 seconds and every second while a connection's detail is
+open; they are counted per connection ID and labelled approximate. Time the
+daemon was not running is not counted, and an interface replaced or reset
+starts from zero. GB means 10⁹ bytes.
+
+A quota is optional and set per connection with "Kota ayarla": a monthly
+limit, a reset day (1–31; a missing day uses the month's last day, at local
+midnight), a warning threshold (default 80%) and a manual "used this period"
+value to match the operator's counter. The quota counts the interface's total
+traffic. RouteLane never stops or throttles traffic: at the warning threshold
+and when the quota is full it shows a desktop notification (or a toast while
+the window is open), once per period. A quota belongs to the network
+interface, so a phone's Wi-Fi hotspot on the same Wi-Fi adapter as other
+networks counts them too; the quota window says so for wireless adapters.
+Quotas by Wi-Fi network (SSID) are a later item.
+
+Overview shows this period's usage and the last three events; "Tümünü göster"
+opens the event history: profile applied or turned off, failed applies and
+their rollback, rules applied, failover and failback, attention states and
+quota thresholds, with filters. Events are kept for 30 days (at most 5,000)
+and can be cleared; they never contain connection addresses.
+
+Files, all mode 0600 and never sent anywhere:
+`~/.config/routelane/usage-settings.json` (quotas),
+`~/.local/state/routelane/usage-v1.json` (daily totals) and
+`~/.local/state/routelane/events-v1.jsonl` (events); `XDG_CONFIG_HOME` and
+`XDG_STATE_HOME` are honoured. A corrupt file is set aside as
+`*.corrupt-<time>` and started fresh.
+
+Not yet included: how much of the traffic RouteLane itself routed, and the
+live connection list with server names. They need helper changes and follow
+in separate plans.
 
 ### Protocol versions and upgrades
 
