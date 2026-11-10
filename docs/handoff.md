@@ -2,6 +2,27 @@
 
 Tarih: 22 Ekim 2026. Bu belge, devralan geliştiricinin geçmiş kararları bulması ve yarım kalan işi güvenli şekilde sürdürmesi içindir. Kalıcı devir kaydı `docs/handoff.md` dosyasıdır; `/tmp` kopyasına veya oturumlar arası asistan hafızasına bağımlı değildir. Ayrıntılı değişiklik geçmişinin kaynağı Git ve aşağıdaki depo belgeleridir.
 
+## En son kayıt — inceleme bulguları düzeltmeleri (10 Kasım 2026)
+
+- 10 Kasım proje incelemesinin 5 hatası (H1–H5) ve 11 eksiği (E1–E11) `docs/superpowers/plans/2026-11-10-audit-fixes.md` (`4e41925`) planına alındı; kullanıcı `/sous-chef:fire` ile yürüttü (Codex biletleri, baş aşçı satır satır inceleme ve yerel doğrulama). Defter: `.superpowers/sdd/2026-11-10-audit-fixes/progress.md`.
+- Kapananlar:
+  - H1 Snap/Flatpak sembolik bağlantı tespiti — `656ce38`, `tests/application_sandbox_contract.rs`, `ui::desktop_catalog::tests::sandbox_launcher_is_not_selectable_as_a_host_application` (artık geçiyor).
+  - H2 gizli pencerede masaüstü bildirimi, kapanan abone hemen düşer — `656ce38`, `ipc_contract::closed_subscriber_is_dropped_without_waiting_for_an_event`, GTK smoke.
+  - H3 kayıtlı ama uygulanmamış hatlar, kota penceresinde daemon hatası — `656ce38`, `usage_ipc_contract::{saved_but_unapplied_lanes_are_sampled_and_accept_a_quota, applied_lane_wins_over_a_saved_lane_with_the_same_id}`, `ui::controller::tests::quota_save_reports_the_daemon_error_and_sends_correction_only_after_success`.
+  - H4/H5/E4 kullanım sorguları ayrı hata alanı, köprü eşzamanlı teslim, 3 sn zaman aşımı — `b321835`, `ui::session::tests::usage_failures_never_replace_routing_errors_or_block_polling`, `tests::{events_and_polls_flow_while_a_mutation_is_waiting, a_usage_timeout_does_not_reconnect}`.
+  - E2 engellenme olayı, E3 adres gizleme — `b321835`, `losing_every_approved_exit_is_recorded_once`, `recorded_messages_never_contain_addresses`.
+  - E9 TR yüzde eki, ondalık virgül, hız taşıma, bağlı olmayan kotalı hat — `703ae53`, `turkish_percent_suffix_follows_the_spoken_number`, `same_second_samples_carry_into_the_next_rate`, GTK smoke.
+  - E8 değişmeyen depoyu yazmama ve kapanışta flush, E10 HOME'suz açılış — `703ae53`, `idle_samples_do_not_dirty_the_store`, `fast_ticks_write_at_most_every_thirty_seconds_and_flush_on_demand`, `open_usage_without_*`.
+  - E1 CLAUDE.md, E7 CLI taşıma notu, E11 CI tanımı — `16e3191` (CI push edilmediği için çalışmadı: NOT VERIFIED).
+- Yeni bulgu ve düzeltme: 0.1.2 kilit güncellemesi MSRV'yi bozmuştu (`uuid` 1.29.2 → rustc 1.89); `uuid` 1.23.3'e sabitlendi — `8df2141`. MSRV'yi yükseltmek kullanıcı kararı.
+- Doğrulama (10 Kasım, `703ae53`): rootless suite stable'da ve rustc 1.87'de 595 passed, **0 failed**, 2 ignored; fmt, clippy (iki özellik seti), release build, root no-run, GTK smoke temiz.
+- Açık kalanlar: E5 (geri almada korumalı geçiş, Görev 9) ve E6 (aralıklı katı RPF testi, Görev 10) yeni onaylı tek kullanımlık VM bekliyor; etkileşimli Polkit, Debian/Fedora/aarch64, CI'ın gerçek çalışması NOT VERIFIED. Ertelenen küçükler defterde (örnekleyici her turda `config.json` okur, kota penceresi daemon'un İngilizce hata metnini gösterir, ayrıntı penceresi açıkken kota eşiği masaüstü bildirimine düşer).
+- Push yapılmadı.
+
+### Sonraki adım
+
+VM onayı gelirse Görev 9–10; gelmezse kullanım Plan 2 için `writing-plans`.
+
 ## En son kayıt — veri kullanımı, kota ve olay geçmişi Plan 1/3 (10 Kasım 2026)
 
 - Onaylı tasarım (`docs/superpowers/specs/2026-11-09-usage-and-events-design.md`) üç plana bölündü. Plan 1 (`docs/superpowers/plans/2026-11-10-usage-quota-events.md`, `c8afed1`) tamamlandı; kullanıcı `/sous-chef:fire` ile yürüttü: görevler Codex'e aşamalı biletlerle verildi, her aşama baş aşçı tarafından satır satır incelendi, testler/GTK smoke yerelde koşuldu, commit'ler baş aşçının. Karar defteri: `.superpowers/sdd/2026-11-10-usage-quota-events/progress.md` (yerel).
