@@ -4,6 +4,7 @@ use std::net::IpAddr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -33,6 +34,12 @@ use crate::ipc::{
 };
 
 use super::DaemonState;
+use crate::config::Language;
+use crate::usage::{
+    events::EventKind,
+    notify::{quota_notification, Notifier, SessionNotifier},
+    UsageService,
+};
 
 const EVENT_CAPACITY: usize = 32;
 const MAX_CONFIG_BYTES: u64 = 1_048_576;
@@ -78,7 +85,7 @@ impl DaemonError {
         &self.message
     }
 
-    fn validation(message: impl Into<String>) -> Self {
+    pub(crate) fn validation(message: impl Into<String>) -> Self {
         Self::new("DAEMON_PROFILE_INVALID", message)
     }
 
@@ -163,6 +170,9 @@ pub trait PrivilegedHelperClient: Send + Sync {
 }
 
 pub trait ConfigRepository: Send + Sync {
+    fn language(&self) -> Language {
+        Language::default()
+    }
     fn load(&self) -> Result<Option<Profile>, DaemonError>;
     fn save(&self, desired: Option<&Profile>) -> Result<(), DaemonError>;
 }
@@ -183,6 +193,8 @@ where
     helper: H,
     config: C,
     events: broadcast::Sender<DaemonEvent>,
+    usage: Option<Arc<UsageService>>,
+    notifier: Arc<dyn Notifier>,
 }
 
 impl<T, R, H, C> DaemonService<T, R, H, C>
@@ -205,7 +217,180 @@ where
             helper,
             config,
             events,
+            usage: None,
+            notifier: Arc::new(SessionNotifier),
         })
+    }
+
+    pub fn with_usage(mut self, usage: Arc<UsageService>) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
+        self.notifier = notifier;
+        self
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.events.receiver_count()
+    }
+
+    fn usage(&self) -> Result<&UsageService, DaemonError> {
+        self.usage.as_deref().ok_or_else(|| {
+            DaemonError::new(
+                "DAEMON_USAGE_UNAVAILABLE",
+                "local usage service is unavailable",
+            )
+        })
+    }
+
+    async fn usage_request(&self, request: DaemonRequest) -> Result<DaemonResult, DaemonError> {
+        let usage = self.usage()?;
+        match request {
+            DaemonRequest::GetUsage { fast_lane } => {
+                let lanes = self
+                    .state
+                    .lock()
+                    .await
+                    .desired
+                    .as_ref()
+                    .map(|profile| profile.lanes.clone())
+                    .unwrap_or_default();
+                Ok(DaemonResult::Usage(usage.report(&lanes, fast_lane)))
+            }
+            DaemonRequest::SetQuota { lane_id, quota } => {
+                self.require_usage_lane(&lane_id).await?;
+                usage.set_quota(&lane_id, quota)?;
+                Ok(DaemonResult::QuotaSaved)
+            }
+            DaemonRequest::CorrectUsage {
+                lane_id,
+                used_bytes,
+            } => {
+                self.require_usage_lane(&lane_id).await?;
+                let crossings = usage.correct(&lane_id, used_bytes)?;
+                self.quota_crossings(crossings).await;
+                Ok(DaemonResult::QuotaSaved)
+            }
+            DaemonRequest::ListEvents { category } => {
+                Ok(DaemonResult::Events(usage.events(category)))
+            }
+            DaemonRequest::ClearEvents => {
+                usage.clear_events()?;
+                Ok(DaemonResult::EventsCleared)
+            }
+            _ => unreachable!("only usage requests are dispatched here"),
+        }
+    }
+
+    async fn require_usage_lane(&self, id: &crate::domain::LaneId) -> Result<(), DaemonError> {
+        if self
+            .state
+            .lock()
+            .await
+            .desired
+            .as_ref()
+            .is_some_and(|profile| profile.lanes.iter().any(|lane| &lane.id == id))
+        {
+            Ok(())
+        } else {
+            Err(DaemonError::validation(
+                "lane is not in the desired profile",
+            ))
+        }
+    }
+
+    /// Samples only desired lanes. This never reconciles or takes the routing mutation lock.
+    pub async fn sample_usage(&self) {
+        if let Some(usage) = &self.usage {
+            let lanes = self
+                .state
+                .lock()
+                .await
+                .desired
+                .as_ref()
+                .map(|profile| profile.lanes.clone())
+                .unwrap_or_default();
+            self.quota_crossings(usage.tick(&lanes)).await;
+        }
+    }
+
+    async fn quota_crossings(
+        &self,
+        crossings: Vec<(crate::domain::LaneId, crate::usage::store::QuotaCrossing)>,
+    ) {
+        let Some(usage) = &self.usage else { return };
+        for (lane_id, crossing) in crossings {
+            use crate::usage::store::QuotaCrossing;
+            let kind = match crossing {
+                QuotaCrossing::Warning { used, limit } => EventKind::QuotaWarning {
+                    lane_id: lane_id.clone(),
+                    used,
+                    limit,
+                },
+                QuotaCrossing::Full { used, limit } => EventKind::QuotaFull {
+                    lane_id: lane_id.clone(),
+                    used,
+                    limit,
+                },
+            };
+            if let Err(error) = usage.record(kind) {
+                log::warn!("record quota crossing: {error}");
+            }
+            // The subscriber decision and event publication happen together, without yielding.
+            let mut state = self.state.lock().await;
+            if self.subscriber_count() > 0 {
+                let sequence = advance_event_sequence(&mut state);
+                if self
+                    .events
+                    .send(DaemonEvent::QuotaCrossed {
+                        sequence,
+                        lane_id: lane_id.clone(),
+                        crossing: crossing.clone(),
+                    })
+                    .is_ok()
+                {
+                    continue;
+                }
+            }
+            let lane = state
+                .desired
+                .as_ref()
+                .and_then(|profile| profile.lanes.iter().find(|lane| lane.id == lane_id))
+                .cloned();
+            drop(state);
+            if let Some(lane) = lane {
+                if let Some(quota) = usage
+                    .report(std::slice::from_ref(&lane), None)
+                    .lanes
+                    .into_iter()
+                    .next()
+                    .and_then(|lane| lane.quota)
+                {
+                    let text = quota_notification(
+                        &lane.name,
+                        &crossing,
+                        &quota.settings,
+                        quota.next_reset,
+                        self.config.language(),
+                    );
+                    self.notifier.notify("RouteLane", &text);
+                }
+            }
+        }
+    }
+
+    async fn record_usage(&self, kind: EventKind) {
+        if let Some(usage) = &self.usage {
+            if let Err(error) = usage.record(kind) {
+                log::warn!("record daemon event: {error}");
+                return;
+            }
+            let mut state = self.state.lock().await;
+            let sequence = advance_event_sequence(&mut state);
+            let _ = self.events.send(DaemonEvent::EventRecorded { sequence });
+        }
     }
 
     pub async fn state(&self) -> DaemonState {
@@ -224,7 +409,7 @@ where
                 IpcError::new(
                     "IPC_UNSUPPORTED_PROTOCOL_VERSION",
                     format!(
-                        "protocol version {} is unsupported; expected {IPC_PROTOCOL_VERSION}",
+                        "protocol version {} is unsupported; expected {IPC_PROTOCOL_VERSION}; install matching RouteLane GUI, CLI and daemon versions",
                         envelope.protocol_version
                     ),
                 ),
@@ -238,6 +423,11 @@ where
         }
 
         let result = match envelope.request {
+            request @ (DaemonRequest::GetUsage { .. }
+            | DaemonRequest::SetQuota { .. }
+            | DaemonRequest::CorrectUsage { .. }
+            | DaemonRequest::ListEvents { .. }
+            | DaemonRequest::ClearEvents) => self.usage_request(request).await,
             DaemonRequest::GetStatus => Ok(DaemonResult::Status(self.current_status().await)),
             DaemonRequest::ListProfiles => {
                 let _ = self.ensure_reconciled().await;
@@ -445,6 +635,46 @@ where
     }
 
     async fn apply_profile_locked(
+        &self,
+        profile: Profile,
+    ) -> Result<ApplyProfileResult, DaemonError> {
+        let previous = self.state.lock().await.applied_profile.clone();
+        let result = self.apply_profile_transaction(profile.clone()).await;
+        match &result {
+            Ok(_) => {
+                if let Some(usage) = &self.usage {
+                    usage.reset_runtime();
+                }
+                self.record_usage(EventKind::ProfileApplied {
+                    profile: profile.name.clone(),
+                })
+                .await;
+                for rule in profile.rules.iter().filter(|rule| rule.enabled) {
+                    if !previous.as_ref().is_some_and(|old| {
+                        old.rules
+                            .iter()
+                            .any(|prior| prior.id == rule.id && prior.enabled)
+                    }) {
+                        self.record_usage(EventKind::RuleApplied {
+                            rule_id: rule.id.clone(),
+                        })
+                        .await;
+                    }
+                }
+            }
+            Err(error) => {
+                self.record_usage(EventKind::ApplyFailed {
+                    code: error.code().to_owned(),
+                    message: error.message().to_owned(),
+                    rolled_back: error.code() != "DAEMON_KERNEL_ROLLBACK_FAILED",
+                })
+                .await
+            }
+        }
+        result
+    }
+
+    async fn apply_profile_transaction(
         &self,
         profile: Profile,
     ) -> Result<ApplyProfileResult, DaemonError> {
@@ -711,6 +941,11 @@ where
             }
             None => HealthReport::from_parts(HealthState::Degraded, Default::default(), vec![]),
         };
+        let runtime_events = self
+            .usage
+            .as_ref()
+            .map(|usage| usage.runtime_change(&state.primary, &inspected.runtime))
+            .unwrap_or_default();
         state.health = health;
         state.primary = inspected.runtime;
         let sequence = advance_event_sequence(&mut state);
@@ -719,6 +954,10 @@ where
             generation: state.generation,
             primary: state.primary.clone(),
         });
+        drop(state);
+        for event in runtime_events {
+            self.record_usage(event).await;
+        }
     }
 
     pub async fn set_rule_enabled(
@@ -793,6 +1032,10 @@ where
                 health: HealthReport::inactive(),
             });
         }
+        if let Some(usage) = &self.usage {
+            usage.reset_runtime();
+        }
+        self.record_usage(EventKind::ProfileDeactivated).await;
         Ok(())
     }
 
@@ -1600,6 +1843,16 @@ impl AtomicJsonConfigRepository {
 }
 
 impl ConfigRepository for AtomicJsonConfigRepository {
+    fn language(&self) -> Language {
+        // desired-profile.json holds routing intent only. The adjacent UI config
+        // document owns the session language; reading it must never save/migrate it.
+        self.path
+            .parent()
+            .and_then(|parent| crate::config::load_config_file(&parent.join("config.json")).ok())
+            .map(|document| document.language)
+            .unwrap_or_default()
+    }
+
     fn load(&self) -> Result<Option<Profile>, DaemonError> {
         let file = match OpenOptions::new()
             .read(true)

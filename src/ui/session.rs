@@ -488,7 +488,13 @@ impl UiSession {
             }
             DaemonToUi::Event { epoch, event } if epoch == self.epoch => {
                 // Topology or runtime moved on: the observed facts may differ.
-                self.preview = None;
+                // Usage notices change neither, so they keep the preview.
+                if !matches!(
+                    event,
+                    DaemonEvent::QuotaCrossed { .. } | DaemonEvent::EventRecorded { .. }
+                ) {
+                    self.preview = None;
+                }
                 if let DaemonEvent::PrimaryChanged {
                     generation,
                     sequence,
@@ -516,6 +522,9 @@ impl UiSession {
                         ..
                     } => (generation, sequence, health),
                     DaemonEvent::PrimaryChanged { .. } => unreachable!("handled above"),
+                    DaemonEvent::QuotaCrossed { .. } | DaemonEvent::EventRecorded { .. } => {
+                        return vec![]
+                    }
                 };
                 if let Some(mut status) = self.status.clone() {
                     status.generation = generation;
@@ -1192,6 +1201,27 @@ mod tests {
             response: preview_response(&request.request_id, vec![]),
         });
         assert!(s.preview_for(&candidate).is_none());
+    }
+
+    #[test]
+    fn usage_notices_keep_the_preview() {
+        let mut s = session(true, true);
+        let candidate = profile();
+        previewed(&mut s, &candidate);
+        for event in [
+            DaemonEvent::EventRecorded { sequence: 9 },
+            DaemonEvent::QuotaCrossed {
+                sequence: 10,
+                lane_id: "vpn".into(),
+                crossing: routelane::usage::store::QuotaCrossing::Warning {
+                    used: 16_000_000_000,
+                    limit: 20_000_000_000,
+                },
+            },
+        ] {
+            s.handle_daemon(DaemonToUi::Event { epoch: 1, event });
+        }
+        assert!(s.preview_for(&candidate).is_some());
     }
 
     #[test]

@@ -134,7 +134,7 @@ fn readme_documents_selective_scope_and_protocol_versions() {
         "DAEMON_PREVIEW_UNAVAILABLE",
         "docs/selective-routing-verification.md",
         "schema version 4",
-        "IPC protocol 3",
+        "IPC protocol 4",
         "runtime protocol 3",
         "helper journal version 3",
         "exit code 6",
@@ -144,7 +144,7 @@ fn readme_documents_selective_scope_and_protocol_versions() {
     ] {
         assert!(readme.contains(fact), "README must document {fact}");
     }
-    assert_eq!(IPC_PROTOCOL_VERSION, 3);
+    assert_eq!(IPC_PROTOCOL_VERSION, 4);
     assert_eq!(RUNTIME_PROTOCOL_VERSION, 3);
     assert_eq!(routelane::config::CURRENT_SCHEMA_VERSION, 4);
 }
@@ -168,8 +168,8 @@ fn packages_ship_helper2_policy_and_consistent_versions() {
     ));
     assert!(rpm_spec().contains("Requires:       polkit\n"));
 
-    // GUI, daemon and helper speak the same protocol generation.
-    assert_eq!(IPC_PROTOCOL_VERSION, RUNTIME_PROTOCOL_VERSION);
+    // Daemon IPC and helper runtime have independent protocol generations.
+    assert_eq!((IPC_PROTOCOL_VERSION, RUNTIME_PROTOCOL_VERSION), (4, 3));
 
     // Both packages take their version from Cargo.toml the same way.
     let cargo_version = read("Cargo.toml")

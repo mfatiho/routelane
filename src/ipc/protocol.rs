@@ -1,12 +1,19 @@
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{PlanHash, RoutingPreview, RuntimeStatus};
-use crate::domain::{Profile, ProfileId, RuleId};
+use crate::domain::{LaneId, Profile, ProfileId, RuleId};
 use crate::health::HealthReport;
+use crate::usage::{
+    events::{EventCategory, UsageEvent},
+    quota::LaneQuota,
+    store::QuotaCrossing,
+    UsageReport,
+};
 
 /// 2: runtime authority (helper-owned primary/backup decisions).
 /// 3: selective routing; status reports the helper's applied routing mode.
-pub const IPC_PROTOCOL_VERSION: u32 = 3;
+/// 4: local usage, quotas and event history (runtime protocol remains 3).
+pub const IPC_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonEnvelope {
@@ -29,6 +36,21 @@ impl DaemonEnvelope {
 #[serde(tag = "method", content = "parameters")]
 pub enum DaemonRequest {
     GetStatus,
+    GetUsage {
+        fast_lane: Option<LaneId>,
+    },
+    SetQuota {
+        lane_id: LaneId,
+        quota: Option<LaneQuota>,
+    },
+    CorrectUsage {
+        lane_id: LaneId,
+        used_bytes: u64,
+    },
+    ListEvents {
+        category: EventCategory,
+    },
+    ClearEvents,
     /// Returns the daemon's partial desired/applied profile snapshot. Clients
     /// merge these profiles by ID; absence never authorizes local deletion.
     ListProfiles,
@@ -89,6 +111,10 @@ impl DaemonResponse {
 #[serde(tag = "kind", content = "value")]
 pub enum DaemonResult {
     Status(DaemonStatus),
+    Usage(UsageReport),
+    QuotaSaved,
+    Events(Vec<UsageEvent>),
+    EventsCleared,
     /// Partial profile snapshot for merge/upsert, not an authoritative catalog.
     Profiles(Vec<Profile>),
     Applied(ApplyProfileResult),
@@ -138,6 +164,14 @@ pub struct OrphanRecoveryResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", content = "value")]
 pub enum DaemonEvent {
+    QuotaCrossed {
+        sequence: u64,
+        lane_id: LaneId,
+        crossing: QuotaCrossing,
+    },
+    EventRecorded {
+        sequence: u64,
+    },
     StateChanged {
         sequence: u64,
         generation: u64,

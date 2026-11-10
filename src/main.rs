@@ -345,7 +345,9 @@ fn daemon_event_sequence(event: &routelane::ipc::DaemonEvent) -> u64 {
     match event {
         routelane::ipc::DaemonEvent::StateChanged { sequence, .. }
         | routelane::ipc::DaemonEvent::OperationFailed { sequence, .. }
-        | routelane::ipc::DaemonEvent::PrimaryChanged { sequence, .. } => *sequence,
+        | routelane::ipc::DaemonEvent::PrimaryChanged { sequence, .. }
+        | routelane::ipc::DaemonEvent::QuotaCrossed { sequence, .. }
+        | routelane::ipc::DaemonEvent::EventRecorded { sequence } => *sequence,
     }
 }
 

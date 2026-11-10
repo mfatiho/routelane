@@ -137,10 +137,15 @@ impl EventStore {
     }
 
     pub fn append(&mut self, event: UsageEvent) -> anyhow::Result<()> {
+        self.append_at(event, now_unix_ms())
+    }
+
+    /// Uses the service clock for deterministic retention when appending.
+    pub fn append_at(&mut self, event: UsageEvent, now_unix_ms: i64) -> anyhow::Result<()> {
         let mut events = self.events.clone();
         events.push(event.clone());
         let before = events.len();
-        retain(&mut events, now_unix_ms());
+        retain(&mut events, now_unix_ms);
         if events.len() != before {
             self.rewrite(&events)?;
         } else {

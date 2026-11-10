@@ -1,4 +1,4 @@
-//! Daemon IPC v3: the helper owns runtime authority, generations and the
+//! Daemon IPC v4: the helper owns runtime authority, generations and the
 //! applied routing mode; the daemon only verifies, pairs and reports them.
 
 use std::sync::{Arc, Mutex};
@@ -436,7 +436,7 @@ async fn old_protocol_is_rejected_before_mutation() {
 
 #[tokio::test]
 async fn protocol2_peers_are_rejected_before_mutation() {
-    assert_eq!((IPC_PROTOCOL_VERSION, RUNTIME_PROTOCOL_VERSION), (3, 3));
+    assert_eq!((IPC_PROTOCOL_VERSION, RUNTIME_PROTOCOL_VERSION), (4, 3));
     // A protocol-2 GUI/CLI request.
     let helper = RuntimeHelper::default();
     let config = MemoryConfig::default();

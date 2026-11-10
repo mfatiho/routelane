@@ -11,3 +11,10 @@ pub use protocol::{
     OrphanRecoveryResult, IPC_PROTOCOL_VERSION,
 };
 pub use server::{socket_path, DaemonRequestHandler, UnixSocketServer};
+
+pub use crate::usage::{
+    events::{EventCategory, UsageEvent},
+    quota::LaneQuota,
+    store::QuotaCrossing,
+    LaneUsage, QuotaStatus, UsageRate, UsageReport,
+};

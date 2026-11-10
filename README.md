@@ -220,8 +220,8 @@ feature decisions.
 ### Protocol versions and upgrades
 
 Configuration and desired-profile documents use schema version 4. Clients
-and the daemon use IPC protocol 3; runtime activation uses runtime protocol 3,
-with helper journal version 3. A protocol-2 GUI or CLI request is rejected with
+and the daemon use IPC protocol 4; runtime activation uses runtime protocol 3,
+with helper journal version 3. A protocol-3 GUI or CLI request is rejected with
 `IPC_UNSUPPORTED_PROTOCOL_VERSION`. A helper that cannot answer
 `GetRuntimeProtocol` with 3 causes `DAEMON_HELPER_PROTOCOL_MISMATCH` before any
 configuration save or kernel change. Install matching daemon and helper versions.

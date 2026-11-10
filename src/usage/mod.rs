@@ -1,8 +1,13 @@
 pub mod calendar;
 pub mod counters;
 pub mod events;
+pub mod notify;
 pub mod quota;
+pub mod service;
 pub mod store;
+pub use service::{
+    runtime_events, FailoverMark, LaneUsage, QuotaStatus, UsageRate, UsageReport, UsageService,
+};
 
 pub use calendar::LocalDate;
 

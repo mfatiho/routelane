@@ -1,0 +1,422 @@
+use async_trait::async_trait;
+use routelane::{
+    backend::*,
+    daemon::*,
+    domain::*,
+    ipc::*,
+    usage::{calendar::*, counters::*, events::*, service::*, store::*},
+};
+use std::sync::{
+    atomic::{AtomicI64, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+use std::time::Duration;
+
+#[derive(Clone, Default)]
+struct Forbidden(Arc<AtomicUsize>);
+impl Forbidden {
+    fn called(&self) -> ! {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        panic!("usage touched routing")
+    }
+}
+#[async_trait]
+impl TopologyProvider for Forbidden {
+    async fn snapshot(&self, _: &Profile) -> Result<TopologySnapshot, DaemonError> {
+        self.called()
+    }
+}
+#[async_trait]
+impl ResolutionProvider for Forbidden {
+    async fn snapshot(&self, _: &Profile) -> Result<ResolutionSnapshot, DaemonError> {
+        self.called()
+    }
+}
+#[async_trait]
+impl PrivilegedHelperClient for Forbidden {
+    async fn runtime_protocol_version(&self) -> Result<u32, DaemonError> {
+        self.called()
+    }
+    async fn apply(&self, _: &KernelPlan) -> Result<ApplyResponse, DaemonError> {
+        self.called()
+    }
+    async fn restore(
+        &self,
+        _: &KernelPlan,
+        _: Option<&KernelPlan>,
+    ) -> Result<RestoreResponse, DaemonError> {
+        self.called()
+    }
+    async fn inspect(&self) -> Result<InspectResponse, DaemonError> {
+        self.called()
+    }
+    async fn cleanup(&self) -> Result<CleanupResponse, DaemonError> {
+        self.called()
+    }
+    async fn recover_orphaned_resources(&self) -> Result<OrphanRecoveryResponse, DaemonError> {
+        self.called()
+    }
+}
+#[derive(Clone)]
+struct Config {
+    profile: Profile,
+    saves: Arc<AtomicUsize>,
+}
+impl ConfigRepository for Config {
+    fn load(&self) -> Result<Option<Profile>, DaemonError> {
+        Ok(Some(self.profile.clone()))
+    }
+    fn save(&self, _: Option<&Profile>) -> Result<(), DaemonError> {
+        self.saves.fetch_add(1, Ordering::SeqCst);
+        panic!("usage saved profile")
+    }
+}
+#[derive(Default)]
+struct Counters(Mutex<Option<InterfaceSample>>);
+impl InterfaceCounters for Counters {
+    fn sample(&self, _: &str) -> Option<InterfaceSample> {
+        self.0.lock().unwrap().clone()
+    }
+}
+fn lane(id: &str) -> Lane {
+    Lane {
+        id: id.into(),
+        name: id.into(),
+        interface: id.into(),
+        fallback_lane: None,
+        failure_policy: LaneFailurePolicy::Inactive,
+    }
+}
+fn quota() -> LaneQuota {
+    LaneQuota {
+        enabled: true,
+        limit_bytes: 20_000_000_000,
+        reset_day: 1,
+        warn_percent: 80,
+    }
+}
+struct Fixture {
+    _dir: tempfile::TempDir,
+    usage: Arc<UsageService>,
+    daemon: DaemonService<Forbidden, Forbidden, Forbidden, Config>,
+    clock: Arc<AtomicI64>,
+    counters: Arc<Counters>,
+    forbidden: Forbidden,
+    saves: Arc<AtomicUsize>,
+    settings: std::path::PathBuf,
+}
+fn fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(AtomicI64::new(
+        local_midnight(LocalDate::parse("2026-11-09").unwrap()) + 3600,
+    ));
+    let counters = Arc::new(Counters::default());
+    let settings = dir.path().join("usage-settings.json");
+    let (store, _) = UsageStore::open(dir.path().join("usage-v1.json"), "boot");
+    let (events, _) = EventStore::open(dir.path().join("events-v1.jsonl"));
+    let c = clock.clone();
+    let usage = Arc::new(UsageService::new(
+        store,
+        settings.clone(),
+        events,
+        counters.clone(),
+        Arc::new(move || c.load(Ordering::SeqCst)),
+    ));
+    let saves = Arc::new(AtomicUsize::new(0));
+    let forbidden = Forbidden::default();
+    let config = Config {
+        profile: Profile {
+            id: "default".into(),
+            name: "Default".into(),
+            enabled: true,
+            lanes: vec![lane("vinn"), lane("ethernet")],
+            rules: vec![],
+            routing: Default::default(),
+        },
+        saves: saves.clone(),
+    };
+    let daemon = DaemonService::new(
+        forbidden.clone(),
+        forbidden.clone(),
+        forbidden.clone(),
+        config,
+    )
+    .unwrap()
+    .with_usage(usage.clone());
+    Fixture {
+        _dir: dir,
+        usage,
+        daemon,
+        clock,
+        counters,
+        forbidden,
+        saves,
+        settings,
+    }
+}
+async fn request(f: &Fixture, request: DaemonRequest) -> DaemonResponse {
+    f.daemon.handle(DaemonEnvelope::new("test", request)).await
+}
+
+#[tokio::test]
+async fn usage_requests_never_touch_routing_or_config() {
+    let f = fixture();
+    let before = f.daemon.state().await;
+    for req in [
+        DaemonRequest::GetUsage { fast_lane: None },
+        DaemonRequest::SetQuota {
+            lane_id: "vinn".into(),
+            quota: Some(quota()),
+        },
+        DaemonRequest::CorrectUsage {
+            lane_id: "vinn".into(),
+            used_bytes: 12_400_000_000,
+        },
+        DaemonRequest::ListEvents {
+            category: EventCategory::All,
+        },
+        DaemonRequest::ClearEvents,
+    ] {
+        assert!(request(&f, req).await.error.is_none());
+    }
+    let after = f.daemon.state().await;
+    assert_eq!(
+        (before.generation, before.event_sequence),
+        (after.generation, after.event_sequence)
+    );
+    assert_eq!(f.forbidden.0.load(Ordering::SeqCst), 0);
+    assert_eq!(f.saves.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn quota_report_matches_the_vinn_example() {
+    let f = fixture();
+    f.usage.set_quota(&"vinn".into(), Some(quota())).unwrap();
+    *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+        ifindex: 1,
+        rx_bytes: 0,
+        tx_bytes: 0,
+    });
+    f.usage.tick(&[lane("vinn")]);
+    *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+        ifindex: 1,
+        rx_bytes: 11_100_000_000,
+        tx_bytes: 1_300_000_000,
+    });
+    f.usage.tick(&[lane("vinn")]);
+    let response = request(&f, DaemonRequest::GetUsage { fast_lane: None }).await;
+    let Some(DaemonResult::Usage(report)) = response.result else {
+        panic!("{response:?}")
+    };
+    let q = report.lanes[0].quota.as_ref().unwrap();
+    assert_eq!(q.used_bytes, 12_400_000_000);
+    assert_eq!(
+        q.measured,
+        routelane::usage::UsageTotals {
+            rx: 11_100_000_000,
+            tx: 1_300_000_000
+        }
+    );
+    assert_eq!(q.period_start.to_string(), "2026-11-01");
+    assert_eq!(q.next_reset.to_string(), "2026-12-01");
+    assert_eq!(report.lanes[0].daily.len(), 9);
+    assert!(report.lanes[1].quota.is_none());
+    assert_eq!(report.lanes[1].daily.len(), 7);
+}
+#[tokio::test]
+async fn invalid_quota_is_rejected_without_saving() {
+    let f = fixture();
+    for req in [
+        DaemonRequest::SetQuota {
+            lane_id: "vinn".into(),
+            quota: Some(LaneQuota {
+                reset_day: 32,
+                ..quota()
+            }),
+        },
+        DaemonRequest::CorrectUsage {
+            lane_id: "vinn".into(),
+            used_bytes: 1,
+        },
+    ] {
+        assert_eq!(
+            request(&f, req).await.error.unwrap().code,
+            "DAEMON_PROFILE_INVALID"
+        );
+    }
+    assert!(!f.settings.exists());
+}
+#[tokio::test]
+async fn protocol3_client_gets_an_actionable_mismatch() {
+    let f = fixture();
+    let before = f.daemon.state().await;
+    let response = f
+        .daemon
+        .handle(DaemonEnvelope {
+            protocol_version: 3,
+            request_id: "old".into(),
+            request: DaemonRequest::ApplyProfile(f.daemon.state().await.desired.unwrap()),
+        })
+        .await;
+    let error = response.error.unwrap();
+    assert_eq!(error.code, "IPC_UNSUPPORTED_PROTOCOL_VERSION");
+    assert!(error.message.contains("4"));
+    assert!(error.message.contains("matching"));
+    let after = f.daemon.state().await;
+    assert_eq!(
+        (before.generation, before.event_sequence),
+        (after.generation, after.event_sequence)
+    );
+    assert_eq!(f.forbidden.0.load(Ordering::SeqCst), 0);
+    assert_eq!(f.saves.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn fast_sampling_lasts_five_seconds_after_the_last_request() {
+    let f = fixture();
+    assert_eq!(f.usage.interval(), Duration::from_secs(30));
+    request(
+        &f,
+        DaemonRequest::GetUsage {
+            fast_lane: Some("vinn".into()),
+        },
+    )
+    .await;
+    assert_eq!(f.usage.interval(), Duration::from_secs(1));
+    f.clock.fetch_add(4, Ordering::SeqCst);
+    request(
+        &f,
+        DaemonRequest::GetUsage {
+            fast_lane: Some("vinn".into()),
+        },
+    )
+    .await;
+    f.clock.fetch_add(2, Ordering::SeqCst);
+    assert_eq!(f.usage.interval(), Duration::from_secs(1));
+    f.clock.fetch_add(4, Ordering::SeqCst);
+    assert_eq!(f.usage.interval(), Duration::from_secs(30));
+}
+#[test]
+fn removed_lanes_are_hidden_and_retained_when_they_return() {
+    let f = fixture();
+    let lanes = [lane("vinn")];
+    f.usage.set_quota(&"vinn".into(), Some(quota())).unwrap();
+    *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+        ifindex: 1,
+        rx_bytes: 0,
+        tx_bytes: 0,
+    });
+    f.usage.tick(&lanes);
+    *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+        ifindex: 1,
+        rx_bytes: 11_100_000_000,
+        tx_bytes: 1_300_000_000,
+    });
+    f.usage.tick(&lanes);
+    f.usage.correct(&"vinn".into(), 13_000_000_000).unwrap();
+    f.usage.tick(&[]);
+    assert!(f.usage.report(&[], None).lanes.is_empty());
+    let (store, note) = UsageStore::open(f._dir.path().join("usage-v1.json"), "boot");
+    assert!(note.is_none());
+    let (events, _) = EventStore::open(f._dir.path().join("events-v1.jsonl"));
+    let c = f.clock.clone();
+    let restarted = UsageService::new(
+        store,
+        f.settings.clone(),
+        events,
+        f.counters.clone(),
+        Arc::new(move || c.load(Ordering::SeqCst)),
+    );
+    let mut renamed = lane("vinn");
+    renamed.interface = "wwan9".into();
+    let report = restarted.report(&[renamed], None);
+    let q = report.lanes[0].quota.as_ref().unwrap();
+    assert_eq!(q.used_bytes, 13_000_000_000);
+    assert_eq!(
+        q.measured,
+        routelane::usage::UsageTotals {
+            rx: 11_100_000_000,
+            tx: 1_300_000_000
+        }
+    );
+    assert_eq!(report.lanes[0].interface, "wwan9");
+}
+
+#[tokio::test]
+async fn usage_requests_report_unavailable_without_a_usage_service() {
+    let f = fixture();
+    let config = Config {
+        profile: f.daemon.state().await.desired.unwrap(),
+        saves: f.saves.clone(),
+    };
+    let daemon = DaemonService::new(
+        f.forbidden.clone(),
+        f.forbidden.clone(),
+        f.forbidden.clone(),
+        config,
+    )
+    .unwrap();
+    for request in [
+        DaemonRequest::GetUsage { fast_lane: None },
+        DaemonRequest::SetQuota {
+            lane_id: "vinn".into(),
+            quota: None,
+        },
+        DaemonRequest::CorrectUsage {
+            lane_id: "vinn".into(),
+            used_bytes: 0,
+        },
+        DaemonRequest::ListEvents {
+            category: EventCategory::All,
+        },
+        DaemonRequest::ClearEvents,
+    ] {
+        assert_eq!(
+            daemon
+                .handle(DaemonEnvelope::new("no-usage", request))
+                .await
+                .error
+                .unwrap()
+                .code,
+            "DAEMON_USAGE_UNAVAILABLE"
+        );
+    }
+}
+
+#[test]
+fn rates_use_elapsed_seconds_expire_and_clear_on_disconnect() {
+    let f = fixture();
+    let lanes = [lane("vinn")];
+    *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+        ifindex: 1,
+        rx_bytes: 100,
+        tx_bytes: 10,
+    });
+    f.usage.tick(&lanes);
+    assert!(f.usage.report(&lanes, None).lanes[0].rate.is_none());
+    f.clock.fetch_add(2, Ordering::SeqCst);
+    *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+        ifindex: 1,
+        rx_bytes: 2100,
+        tx_bytes: 210,
+    });
+    f.usage.tick(&lanes);
+    assert_eq!(
+        f.usage.report(&lanes, None).lanes[0].rate,
+        Some(UsageRate {
+            rx_per_second: 1000,
+            tx_per_second: 100
+        })
+    );
+    f.clock.fetch_add(60, Ordering::SeqCst);
+    assert!(f.usage.report(&lanes, None).lanes[0]
+        .recent_rates
+        .is_empty());
+    *f.counters.0.lock().unwrap() = None;
+    f.usage.tick(&lanes);
+    let report = f.usage.report(&lanes, None);
+    assert!(!report.lanes[0].available);
+    assert!(report.lanes[0].rate.is_none());
+    assert_eq!(
+        report.lanes[0].today,
+        routelane::usage::UsageTotals { rx: 2000, tx: 200 }
+    );
+}
