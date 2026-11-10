@@ -119,7 +119,15 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
             return;
         }
     };
-    let client = DaemonClient::new(path);
+    run_bridge(from_ui, to_ui, DaemonClient::new(path), policy).await;
+}
+
+async fn run_bridge(
+    from_ui: Receiver<UiToDaemon>,
+    to_ui: Sender<DaemonToUi>,
+    client: DaemonClient,
+    policy: ConnectionPolicy,
+) {
     let mut connection_epoch = 0;
 
     let mut subscription =
@@ -159,6 +167,7 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
                 }
             }
         };
+    let (delivery_sender, mut deliveries) = tokio::sync::mpsc::channel(64);
     let mut reconnect_attempt = 0;
     let mut next_reconnect = tokio::time::Instant::now();
     loop {
@@ -168,15 +177,16 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
             command = from_ui.recv() => {
                 match command {
                     Ok(UiToDaemon::Request(request)) => {
-                        match deliver_request(&client, request, connection_epoch, &to_ui, policy).await {
-                            Ok(()) => {},
-                            Err(_) => {
-                                close_subscription(&mut subscription);
-                                next_reconnect = tokio::time::Instant::now()
-                                    + policy.reconnect_delay(reconnect_attempt);
-                                reconnect_attempt = reconnect_attempt.saturating_add(1);
-                            }
-                        }
+                        let client = client.clone();
+                        let sender = to_ui.clone();
+                        let completed = delivery_sender.clone();
+                        let epoch = connection_epoch;
+                        let poll = matches!(request.request,
+                            DaemonRequest::GetUsage { .. } | DaemonRequest::ListEvents { .. });
+                        tokio::spawn(async move {
+                            let result = deliver_request(&client, request, epoch, &sender, policy).await;
+                            let _ = completed.send((epoch, result.is_err() && !poll)).await;
+                        });
                     }
                     Ok(UiToDaemon::RefreshSnapshot) => {
                         if let Err(error) = refresh_daemon_state(&client, &to_ui, policy, connection_epoch).await {
@@ -187,6 +197,14 @@ async fn daemon_bridge(from_ui: Receiver<UiToDaemon>, to_ui: Sender<DaemonToUi>)
                         }
                     }
                     Ok(UiToDaemon::Shutdown) | Err(_) => break,
+                }
+            }
+            Some((epoch, reconnect)) = deliveries.recv() => {
+                if reconnect && epoch == connection_epoch {
+                    close_subscription(&mut subscription);
+                    next_reconnect = tokio::time::Instant::now()
+                        + policy.reconnect_delay(reconnect_attempt);
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
                 }
             }
             event = async {
@@ -376,9 +394,11 @@ async fn send_with_timeout(
     policy: ConnectionPolicy,
 ) -> Result<routelane::ipc::DaemonResponse, IpcError> {
     let timeout = match &request.request {
-        DaemonRequest::GetStatus | DaemonRequest::ListProfiles | DaemonRequest::Subscribe => {
-            policy.request_timeout
-        }
+        DaemonRequest::GetStatus
+        | DaemonRequest::ListProfiles
+        | DaemonRequest::Subscribe
+        | DaemonRequest::GetUsage { .. }
+        | DaemonRequest::ListEvents { .. } => policy.request_timeout,
         _ => policy.mutation_timeout,
     };
     tokio::time::timeout(
@@ -453,6 +473,254 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
+
+    async fn bridge_fake(
+        listener: UnixListener,
+        mut events: tokio::sync::mpsc::Receiver<DaemonEvent>,
+        mutation_started: async_channel::Sender<()>,
+        hold_polls: bool,
+    ) {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let envelope: DaemonEnvelope = read_frame(&mut stream).await.unwrap();
+            if matches!(envelope.request, DaemonRequest::Subscribe) {
+                write_frame(
+                    &mut stream,
+                    &DaemonResponse::success(envelope.request_id, DaemonResult::Subscribed),
+                )
+                .await
+                .unwrap();
+                let mut subscription = stream;
+                // A single subscription is expected; reconnects are observed by the UI test.
+                tokio::spawn(async move {
+                    while let Some(event) = events.recv().await {
+                        if write_frame(&mut subscription, &event).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                // Keep servicing reconnect attempts without taking the event receiver again.
+                events = tokio::sync::mpsc::channel(1).1;
+                continue;
+            }
+            let started = mutation_started.clone();
+            tokio::spawn(async move {
+                let result = match envelope.request {
+                    DaemonRequest::GetStatus => DaemonResult::Status(DaemonStatus {
+                        generation: 2,
+                        event_sequence: 5,
+                        health: HealthReport::inactive(),
+                        desired_profile_id: None,
+                        applied_profile_id: None,
+                        last_error: None,
+                        primary: Default::default(),
+                    }),
+                    DaemonRequest::ListProfiles => DaemonResult::Profiles(vec![]),
+                    DaemonRequest::ApplyProfile(_) => {
+                        started.send(()).await.unwrap();
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        write_frame(
+                            &mut stream,
+                            &DaemonResponse::failure(
+                                envelope.request_id,
+                                routelane::ipc::IpcError::new("DENIED", "authorization denied"),
+                            ),
+                        )
+                        .await
+                        .ok();
+                        return;
+                    }
+                    DaemonRequest::GetUsage { .. } | DaemonRequest::ListEvents { .. }
+                        if hold_polls =>
+                    {
+                        std::future::pending::<()>().await;
+                        return;
+                    }
+                    DaemonRequest::GetUsage { .. } => {
+                        DaemonResult::Usage(routelane::usage::service::UsageReport {
+                            lanes: vec![],
+                        })
+                    }
+                    DaemonRequest::ListEvents { .. } => DaemonResult::Events(vec![]),
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                write_frame(
+                    &mut stream,
+                    &DaemonResponse::success(envelope.request_id, result),
+                )
+                .await
+                .ok();
+            });
+        }
+    }
+
+    async fn bridge_message(receiver: &async_channel::Receiver<DaemonToUi>) -> DaemonToUi {
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn events_and_polls_flow_while_a_mutation_is_waiting() {
+        use crate::models::UiToDaemon;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("bridge.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (events, event_rx) = tokio::sync::mpsc::channel(4);
+        let (started, start_rx) = bounded(1);
+        let server = tokio::spawn(bridge_fake(listener, event_rx, started, false));
+        let (commands, command_rx) = bounded(8);
+        let (ui, ui_rx) = bounded(8);
+        let bridge = tokio::spawn(super::run_bridge(
+            command_rx,
+            ui,
+            DaemonClient::new(path),
+            ConnectionPolicy::default(),
+        ));
+        assert!(matches!(
+            bridge_message(&ui_rx).await,
+            DaemonToUi::ConnectionEstablished { epoch: 1 }
+        ));
+        assert!(matches!(
+            bridge_message(&ui_rx).await,
+            DaemonToUi::Snapshot { epoch: 1, .. }
+        ));
+        commands
+            .send(UiToDaemon::Request(UiRequest {
+                request_id: "apply".into(),
+                request: DaemonRequest::ApplyProfile(Profile {
+                    id: "work".into(),
+                    name: "Work".into(),
+                    enabled: true,
+                    lanes: vec![],
+                    rules: vec![],
+                    routing: Default::default(),
+                }),
+            }))
+            .await
+            .unwrap();
+        start_rx.recv().await.unwrap();
+        events
+            .send(DaemonEvent::EventRecorded { sequence: 6 })
+            .await
+            .unwrap();
+        for (id, request) in [
+            ("usage", DaemonRequest::GetUsage { fast_lane: None }),
+            (
+                "events",
+                DaemonRequest::ListEvents {
+                    category: routelane::usage::events::EventCategory::All,
+                },
+            ),
+        ] {
+            commands
+                .send(UiToDaemon::Request(UiRequest {
+                    request_id: id.into(),
+                    request,
+                }))
+                .await
+                .unwrap();
+        }
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            match bridge_message(&ui_rx).await {
+                DaemonToUi::Event {
+                    epoch: 1,
+                    event: DaemonEvent::EventRecorded { sequence: 6 },
+                } => seen.push("notice".to_owned()),
+                DaemonToUi::Response { epoch: 1, response } => {
+                    assert_ne!(
+                        response.request_id, "apply",
+                        "polls and events must precede authorization completion"
+                    );
+                    assert!(response.error.is_none());
+                    seen.push(response.request_id);
+                }
+                other => panic!("unexpected bridge message: {other:?}"),
+            }
+        }
+        seen.sort();
+        assert_eq!(seen, ["events", "notice", "usage"]);
+        assert!(
+            matches!(bridge_message(&ui_rx).await, DaemonToUi::Response { epoch: 1, response } if response.request_id == "apply")
+        );
+        commands.send(UiToDaemon::Shutdown).await.unwrap();
+        bridge.await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_usage_timeout_does_not_reconnect() {
+        use crate::models::UiToDaemon;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("bridge.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (events, event_rx) = tokio::sync::mpsc::channel(4);
+        let (started, _) = bounded(1);
+        let server = tokio::spawn(bridge_fake(listener, event_rx, started, true));
+        let (commands, command_rx) = bounded(8);
+        let (ui, ui_rx) = bounded(8);
+        let policy = ConnectionPolicy {
+            request_timeout: Duration::from_millis(20),
+            initial_reconnect_delay: Duration::from_millis(1),
+            ..ConnectionPolicy::default()
+        };
+        let bridge = tokio::spawn(super::run_bridge(
+            command_rx,
+            ui,
+            DaemonClient::new(path),
+            policy,
+        ));
+        assert!(matches!(
+            bridge_message(&ui_rx).await,
+            DaemonToUi::ConnectionEstablished { epoch: 1 }
+        ));
+        assert!(matches!(
+            bridge_message(&ui_rx).await,
+            DaemonToUi::Snapshot { epoch: 1, .. }
+        ));
+        for (index, request) in [
+            DaemonRequest::GetUsage { fast_lane: None },
+            DaemonRequest::ListEvents {
+                category: routelane::usage::events::EventCategory::All,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("poll-{index}");
+            commands
+                .send(UiToDaemon::Request(UiRequest {
+                    request_id: id.clone(),
+                    request,
+                }))
+                .await
+                .unwrap();
+            assert!(
+                matches!(tokio::time::timeout(Duration::from_millis(150), ui_rx.recv()).await.unwrap().unwrap(),
+                DaemonToUi::DaemonUnavailable { epoch: 1, request_id: Some(actual), error } if actual == id && error.code == "IPC_TIMEOUT")
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            events
+                .send(DaemonEvent::EventRecorded {
+                    sequence: 6 + index as u64,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                bridge_message(&ui_rx).await,
+                DaemonToUi::Event { epoch: 1, .. }
+            ));
+            assert!(
+                ui_rx.try_recv().is_err(),
+                "poll failure must not establish another epoch"
+            );
+        }
+        commands.send(UiToDaemon::Shutdown).await.unwrap();
+        bridge.await.unwrap();
+        server.abort();
+    }
 
     #[tokio::test]
     async fn forward_response_retains_id_error_and_epoch() {

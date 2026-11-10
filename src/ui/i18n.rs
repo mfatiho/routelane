@@ -542,6 +542,7 @@ pub struct UsageTexts {
     pub event_apply_failed_no_rollback: &'static str,
     pub event_quota_warning: &'static str,
     pub event_quota_full: &'static str,
+    pub event_blocked: &'static str,
     pub event_failover: &'static str,
     pub event_failback: &'static str,
     pub event_rule_applied: &'static str,
@@ -604,6 +605,7 @@ const USAGE_TR: UsageTexts = UsageTexts {
     event_apply_failed_no_rollback: "Yönlendirme uygulanamadı, önceki ayar geri yüklenemedi",
     event_quota_warning: "{lane} kotasının %{percent}'i kullanıldı — {used} / {limit} GB",
     event_quota_full: "{lane} kotası doldu — trafik kesilmedi; operatörünüz ek ücret alabilir.",
+    event_blocked: "Kullanılabilir onaylı bağlantı yok; yönetilen trafik engellendi — {families}",
     event_failover: "{from} kesildi, {to_dative} geçildi — {families}",
     event_failback: "{lane_dative} geri dönüldü — {minutes} dk yedekte, {bytes}",
     event_rule_applied: "“{rule}” kuralı uygulandı",
@@ -669,6 +671,7 @@ const USAGE_EN: UsageTexts = UsageTexts {
     event_quota_warning: "{lane} quota is {percent}% used — {used} / {limit} GB",
     event_quota_full:
         "{lane} quota is full — traffic was not stopped; your operator may charge extra.",
+    event_blocked: "No approved connection is available; managed traffic is blocked — {families}",
     event_failover: "{from} disconnected, switched to {to} — {families}",
     event_failback: "Returned to {lane} — {minutes} min on backup, {bytes}",
     event_rule_applied: "Rule “{rule}” applied",

@@ -94,6 +94,9 @@ pub fn event_text(
         EventKind::QuotaFull { lane_id, .. } => {
             u.event_quota_full.replace("{lane}", &names.lane(lane_id))
         }
+        EventKind::Blocked { families } => u
+            .event_blocked
+            .replace("{families}", &families.join(u.event_and)),
         EventKind::Failover { from, to, families } => u
             .event_failover
             .replace(
@@ -522,6 +525,8 @@ mod tests {
     fn other_event_kinds_and_missing_names_remain_distinct() {
         let names = EventNames::default();
         let cases = [
+            (EventKind::Blocked { families: vec!["IPv4".into(), "IPv6".into()] },
+             "Kullanılabilir onaylı bağlantı yok; yönetilen trafik engellendi — IPv4 ve IPv6", "No approved connection is available; managed traffic is blocked — IPv4 and IPv6", None),
             (EventKind::ApplyFailed { code: "APPLY_FAILED".into(), message: "denied".into(), rolled_back: false },
              "Yönlendirme uygulanamadı, önceki ayar geri yüklenemedi", "Routing could not be applied, previous settings could not be restored", Some("APPLY_FAILED · denied · rollback: failed")),
             (EventKind::ProfileApplied { profile: "Work".into() }, "Profil uygulandı: Work", "Profile applied: Work", None),

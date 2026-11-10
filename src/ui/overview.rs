@@ -303,6 +303,11 @@ impl Overview {
         while let Some(child) = self.usage.first_child() {
             self.usage.remove(&child);
         }
+        if let Some(error) = session.usage_error() {
+            let label = gtk::Label::new(Some(self.texts.ux.request_failed));
+            label.set_tooltip_text(Some(&error.to_string()));
+            self.usage.append(&label);
+        }
         let Some(report) = session.usage() else {
             self.usage
                 .append(&gtk::Label::new(Some(self.texts.ux.checking)));

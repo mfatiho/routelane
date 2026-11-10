@@ -257,3 +257,73 @@ fn event_file_holds_no_connection_addresses() {
         }
     }
 }
+
+#[test]
+fn recorded_messages_never_contain_addresses() {
+    use routelane::usage::{counters::SysfsCounters, store::UsageStore, UsageService};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events-v1.jsonl");
+    let service = UsageService::new(
+        UsageStore::open(dir.path().join("usage-v1.json"), "boot").0,
+        dir.path().join("settings.json"),
+        EventStore::open(&path).0,
+        Arc::new(SysfsCounters {
+            root: dir.path().join("sysfs"),
+        }),
+        Arc::new(|| now() / 1000),
+    );
+    service
+        .record(EventKind::ApplyFailed {
+            code: "FAILED".into(),
+            message: "resolve 198.51.100.9:443 via 10.0.0.1/24".into(),
+            rolled_back: true,
+        })
+        .unwrap();
+    service
+        .record(EventKind::RuntimeAttention {
+            phase: "Degraded".into(),
+            message: Some("gateway 2001:db8::1 and fe80::1%eth0".into()),
+        })
+        .unwrap();
+    let bytes = std::fs::read_to_string(&path).unwrap();
+    for address in ["198.51.100.9", "10.0.0.1", "2001:db8::1", "fe80::1"] {
+        assert!(!bytes.contains(address), "persisted address: {address}");
+    }
+    let records = EventStore::open(&path)
+        .0
+        .list(EventCategory::Problems, now());
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().any(|event| matches!(&event.kind,
+        EventKind::ApplyFailed { message, .. } if message == "resolve [adres] via [adres]")));
+    assert!(records.iter().any(|event| matches!(&event.kind,
+        EventKind::RuntimeAttention { message: Some(message), .. } if message == "gateway [adres] and [adres]%eth0")));
+}
+
+#[test]
+fn blocked_events_are_problems_and_old_journals_still_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events-v1.jsonl");
+    let at = now();
+    std::fs::write(
+        &path,
+        format!("{{\"at_unix_ms\":{at},\"kind\":{{\"kind\":\"ProfileDeactivated\"}}}}\n"),
+    )
+    .unwrap();
+    let (mut store, note) = EventStore::open(&path);
+    assert!(note.is_none());
+    let blocked = EventKind::Blocked {
+        families: vec!["IPv4".into(), "IPv6".into()],
+    };
+    assert_eq!(blocked.category(), EventCategory::Problems);
+    store
+        .append(UsageEvent {
+            at_unix_ms: at + 1,
+            kind: blocked.clone(),
+        })
+        .unwrap();
+    let (store, note) = EventStore::open(&path);
+    assert!(note.is_none());
+    assert_eq!(store.list(EventCategory::All, at).len(), 2);
+    assert_eq!(store.list(EventCategory::Problems, at)[0].kind, blocked);
+}

@@ -384,7 +384,9 @@ impl UiController {
                 *self.completed_id.borrow_mut() = Some(response.request_id.clone());
             }
         }
-        let disconnect = matches!(message, DaemonToUi::DaemonUnavailable { .. });
+        let disconnect = matches!(&message, DaemonToUi::DaemonUnavailable { epoch, request_id, .. }
+            if *epoch == self.session().connection_epoch()
+                && request_id.as_ref().is_none_or(|id| self.session().accepts_reply(*epoch, id)));
         let preview_reply = match &message {
             DaemonToUi::Response { epoch, response } => self
                 .preview_ready

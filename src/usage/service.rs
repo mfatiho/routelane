@@ -9,7 +9,7 @@ use tokio::sync::Notify;
 
 use super::calendar::{days_in_month, local_date, next_reset, period_start, LocalDate};
 use super::counters::InterfaceCounters;
-use super::events::{EventCategory, EventKind, EventStore, UsageEvent};
+use super::events::{redact_addresses, EventCategory, EventKind, EventStore, UsageEvent};
 use super::quota::{LaneQuota, QuotaSettings};
 use super::store::{QuotaCrossing, UsageStore};
 use super::UsageTotals;
@@ -282,7 +282,17 @@ impl UsageService {
             .collect())
     }
 
-    pub fn record(&self, kind: EventKind) -> Result<(), DaemonError> {
+    pub fn record(&self, mut kind: EventKind) -> Result<(), DaemonError> {
+        match &mut kind {
+            EventKind::ApplyFailed { message, .. }
+            | EventKind::RuntimeAttention {
+                message: Some(message),
+                ..
+            } => {
+                *message = redact_addresses(message);
+            }
+            _ => {}
+        }
         let now = (self.clock)().saturating_mul(1000);
         self.state
             .lock()
@@ -435,6 +445,18 @@ pub fn runtime_events(
                 "IPv6",
             ),
         ] {
+            if matches!(old, FamilyExit::Lane(_)) && matches!(new, FamilyExit::Blocked) {
+                if let Some(EventKind::Blocked { families }) = events
+                    .iter_mut()
+                    .find(|event| matches!(event, EventKind::Blocked { .. }))
+                {
+                    families.push(family.into());
+                } else {
+                    events.push(EventKind::Blocked {
+                        families: vec![family.into()],
+                    });
+                }
+            }
             let FamilyExit::Lane(to) = new else { continue };
             if old == new {
                 continue;
@@ -513,6 +535,38 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn losing_every_approved_exit_is_recorded_once() {
+        let primary = status("ethernet");
+        let mut blocked = primary.clone();
+        blocked.decision.as_mut().unwrap().effective = FamilyPair {
+            v4: FamilyExit::Blocked,
+            v6: FamilyExit::Blocked,
+        };
+        assert_eq!(
+            runtime_events(&primary, &blocked, None, 100, None),
+            vec![EventKind::Blocked {
+                families: vec!["IPv4".into(), "IPv6".into()]
+            }]
+        );
+        assert!(runtime_events(&blocked, &blocked, None, 100, None).is_empty());
+        let mut split = primary.clone();
+        split.decision.as_mut().unwrap().effective.v6 = FamilyExit::Blocked;
+        assert_eq!(
+            runtime_events(&primary, &split, None, 100, None),
+            vec![EventKind::Blocked {
+                families: vec!["IPv6".into()]
+            }]
+        );
+        assert_eq!(
+            runtime_events(&split, &blocked, None, 100, None),
+            vec![EventKind::Blocked {
+                families: vec!["IPv4".into()]
+            }]
+        );
+        assert!(runtime_events(&RuntimeStatus::default(), &blocked, None, 100, None).is_empty());
+    }
+
     #[test]
     fn runtime_transitions_produce_one_event_each() {
         let primary = status("ethernet");

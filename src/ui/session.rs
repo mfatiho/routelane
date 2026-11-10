@@ -98,6 +98,7 @@ pub struct UiSession {
     result: Option<DaemonResult>,
     preview: Option<BoundPreview>,
     usage: Option<UsageReport>,
+    usage_error: Option<IpcError>,
     events: Vec<UsageEvent>,
     usage_requests: BTreeMap<String, DaemonRequest>,
 }
@@ -130,6 +131,7 @@ impl UiSession {
             result: None,
             preview: None,
             usage: None,
+            usage_error: None,
             events: vec![],
             usage_requests: BTreeMap::new(),
         }
@@ -186,6 +188,10 @@ impl UiSession {
         )?;
         self.preview = None;
         Ok(effects)
+    }
+
+    pub fn usage_error(&self) -> Option<&IpcError> {
+        self.usage_error.as_ref()
     }
 
     pub fn usage(&self) -> Option<&UsageReport> {
@@ -604,6 +610,22 @@ impl UiSession {
                 request_id,
                 error,
             } if epoch == self.epoch => {
+                if let Some(request) = request_id
+                    .as_ref()
+                    .and_then(|id| self.usage_requests.remove(id))
+                {
+                    self.usage_error = Some(error.clone());
+                    if matches!(
+                        request,
+                        DaemonRequest::SetQuota { .. } | DaemonRequest::CorrectUsage { .. }
+                    ) {
+                        return vec![UiEffect::QuotaFinished {
+                            request_id: request_id.unwrap(),
+                            result: Err(error),
+                        }];
+                    }
+                    return vec![];
+                }
                 if request_id.as_ref().is_some_and(|id| {
                     self.pending
                         .as_ref()
@@ -674,12 +696,17 @@ impl UiSession {
                 }];
             }
             if response.protocol_version != IPC_PROTOCOL_VERSION {
+                self.usage_error = Some(IpcError::new(
+                    "IPC_INVALID_RESPONSE",
+                    "unsupported response version",
+                ));
                 return vec![];
             }
             if let Some(error) = response.error {
-                self.error = Some(error);
+                self.usage_error = Some(error);
                 return vec![];
             }
+            self.usage_error = None;
             match (request, response.result) {
                 (DaemonRequest::GetUsage { .. }, Some(DaemonResult::Usage(report))) => {
                     self.usage = Some(report)
@@ -691,7 +718,7 @@ impl UiSession {
                     self.events.clear()
                 }
                 _ => {
-                    self.error = Some(IpcError::new(
+                    self.usage_error = Some(IpcError::new(
                         "IPC_INVALID_RESPONSE",
                         "unexpected usage reply",
                     ))
@@ -887,6 +914,91 @@ mod tests {
         match effects.into_iter().next().unwrap() {
             UiEffect::Send(request) => request,
             other => panic!("expected send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_failures_never_replace_routing_errors_or_block_polling() {
+        use routelane::usage::events::EventCategory;
+        let mut s = session(true, false);
+        s.error = Some(IpcError::new("DAEMON_ORPHANED_RESOURCES", "recover"));
+        for request in [
+            DaemonRequest::GetUsage { fast_lane: None },
+            DaemonRequest::ListEvents {
+                category: EventCategory::All,
+            },
+        ] {
+            let poll = sent(s.begin_request(request.clone(), None).unwrap());
+            s.handle_daemon(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::failure(
+                    poll.request_id,
+                    IpcError::new("DAEMON_USAGE_UNAVAILABLE", "unavailable"),
+                ),
+            });
+            assert_eq!(s.last_error().unwrap().code, "DAEMON_ORPHANED_RESOURCES");
+            assert_eq!(s.usage_error().unwrap().code, "DAEMON_USAGE_UNAVAILABLE");
+        }
+        assert!(s
+            .begin_request(DaemonRequest::RecoverOrphanedResources, None)
+            .is_ok());
+
+        let mut s = session(true, false);
+        previewed(&mut s, &profile());
+        let before = s.save_state();
+        let poll = sent(
+            s.begin_request(DaemonRequest::GetUsage { fast_lane: None }, None)
+                .unwrap(),
+        );
+        assert!(s
+            .handle_daemon(DaemonToUi::DaemonUnavailable {
+                epoch: 1,
+                request_id: Some(poll.request_id),
+                error: IpcError::new("IPC_TIMEOUT", "timeout")
+            })
+            .is_empty());
+        assert!(s.preview_for(&profile()).is_some());
+        assert_eq!(s.save_state(), before);
+        s.begin_request(DaemonRequest::ApplyProfile(profile()), Some(profile()))
+            .unwrap();
+        let applying = s.operation();
+        let before = s.save_state();
+        for request in [
+            DaemonRequest::GetUsage { fast_lane: None },
+            DaemonRequest::ListEvents {
+                category: EventCategory::All,
+            },
+        ] {
+            let poll = sent(s.begin_request(request.clone(), None).unwrap());
+            assert!(s
+                .handle_daemon(DaemonToUi::DaemonUnavailable {
+                    epoch: 1,
+                    request_id: Some(poll.request_id),
+                    error: IpcError::new("IPC_TIMEOUT", "timeout")
+                })
+                .is_empty());
+            assert_eq!(s.operation(), applying);
+            assert!(s.snapshot_known());
+            assert_eq!(s.save_state(), before);
+            assert!(s.last_error().is_none());
+            assert_eq!(s.usage_error().unwrap().code, "IPC_TIMEOUT");
+            let retry = sent(s.begin_request(request, None).unwrap());
+            let result = match retry.request {
+                DaemonRequest::GetUsage { .. } => {
+                    DaemonResult::Usage(UsageReport { lanes: vec![] })
+                }
+                _ => DaemonResult::Events(vec![]),
+            };
+            s.handle_daemon(DaemonToUi::Response {
+                epoch: 0,
+                response: DaemonResponse::success(&retry.request_id, result.clone()),
+            });
+            assert!(s.usage_error().is_some(), "old epochs are ignored");
+            s.handle_daemon(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(retry.request_id, result),
+            });
+            assert!(s.usage_error().is_none());
         }
     }
 
