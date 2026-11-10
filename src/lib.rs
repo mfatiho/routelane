@@ -7,3 +7,4 @@ pub mod doctor;
 pub mod domain;
 pub mod health;
 pub mod ipc;
+pub mod usage;

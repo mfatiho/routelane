@@ -513,7 +513,7 @@ impl Drop for TemporaryPath {
     }
 }
 
-fn write_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -563,7 +563,7 @@ fn open_existing_file_nonblocking(path: &Path) -> anyhow::Result<File> {
         .with_context(|| format!("could not safely open {}", path.display()))
 }
 
-fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
