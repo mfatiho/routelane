@@ -33,12 +33,12 @@ use super::namespace_routing::{
 const ECHO_PORT: u16 = 7000;
 const SERVER_ENV: &str = "ROUTELANE_TEST_ECHO_BIND";
 const SEND_ENV: &str = "ROUTELANE_TEST_UDP_SEND";
-const SCENARIO_ENV: &str = "ROUTELANE_TEST_SCENARIO";
+pub(super) const SCENARIO_ENV: &str = "ROUTELANE_TEST_SCENARIO";
 const LEGACY_ENV: &str = "ROUTELANE_TEST_LEGACY_BASELINE";
 /// Reachable through sink A only: the primary (non-OS-default) uplink.
-const PRIMARY_TARGET: &str = "203.0.113.10";
+pub(super) const PRIMARY_TARGET: &str = "203.0.113.10";
 /// Reachable through sink C only: the explicit rule ("VINN") uplink.
-const RULE_TARGET: &str = "192.0.2.10";
+pub(super) const RULE_TARGET: &str = "192.0.2.10";
 /// Reachable through both sink A and sink C: primary and backup.
 const SHARED_TARGET: &str = "198.51.100.77";
 const V6_TARGET: &str = "2001:db8:ffff::10";
@@ -46,7 +46,7 @@ const V6_TARGET: &str = "2001:db8:ffff::10";
 const V6_A_TARGET: &str = "2001:db8:fffa::10";
 const LANE_IDS: [&str; 3] = ["lane-a", "lane-b", "lane-c"];
 const LANE_GATEWAYS: [&str; 3] = ["10.10.1.1", "10.10.2.1", "10.10.3.1"];
-const LANE_SOURCES: [&str; 3] = ["10.10.1.2", "10.10.2.2", "10.10.3.2"];
+pub(super) const LANE_SOURCES: [&str; 3] = ["10.10.1.2", "10.10.2.2", "10.10.3.2"];
 
 #[test]
 fn primary_and_rule_paths_have_correct_source_and_return() {
@@ -174,6 +174,16 @@ fn loss_signals_fail_closed_without_escape() {
 }
 
 fn run_scenario(scenario: &str, setup: impl FnOnce(&RunNames) -> Vec<EchoServer>) {
+    run_worker_scenario("primary_failover::client_worker", scenario, setup);
+}
+
+/// Provisions the topology and endpoints, then runs `worker` (a test path in
+/// this binary) inside the client namespace with `scenario` selected.
+pub(super) fn run_worker_scenario(
+    worker: &str,
+    scenario: &str,
+    setup: impl FnOnce(&RunNames) -> Vec<EchoServer>,
+) {
     let names = require_root_capabilities();
     let _topology = NamespaceHarness::create(names.clone());
     let _servers = setup(&names);
@@ -181,12 +191,7 @@ fn run_scenario(scenario: &str, setup: impl FnOnce(&RunNames) -> Vec<EchoServer>
         Command::new("/usr/sbin/ip")
             .args(["netns", "exec", &names.client])
             .arg(env::current_exe().expect("resolve root integration test binary"))
-            .args([
-                "--exact",
-                "primary_failover::client_worker",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["--exact", worker, "--nocapture", "--test-threads=1"])
             .env(WORKER_ENV, "1")
             .env(SCENARIO_ENV, scenario),
     );
@@ -821,7 +826,7 @@ fn assert_fails_closed(target: &str, escaped: &impl Fn() -> [u64; 2]) {
 
 /// A plan as the runtime would compile it: lane A is the preferred primary,
 /// `effective` is the decided IPv4 exit and IPv6 has no approved lane.
-fn scenario_plan(
+pub(super) fn scenario_plan(
     generation: u64,
     names: &RunNames,
     effective: usize,
@@ -864,7 +869,7 @@ fn scenario_plan(
     }
 }
 
-fn vinn_rule() -> routelane::backend::CompiledRule {
+pub(super) fn vinn_rule() -> routelane::backend::CompiledRule {
     rule(
         "vinn-site",
         10,
@@ -873,7 +878,7 @@ fn vinn_rule() -> routelane::backend::CompiledRule {
     )
 }
 
-fn assert_echo(reply: &str, lane: usize, payload: &str) {
+pub(super) fn assert_echo(reply: &str, lane: usize, payload: &str) {
     let (observed_source, reply_payload) = reply
         .strip_prefix("peer=")
         .and_then(|rest| rest.split_once(' '))
@@ -885,7 +890,7 @@ fn assert_echo(reply: &str, lane: usize, payload: &str) {
     assert_eq!(reply_payload, payload, "reply reached the original socket");
 }
 
-fn tcp_connect(target: &str) -> std::io::Result<TcpStream> {
+pub(super) fn tcp_connect(target: &str) -> std::io::Result<TcpStream> {
     let address: SocketAddr = if target.contains(':') {
         format!("[{target}]:{ECHO_PORT}")
     } else {
@@ -899,7 +904,7 @@ fn tcp_connect(target: &str) -> std::io::Result<TcpStream> {
     Ok(stream)
 }
 
-fn tcp_exchange(stream: &mut TcpStream, payload: &str) -> String {
+pub(super) fn tcp_exchange(stream: &mut TcpStream, payload: &str) -> String {
     writeln!(stream, "{payload}").expect("send over TCP");
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut line = String::new();
@@ -907,7 +912,7 @@ fn tcp_exchange(stream: &mut TcpStream, payload: &str) -> String {
     line.trim_end().to_owned()
 }
 
-fn udp_exchange(target: &str, payload: &str) -> Option<String> {
+pub(super) fn udp_exchange(target: &str, payload: &str) -> Option<String> {
     udp_exchange_port(target, ECHO_PORT, payload)
 }
 
@@ -1016,7 +1021,7 @@ fn udp_send_worker() {
 }
 
 /// Resources RouteLane does not own, inside the run-owned client namespace.
-fn install_foreign_sentinels() -> Value {
+pub(super) fn install_foreign_sentinels() -> Value {
     let mut nft = Command::new("/usr/sbin/nft")
         .args(["-f", "-"])
         .stdin(Stdio::piped())
@@ -1047,7 +1052,7 @@ fn install_foreign_sentinels() -> Value {
     foreign_sentinels()
 }
 
-fn foreign_sentinels() -> Value {
+pub(super) fn foreign_sentinels() -> Value {
     let read = |args: &[&str]| -> Value {
         let output = checked_output(Command::new(args[0]).args(&args[1..]), "read sentinel");
         serde_json::from_slice(&output.stdout).unwrap()
@@ -1333,10 +1338,10 @@ fn gateway_counter(names: &RunNames, lane: usize, comment: &str) -> u64 {
 /// TCP and UDP echo endpoint inside a run-owned namespace. Bind the exact
 /// service address: an unconnected UDP reply from a wildcard socket would use
 /// the outgoing interface address and never match the client's flow.
-struct EchoServer(Child);
+pub(super) struct EchoServer(Child);
 
 impl EchoServer {
-    fn spawn(namespace: &str, binds: &[&str]) -> Self {
+    pub(super) fn spawn(namespace: &str, binds: &[&str]) -> Self {
         let mut child = Command::new("/usr/sbin/ip")
             .args(["netns", "exec", namespace])
             .arg(env::current_exe().unwrap())
@@ -1428,7 +1433,7 @@ fn serve_udp(socket: UdpSocket) {
 }
 
 /// The real helper, or the schema-1 mark-only semantics for baseline RED.
-enum Routing {
+pub(super) enum Routing {
     Helper {
         helper: HelperProcess,
         _state: tempfile::TempDir,
@@ -1439,7 +1444,15 @@ enum Routing {
 }
 
 impl Routing {
-    fn start(names: &RunNames) -> Self {
+    /// The real helper process and its journal directory.
+    pub(super) fn helper(&mut self) -> (&mut HelperProcess, &std::path::Path) {
+        match self {
+            Self::Helper { helper, _state } => (helper, _state.path()),
+            Self::Legacy { .. } => panic!("the schema-1 baseline has no helper"),
+        }
+    }
+
+    pub(super) fn start(names: &RunNames) -> Self {
         if env::var_os(LEGACY_ENV).is_some() {
             return Self::Legacy { active: None };
         }
@@ -1458,7 +1471,7 @@ impl Routing {
         }
     }
 
-    fn apply(&mut self, plan: &KernelPlan) {
+    pub(super) fn apply(&mut self, plan: &KernelPlan) {
         match self {
             Self::Helper { helper, .. } => {
                 let applied = helper.ok(json!({
@@ -1477,7 +1490,7 @@ impl Routing {
         }
     }
 
-    fn cleanup(&mut self) {
+    pub(super) fn cleanup(&mut self) {
         match self {
             Self::Helper { helper, .. } => {
                 assert_eq!(helper.ok(json!({"method": "cleanup"}))["cleaned"], true);

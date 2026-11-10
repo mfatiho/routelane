@@ -511,6 +511,9 @@ enum RootIntegrationRequest {
     RecoverOrphanedResources,
     SetFailPoint {
         value: Option<String>,
+        /// Test-only: the activate_nft fail point waits while this file exists.
+        #[serde(default)]
+        pause_file: Option<String>,
     },
     /// Test-only: runtime activation with an explicit caller and clock.
     ActivateRuntime {
@@ -593,7 +596,7 @@ async fn run_root_integration_stdio() -> Result<(), Box<dyn std::error::Error>> 
                 .await
                 .map(|response| serde_json::json!({"ok": response}))
                 .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-            Ok(RootIntegrationRequest::SetFailPoint { value }) => {
+            Ok(RootIntegrationRequest::SetFailPoint { value, pause_file }) => {
                 if value
                     .as_deref()
                     .is_some_and(|value| value != "activate_nft")
@@ -603,6 +606,10 @@ async fn run_root_integration_stdio() -> Result<(), Box<dyn std::error::Error>> 
                     match value.as_deref() {
                         Some(value) => std::env::set_var("ROUTELANE_TEST_FAIL_POINT", value),
                         None => std::env::remove_var("ROUTELANE_TEST_FAIL_POINT"),
+                    }
+                    match pause_file.as_deref() {
+                        Some(path) => std::env::set_var("ROUTELANE_TEST_FAIL_PAUSE", path),
+                        None => std::env::remove_var("ROUTELANE_TEST_FAIL_PAUSE"),
                     }
                     serde_json::json!({"ok": {"fail_point": value}})
                 }
@@ -648,5 +655,6 @@ async fn run_root_integration_stdio() -> Result<(), Box<dyn std::error::Error>> 
         stdout.flush()?;
     }
     std::env::remove_var("ROUTELANE_TEST_FAIL_POINT");
+    std::env::remove_var("ROUTELANE_TEST_FAIL_PAUSE");
     Ok(())
 }

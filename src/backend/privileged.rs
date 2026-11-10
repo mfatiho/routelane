@@ -3039,6 +3039,17 @@ where
                     "root integration fail point reached before candidate routes and rules were prepared",
                 ));
             }
+            // Test-only: hold the guarded transition open until the test
+            // removes the pause file, so traffic can be observed mid-flight.
+            if let Some(pause) = std::env::var_os("ROUTELANE_TEST_FAIL_PAUSE") {
+                let pause = std::path::PathBuf::from(pause);
+                std::fs::write(&pause, b"paused")
+                    .map_err(|error| RunnerError::new(format!("write pause file: {error}")))?;
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while pause.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
             return Err(RunnerError::new(
                 "root integration fail point before activate_nft",
             ));

@@ -26,6 +26,11 @@ pub(super) struct RunNames {
     pub(super) gateway_client_interfaces: [String; 3],
     pub(super) gateway_sink_interfaces: [String; 3],
     pub(super) sink_interfaces: [String; 3],
+    /// A directly connected lab bridge network that is never a lane:
+    /// client 10.65.201.1/24 + fd00:65::1/64, lab host .60 / ::60.
+    pub(super) lab: String,
+    pub(super) client_lab_interface: String,
+    pub(super) lab_interface: String,
 }
 
 impl RunNames {
@@ -62,6 +67,9 @@ impl RunNames {
         let gateway_client_interfaces = [interface("gac"), interface("gbc"), interface("gcc")];
         let gateway_sink_interfaces = [interface("gas"), interface("gbs"), interface("gcs")];
         let sink_interfaces = [interface("sa"), interface("sb"), interface("sc")];
+        let lab = namespace("lab");
+        let client_lab_interface = interface("cl");
+        let lab_interface = interface("ll");
         Ok(Self {
             token,
             client,
@@ -71,6 +79,9 @@ impl RunNames {
             gateway_client_interfaces,
             gateway_sink_interfaces,
             sink_interfaces,
+            lab,
+            client_lab_interface,
+            lab_interface,
         })
     }
 
@@ -78,6 +89,7 @@ impl RunNames {
         std::iter::once(self.client.clone())
             .chain(self.gateways.iter().cloned())
             .chain(self.sinks.iter().cloned())
+            .chain(std::iter::once(self.lab.clone()))
             .collect()
     }
 
@@ -97,6 +109,10 @@ impl RunNames {
                 self.sink_interfaces[lane].clone(),
             ));
         }
+        creations.push(Creation::VethPair(
+            self.client_lab_interface.clone(),
+            self.lab_interface.clone(),
+        ));
         creations
     }
 }
@@ -576,6 +592,7 @@ impl NamespaceHarness {
         for lane in 0..3 {
             create_lane(lane, &harness.names);
         }
+        create_lab(&harness.names);
         run_ip([
             "-n",
             &harness.names.client,
@@ -732,6 +749,40 @@ fn create_lane(lane: usize, names: &RunNames) {
             gateway_sink_if,
         ]);
     }
+}
+
+/// The lab bridge: connected to the client only, with a default route back
+/// through it so the lab host can also act as a forwarded VM/container.
+fn create_lab(names: &RunNames) {
+    run_ip([
+        "link",
+        "set",
+        &names.client_lab_interface,
+        "netns",
+        &names.client,
+    ]);
+    run_ip(["link", "set", &names.lab_interface, "netns", &names.lab]);
+    configure_interface(&names.client, &names.client_lab_interface, "10.65.201.1/24");
+    configure_interface(&names.lab, &names.lab_interface, "10.65.201.60/24");
+    for (namespace, interface, address) in [
+        (&names.client, &names.client_lab_interface, "fd00:65::1/64"),
+        (&names.lab, &names.lab_interface, "fd00:65::60/64"),
+    ] {
+        run_ip([
+            "-n", namespace, "addr", "add", address, "dev", interface, "nodad",
+        ]);
+    }
+    run_ip([
+        "-n",
+        &names.lab,
+        "route",
+        "add",
+        "default",
+        "via",
+        "10.65.201.1",
+        "dev",
+        &names.lab_interface,
+    ]);
 }
 
 fn configure_interface(namespace: &str, interface: &str, address: &str) {
@@ -1046,7 +1097,15 @@ pub(super) struct HelperProcess {
 
 impl HelperProcess {
     pub(super) fn spawn(state_directory: &std::path::Path) -> Self {
-        let mut child = Command::new(HELPER)
+        Self::spawn_binary(std::path::Path::new(HELPER), state_directory)
+    }
+
+    /// Another feature-gated helper build (e.g. a released version).
+    pub(super) fn spawn_binary(
+        binary: &std::path::Path,
+        state_directory: &std::path::Path,
+    ) -> Self {
+        let mut child = Command::new(binary)
             .arg("--root-integration-stdio")
             .env("ROUTELANE_TEST_STATE_DIRECTORY", state_directory)
             .stdin(Stdio::piped())
@@ -1063,7 +1122,7 @@ impl HelperProcess {
         }
     }
 
-    fn request(&mut self, request: Value) -> Value {
+    pub(super) fn request(&mut self, request: Value) -> Value {
         serde_json::to_writer(&mut self.stdin, &request).unwrap();
         self.stdin.write_all(b"\n").unwrap();
         self.stdin.flush().unwrap();
@@ -1082,7 +1141,7 @@ impl HelperProcess {
         response["ok"].clone()
     }
 
-    fn error(&mut self, request: Value) -> String {
+    pub(super) fn error(&mut self, request: Value) -> String {
         let response = self.request(request);
         response["error"]
             .as_str()
