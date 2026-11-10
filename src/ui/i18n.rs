@@ -497,8 +497,6 @@ impl LanguageTexts for Language {
     }
 }
 
-// Task 8 consumes the event and toast texts together with the usage controls.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct UsageTexts {
     pub today_down_up: &'static str,
@@ -525,6 +523,8 @@ pub struct UsageTexts {
     pub wifi_note: &'static str,
     pub quota_invalid: &'static str,
     pub used_summary: &'static str,
+    pub overview_lane_totals: &'static str,
+    pub event_error_detail: &'static str,
     pub usage_overview: &'static str,
     pub recent_events: &'static str,
     pub show_all: &'static str,
@@ -551,6 +551,9 @@ pub struct UsageTexts {
     pub detail: &'static str,
     pub event_today: &'static str,
     pub event_profile: &'static str,
+    pub event_and: &'static str,
+    pub event_unknown: &'static str,
+    pub quota_toast_warning_no_reset: &'static str,
     pub quota_toast_warning: &'static str,
     pub months: [&'static str; 12],
     pub reset_months: [&'static str; 12],
@@ -581,6 +584,8 @@ const USAGE_TR: UsageTexts = UsageTexts {
     wifi_note: "aynı kartla bağlandığınız diğer ağlar da sayılır",
     quota_invalid: "Kota en az 0,1 GB, yenilenme günü 1–31, uyarı eşiği 1–99 olmalıdır.",
     used_summary: "{used} GB / {limit} GB kullanıldı · yaklaşık",
+    overview_lane_totals: "{lane} · ↓ {down} GB ↑ {up} GB · yaklaşık",
+    event_error_detail: "{code} · {message} · rollback: {rollback}",
     usage_overview: "Veri kullanımı (bu dönem)",
     recent_events: "Son olaylar",
     show_all: "Tümünü göster ›",
@@ -597,8 +602,8 @@ const USAGE_TR: UsageTexts = UsageTexts {
     event_apply_failed_no_rollback: "Yönlendirme uygulanamadı, önceki ayar geri yüklenemedi",
     event_quota_warning: "{lane} kotasının %{percent}'i kullanıldı — {used} / {limit} GB",
     event_quota_full: "{lane} kotası doldu — trafik kesilmedi; operatörünüz ek ücret alabilir.",
-    event_failover: "{from} kesildi, {to}'e geçildi — {families}",
-    event_failback: "{lane}'e geri dönüldü — {minutes} dk yedekte, {bytes}",
+    event_failover: "{from} kesildi, {to_dative} geçildi — {families}",
+    event_failback: "{lane_dative} geri dönüldü — {minutes} dk yedekte, {bytes}",
     event_rule_applied: "“{rule}” kuralı uygulandı",
     event_profile_applied: "Profil uygulandı: {profile}",
     event_deactivated: "Yönlendirme kapatıldı",
@@ -607,6 +612,9 @@ const USAGE_TR: UsageTexts = UsageTexts {
     detail: "Ayrıntı",
     event_today: "Bugün",
     event_profile: "Profil",
+    event_and: " ve ",
+    event_unknown: "Bilinmiyor",
+    quota_toast_warning_no_reset: "{lane} kotasının %{percent}'i doldu — {used} / {limit} GB · {left} GB kaldı",
     quota_toast_warning: "{lane} kotasının %{percent}'i doldu — {used} / {limit} GB · {left} GB kaldı · {date} yenilenir",
     months: ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"],
     reset_months: ["Ocak'ta", "Şubat'ta", "Mart'ta", "Nisan'da", "Mayıs'ta", "Haziran'da", "Temmuz'da", "Ağustos'ta", "Eylül'de", "Ekim'de", "Kasım'da", "Aralık'ta"],
@@ -638,6 +646,8 @@ const USAGE_EN: UsageTexts = UsageTexts {
     wifi_note: "other networks you connect to with the same adapter are also counted",
     quota_invalid: "Quota must be at least 0.1 GB, reset day 1–31, and warning threshold 1–99.",
     used_summary: "{used} GB / {limit} GB used · approximate",
+    overview_lane_totals: "{lane} · ↓ {down} GB ↑ {up} GB · approximate",
+    event_error_detail: "{code} · {message} · rollback: {rollback}",
     usage_overview: "Data usage (this period)",
     recent_events: "Recent events",
     show_all: "Show all ›",
@@ -666,6 +676,9 @@ const USAGE_EN: UsageTexts = UsageTexts {
     detail: "Details",
     event_today: "Today",
     event_profile: "Profile",
+    event_and: " and ",
+    event_unknown: "Unknown",
+    quota_toast_warning_no_reset: "{lane} quota is {percent}% used — {used} / {limit} GB · {left} GB left",
     quota_toast_warning:
         "{lane} quota is {percent}% used — {used} / {limit} GB · {left} GB left · renews on {date}",
     months: [

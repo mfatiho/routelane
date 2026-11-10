@@ -21,6 +21,7 @@ use crate::ui::confirm::{confirm_destructive_action, confirm_destructive_action_
 use crate::ui::connections::ConnectionsPage;
 use crate::ui::controller::UiController;
 use crate::ui::desktop_catalog::{application_display_name, load_catalog, DesktopCatalog};
+use crate::ui::events_page::{EventNames, EventsPage};
 use crate::ui::experience::{dashboard_state, PrimaryAction};
 use crate::ui::form::MenuAction;
 use crate::ui::i18n::{LanguageTexts, Texts};
@@ -116,6 +117,9 @@ struct WindowUi {
     controller: Rc<UiController>,
     shell: Shell,
     overview: Overview,
+    events_page: EventsPage,
+    overview_stack: gtk::Stack,
+    overview_loaded: Cell<bool>,
     rules: ListPage,
     applications: ListPage,
     connections: ConnectionsPage,
@@ -776,6 +780,10 @@ impl WindowUi {
         );
         self.quick_application.set_sensitive(editable);
         self.overview.update(&profile, &session);
+        if self.events_page.all.is_active() {
+            self.overview.update_events(&profile, session.events());
+        }
+        self.events_page.update(&profile, session.events());
         self.connections.update(editable);
         let status = session.confirmed_status().cloned();
         drop(session);
@@ -842,7 +850,23 @@ impl WindowUi {
 
     fn receive(self: &Rc<Self>, message: DaemonToUi) {
         let snapshot = matches!(message, DaemonToUi::Snapshot { .. });
+        let event_category = match &message {
+            DaemonToUi::Response { epoch, response }
+                if *epoch == self.controller.session().connection_epoch()
+                    && matches!(response.result, Some(DaemonResult::Events(_))) =>
+            {
+                self.controller
+                    .session()
+                    .pending_event_category(&response.request_id)
+            }
+            _ => None,
+        };
         self.controller.receive(message);
+        if event_category.is_some_and(|category| category != self.events_page.category()) {
+            // A coalesced newer read may already have finished before this older
+            // filter reply. Reissue the selected filter to restore its results.
+            self.controller.refresh_events(self.events_page.category());
+        }
         if snapshot && self.controller.session().snapshot_known() {
             let session = self.controller.session();
             let canonical = session.daemon_profiles().to_vec();
@@ -856,6 +880,13 @@ impl WindowUi {
             );
         }
         self.render();
+        if snapshot
+            && self.controller.session().snapshot_known()
+            && !self.overview_loaded.replace(true)
+        {
+            self.controller.refresh_usage(None);
+            self.controller.refresh_events(self.events_page.category());
+        }
     }
 
     fn open_settings(self: &Rc<Self>) {
@@ -960,7 +991,14 @@ fn build_window_with_repository(
         }),
         controller.clone(),
     );
-    shell.add_page(Section::Overview, &overview.root);
+    let events_page = EventsPage::new(&window, texts, controller.clone());
+    let overview_stack = gtk::Stack::builder()
+        .vhomogeneous(false)
+        .hhomogeneous(false)
+        .build();
+    overview_stack.add_named(&overview.root, Some("summary"));
+    overview_stack.add_named(&events_page.root, Some("events"));
+    shell.add_page(Section::Overview, &overview_stack);
     shell.add_page(Section::Rules, &rules.root);
     shell.add_page(Section::Applications, &applications.root);
     shell.add_page(Section::Connections, &connections.list.root);
@@ -982,6 +1020,9 @@ fn build_window_with_repository(
         controller: controller.clone(),
         shell,
         overview,
+        events_page,
+        overview_stack,
+        overview_loaded: Cell::new(false),
         rules,
         applications,
         connections,
@@ -1077,7 +1118,118 @@ fn build_window_with_repository(
     ui.overview.refresh.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
             ui.controller.refresh();
+            ui.controller.refresh_usage(None);
+            ui.controller
+                .refresh_events(routelane::usage::events::EventCategory::All);
         }
+    });
+    let weak = Rc::downgrade(&ui);
+    ui.overview.events_open.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.overview_stack.set_visible_child_name("events");
+            ui.events_page.all.set_active(true);
+            ui.controller
+                .refresh_events(routelane::usage::events::EventCategory::All);
+        }
+    });
+    let weak = Rc::downgrade(&ui);
+    ui.events_page.back.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.overview_stack.set_visible_child_name("summary");
+            ui.events_page.all.set_active(true);
+            ui.controller
+                .refresh_events(routelane::usage::events::EventCategory::All);
+        }
+    });
+    let weak = Rc::downgrade(&ui);
+    controller.connect_quota_crossed(Rc::new(move |lane_id, crossing| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let names = EventNames::from_profile(&ui.profile.borrow());
+        let next_reset = ui
+            .controller
+            .session()
+            .usage()
+            .and_then(|report| report.lanes.iter().find(|lane| &lane.lane_id == lane_id))
+            .and_then(|lane| lane.quota.as_ref())
+            .map(|quota| quota.next_reset);
+        let message = crate::ui::events_page::quota_toast_text(
+            lane_id,
+            crossing,
+            &names,
+            next_reset,
+            texts.language,
+        );
+        let toast = adw::Toast::new(&glib::markup_escape_text(&message));
+        toast.set_button_label(Some(texts.usage.detail));
+        toast.set_action_name(Some("win.show-lane-detail"));
+        toast.set_action_target_value(Some(&lane_id.as_str().to_variant()));
+        ui.toast.add_toast(&toast);
+    }));
+    let show_lane = gtk::gio::SimpleAction::new("show-lane-detail", Some(glib::VariantTy::STRING));
+    let weak = Rc::downgrade(&ui);
+    show_lane.connect_activate(move |_, parameter| {
+        let Some(id) = parameter.and_then(|value| value.get::<String>()) else {
+            return;
+        };
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let Some(window) = ui.window.upgrade() else {
+            return;
+        };
+        let Some(lane) = ui
+            .profile
+            .borrow()
+            .lanes
+            .iter()
+            .find(|lane| lane.id.as_str() == id)
+            .cloned()
+        else {
+            return;
+        };
+        let weak = Rc::downgrade(&ui);
+        let edit_id: routelane::domain::LaneId = id.as_str().into();
+        let edit = Rc::new(move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(window) = ui.window.upgrade() else {
+                return;
+            };
+            let save_ui = Rc::downgrade(&ui);
+            crate::ui::connections::open_connection_editor(
+                &window,
+                texts,
+                ui.profile.clone(),
+                Some(edit_id.clone()),
+                Rc::new(move |candidate| {
+                    save_ui
+                        .upgrade()
+                        .is_some_and(|ui| ui.save_profile(candidate, None))
+                }),
+            );
+        });
+        crate::ui::lane_detail::open(&window, texts, lane, ui.controller.clone(), edit);
+    });
+    window.add_action(&show_lane);
+    // Match usage's thirty-second background cadence. EventRecorded also refreshes immediately.
+    let weak = Rc::downgrade(&ui);
+    glib::timeout_add_seconds_local(30, move || {
+        let Some(ui) = weak.upgrade() else {
+            return glib::Continue(false);
+        };
+        if ui
+            .window
+            .upgrade()
+            .is_some_and(|window| window.is_visible())
+            && ui.overview_stack.visible_child_name().as_deref() == Some("summary")
+        {
+            ui.controller
+                .refresh_events(routelane::usage::events::EventCategory::All);
+        }
+        glib::Continue(true)
     });
     for search in [&ui.rules.search, &ui.applications.search] {
         let weak = Rc::downgrade(&ui);
@@ -1345,6 +1497,7 @@ mod tests {
             })
             .unwrap();
         drain();
+        answer_initial_overview_reads(&requests, &events);
         for (section, label) in [
             ("rules", "Kural ekle"),
             ("applications", "Uygulama ekle"),
@@ -1893,6 +2046,7 @@ mod tests {
         ] {
             assert_routing_scope_and_activation_preview(&app, language);
             assert_usage_screens(&app, language);
+            assert_overview_and_events(&app, language);
         }
     }
 
@@ -1902,6 +2056,35 @@ mod tests {
             UiToDaemon::Request(request) => request,
             _ => panic!("a daemon request was expected"),
         }
+    }
+
+    fn answer_initial_overview_reads(requests: &Receiver<UiToDaemon>, events: &Sender<DaemonToUi>) {
+        use routelane::{
+            ipc::DaemonResponse,
+            usage::{events::EventCategory, service::UsageReport},
+        };
+        for expected in [
+            DaemonRequest::GetUsage { fast_lane: None },
+            DaemonRequest::ListEvents {
+                category: EventCategory::All,
+            },
+        ] {
+            let read = next_request(requests);
+            assert_eq!(read.request, expected);
+            let result = match expected {
+                DaemonRequest::GetUsage { .. } => {
+                    DaemonResult::Usage(UsageReport { lanes: vec![] })
+                }
+                _ => DaemonResult::Events(vec![]),
+            };
+            events
+                .try_send(DaemonToUi::Response {
+                    epoch: 1,
+                    response: DaemonResponse::success(read.request_id, result),
+                })
+                .unwrap();
+        }
+        drain();
     }
 
     fn reply_preview(
@@ -1970,6 +2153,510 @@ mod tests {
             .find(|dialog| {
                 dialog.is_visible() && dialog.transient_for().as_ref() == Some(window.upcast_ref())
             })
+    }
+
+    fn assert_overview_and_events(app: &adw::Application, language: routelane::config::Language) {
+        use routelane::{
+            domain::{Lane, LaneFailurePolicy, RuleTarget},
+            ipc::{DaemonEvent, DaemonResponse},
+            usage::{
+                events::{EventCategory, EventKind, UsageEvent},
+                quota::LaneQuota,
+                service::{LaneUsage, QuotaStatus, UsageReport},
+                store::QuotaCrossing,
+                LocalDate, UsageTotals,
+            },
+        };
+        fn row_count(widget: &gtk::Widget, name: &str) -> usize {
+            let list = find_named(widget, name)
+                .unwrap()
+                .downcast::<gtk::ListBox>()
+                .unwrap();
+            let mut count = 0;
+            let mut child = list.first_child();
+            while let Some(row) = child {
+                count += 1;
+                child = row.next_sibling();
+            }
+            count
+        }
+        fn has_text(widget: &gtk::Widget, text: &str) -> bool {
+            if widget
+                .downcast_ref::<gtk::Label>()
+                .is_some_and(|label| label.text() == text)
+            {
+                return true;
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if has_text(&current, text) {
+                    return true;
+                }
+                child = current.next_sibling();
+            }
+            false
+        }
+        let texts = language.texts();
+        let tr = language == routelane::config::Language::Tr;
+        let tag = if tr { "tr" } else { "en" };
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        let mut profile = empty_default_profile();
+        profile.lanes = [("ethernet", "Ethernet", "eth0"), ("vinn", "VINN", "usb0")]
+            .into_iter()
+            .map(|(id, name, interface)| Lane {
+                id: id.into(),
+                name: name.into(),
+                interface: interface.into(),
+                fallback_lane: None,
+                failure_policy: LaneFailurePolicy::Block,
+            })
+            .collect();
+        profile.rules.push(Rule {
+            id: "chat".into(),
+            enabled: true,
+            priority: 10,
+            source: RuleSource::Any,
+            target: RuleTarget::Domain("chatgpt.com".into()),
+            action: RuleAction::Route("vinn".into()),
+        });
+        ConfigRepository::new(&path)
+            .save(&ConfigV4 {
+                language,
+                profiles: vec![profile],
+                ..Default::default()
+            })
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let (sender, requests) = async_channel::unbounded();
+        let (events, receiver) = async_channel::unbounded();
+        let window =
+            build_window_with_repository(app, sender, receiver, ConfigRepository::new(&path));
+        events
+            .try_send(DaemonToUi::ConnectionEstablished { epoch: 1 })
+            .unwrap();
+        events
+            .try_send(DaemonToUi::Snapshot {
+                epoch: 1,
+                status: DaemonStatus {
+                    generation: 0,
+                    event_sequence: 0,
+                    health: HealthReport::inactive(),
+                    desired_profile_id: None,
+                    applied_profile_id: None,
+                    last_error: None,
+                    primary: Default::default(),
+                },
+                profiles: vec![],
+            })
+            .unwrap();
+        drain();
+        let read = next_request(&requests);
+        assert_eq!(read.request, DaemonRequest::GetUsage { fast_lane: None });
+        let quota = QuotaStatus {
+            settings: LaneQuota {
+                enabled: true,
+                limit_bytes: 20_000_000_000,
+                reset_day: 1,
+                warn_percent: 80,
+            },
+            period_start: LocalDate::parse("2026-11-01").unwrap(),
+            next_reset: LocalDate::parse("2026-12-01").unwrap(),
+            used_bytes: 16_000_000_000,
+            measured: UsageTotals {
+                rx: 15_000_000_000,
+                tx: 1_000_000_000,
+            },
+        };
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(
+                    read.request_id,
+                    DaemonResult::Usage(UsageReport {
+                        lanes: [("ethernet", None), ("vinn", Some(quota))]
+                            .into_iter()
+                            .map(|(id, quota)| LaneUsage {
+                                lane_id: id.into(),
+                                interface: id.into(),
+                                available: true,
+                                today: UsageTotals::default(),
+                                quota,
+                                daily: vec![(
+                                    LocalDate::parse("2026-11-10").unwrap(),
+                                    UsageTotals {
+                                        rx: 3_100_000_000,
+                                        tx: 420_000_000,
+                                    },
+                                )],
+                                rate: None,
+                                recent_rates: vec![],
+                            })
+                            .collect(),
+                    }),
+                ),
+            })
+            .unwrap();
+        let read = next_request(&requests);
+        assert_eq!(
+            read.request,
+            DaemonRequest::ListEvents {
+                category: EventCategory::All
+            }
+        );
+        let at = crate::ui::events_page::now_unix_ms();
+        let history: Vec<_> = vec![
+            EventKind::ApplyFailed {
+                code: "DAEMON_RECONCILIATION_FAILED".into(),
+                message: "failure".into(),
+                rolled_back: true,
+            },
+            EventKind::QuotaWarning {
+                lane_id: "vinn".into(),
+                used: 16_000_000_000,
+                limit: 20_000_000_000,
+            },
+            EventKind::Failover {
+                from: Some("ethernet".into()),
+                to: "vinn".into(),
+                families: vec!["IPv4".into(), "IPv6".into()],
+            },
+            EventKind::Failback {
+                to: "ethernet".into(),
+                backup_seconds: 420,
+                backup_bytes: Some(410_000_000),
+            },
+            EventKind::RuleApplied {
+                rule_id: "chat".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| UsageEvent {
+            at_unix_ms: at - i as i64 * 60_000,
+            kind,
+        })
+        .collect();
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(
+                    read.request_id,
+                    DaemonResult::Events(history.clone()),
+                ),
+            })
+            .unwrap();
+        wait_for(|| row_count(window.upcast_ref(), "overview-events") == 3);
+        // A subsequent recorded event independently refreshes the current category.
+        events
+            .try_send(DaemonToUi::Event {
+                epoch: 1,
+                event: DaemonEvent::EventRecorded { sequence: 1 },
+            })
+            .unwrap();
+        let read = next_request(&requests);
+        assert_eq!(
+            read.request,
+            DaemonRequest::ListEvents {
+                category: EventCategory::All
+            }
+        );
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(
+                    read.request_id,
+                    DaemonResult::Events(history.clone()),
+                ),
+            })
+            .unwrap();
+        drain();
+        assert!(has_text(window.upcast_ref(), texts.usage.usage_overview));
+        assert!(has_text(window.upcast_ref(), texts.usage.recent_events));
+        assert!(has_text(
+            window.upcast_ref(),
+            if tr {
+                "Ethernet · ↓ 3,1 GB ↑ 0,4 GB · yaklaşık"
+            } else {
+                "Ethernet · ↓ 3.1 GB ↑ 0.4 GB · approximate"
+            }
+        ));
+        assert!(find_named(window.upcast_ref(), "overview-quota-vinn").is_some());
+        screenshot(&window, &format!("overview-usage-{tag}.png"));
+        find_named(window.upcast_ref(), "events-open")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap()
+            .emit_clicked();
+        let read = next_request(&requests);
+        assert_eq!(
+            read.request,
+            DaemonRequest::ListEvents {
+                category: EventCategory::All
+            }
+        );
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(
+                    read.request_id,
+                    DaemonResult::Events(history.clone()),
+                ),
+            })
+            .unwrap();
+        let page = find_named(window.upcast_ref(), "events-page").unwrap();
+        wait_for(|| page.is_mapped() && row_count(&page, "events-list") == 5);
+        let expected = if tr {
+            [
+                "Yönlendirme uygulanamadı, önceki ayar geri yüklendi",
+                "VINN kotasının %80'i kullanıldı — 16,0 / 20 GB",
+                "Ethernet kesildi, VINN'e geçildi — IPv4 ve IPv6",
+                "Ethernet'e geri dönüldü — 7 dk yedekte, 410 MB",
+                "“chatgpt.com” kuralı uygulandı",
+            ]
+        } else {
+            [
+                "Routing could not be applied, previous settings restored",
+                "VINN quota is 80% used — 16.0 / 20 GB",
+                "Ethernet disconnected, switched to VINN — IPv4 and IPv6",
+                "Returned to Ethernet — 7 min on backup, 410 MB",
+                "Rule “chatgpt.com” applied",
+            ]
+        };
+        for title in expected {
+            assert!(has_text(&page, title), "{title}");
+        }
+        let expand = find_named(&page, "event-detail-0")
+            .unwrap()
+            .downcast::<gtk::Expander>()
+            .unwrap();
+        expand.set_expanded(true);
+        let detail = find_named(&page, "event-detail-text-0")
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert!(detail.is_selectable());
+        assert_eq!(
+            detail.text(),
+            "DAEMON_RECONCILIATION_FAILED · failure · rollback: ok"
+        );
+        assert!(has_text(&page, texts.usage.events_retention));
+        screenshot(&window, &format!("events-{tag}.png"));
+        for (filter, category) in [
+            ("problems", EventCategory::Problems),
+            ("transitions", EventCategory::Transitions),
+            ("rules", EventCategory::Rules),
+            ("quota", EventCategory::Quota),
+            ("all", EventCategory::All),
+        ] {
+            find_named(&page, &format!("events-filter-{filter}"))
+                .unwrap()
+                .downcast::<gtk::ToggleButton>()
+                .unwrap()
+                .set_active(true);
+            let read = next_request(&requests);
+            assert_eq!(read.request, DaemonRequest::ListEvents { category });
+            let filtered: Vec<_> = history
+                .iter()
+                .filter(|event| category == EventCategory::All || event.kind.category() == category)
+                .cloned()
+                .collect();
+            let count = filtered.len();
+            events
+                .try_send(DaemonToUi::Response {
+                    epoch: 1,
+                    response: DaemonResponse::success(
+                        read.request_id,
+                        DaemonResult::Events(filtered),
+                    ),
+                })
+                .unwrap();
+            wait_for(|| row_count(&page, "events-list") == count);
+        }
+        // Rapid All → Quota → All must recover after a late quota reply.
+        events
+            .try_send(DaemonToUi::Event {
+                epoch: 1,
+                event: DaemonEvent::EventRecorded { sequence: 2 },
+            })
+            .unwrap();
+        let all_read = next_request(&requests);
+        assert_eq!(
+            all_read.request,
+            DaemonRequest::ListEvents {
+                category: EventCategory::All
+            }
+        );
+        find_named(&page, "events-filter-quota")
+            .unwrap()
+            .downcast::<gtk::ToggleButton>()
+            .unwrap()
+            .set_active(true);
+        let quota_read = next_request(&requests);
+        assert_eq!(
+            quota_read.request,
+            DaemonRequest::ListEvents {
+                category: EventCategory::Quota
+            }
+        );
+        find_named(&page, "events-filter-all")
+            .unwrap()
+            .downcast::<gtk::ToggleButton>()
+            .unwrap()
+            .set_active(true);
+        drain();
+        assert!(
+            requests.try_recv().is_err(),
+            "the pending All read is coalesced"
+        );
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(
+                    all_read.request_id,
+                    DaemonResult::Events(history.clone()),
+                ),
+            })
+            .unwrap();
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(
+                    quota_read.request_id,
+                    DaemonResult::Events(vec![history[1].clone()]),
+                ),
+            })
+            .unwrap();
+        let read = next_request(&requests);
+        assert_eq!(
+            read.request,
+            DaemonRequest::ListEvents {
+                category: EventCategory::All
+            }
+        );
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(
+                    read.request_id,
+                    DaemonResult::Events(history.clone()),
+                ),
+            })
+            .unwrap();
+        wait_for(|| row_count(&page, "events-list") == 5);
+        let clear = find_named(&page, "events-clear")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        for cancel in 0..3 {
+            clear.emit_clicked();
+            drain();
+            let dialog = transient(&window);
+            assert_eq!(
+                dialog.title().as_deref(),
+                Some(texts.usage.events_clear_confirm)
+            );
+            assert!(
+                requests.try_recv().is_err(),
+                "opening confirmation is read-only"
+            );
+            match cancel {
+                0 => escape(&dialog),
+                1 => find_button(dialog.upcast_ref(), texts.cancel)
+                    .unwrap()
+                    .emit_clicked(),
+                _ => dialog.close(),
+            }
+            drain();
+            assert!(
+                requests.try_recv().is_err(),
+                "cancel, Escape and close send nothing"
+            );
+        }
+        clear.emit_clicked();
+        drain();
+        let dialog = transient(&window);
+        let confirm = find_button(dialog.upcast_ref(), texts.usage.events_clear).unwrap();
+        confirm.emit_clicked();
+        confirm.emit_clicked();
+        let read = next_request(&requests);
+        assert_eq!(read.request, DaemonRequest::ClearEvents);
+        assert!(
+            requests.try_recv().is_err(),
+            "confirmation sends exactly one ClearEvents"
+        );
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(read.request_id, DaemonResult::EventsCleared),
+            })
+            .unwrap();
+        wait_for(|| row_count(&page, "events-list") == 0);
+        for (sequence, crossing, expected) in [
+            (
+                3,
+                QuotaCrossing::Warning {
+                    used: 16_000_000_000,
+                    limit: 20_000_000_000,
+                },
+                if tr {
+                    "VINN kotasının %80'i doldu — 16,0 / 20 GB · 4 GB kaldı · 1 Aralık'ta yenilenir"
+                } else {
+                    "VINN quota is 80% used — 16.0 / 20 GB · 4 GB left · renews on 1 December"
+                },
+            ),
+            (
+                4,
+                QuotaCrossing::Full {
+                    used: 20_000_000_000,
+                    limit: 20_000_000_000,
+                },
+                if tr {
+                    "VINN kotası doldu — trafik kesilmedi; operatörünüz ek ücret alabilir."
+                } else {
+                    "VINN quota is full — traffic was not stopped; your operator may charge extra."
+                },
+            ),
+        ] {
+            events
+                .try_send(DaemonToUi::Event {
+                    epoch: 1,
+                    event: DaemonEvent::QuotaCrossed {
+                        sequence,
+                        lane_id: "vinn".into(),
+                        crossing,
+                    },
+                })
+                .unwrap();
+            wait_for(|| has_text(window.upcast_ref(), expected));
+            find_button(window.upcast_ref(), texts.usage.detail)
+                .unwrap()
+                .emit_clicked();
+            drain();
+            let detail = transient(&window);
+            assert_eq!(detail.widget_name(), "lane-detail");
+            assert_eq!(detail.title().as_deref(), Some("VINN"));
+            escape(&detail);
+            while requests.try_recv().is_ok() {}
+        }
+        find_button(&page, &format!("‹ {}", texts.ux.overview))
+            .unwrap()
+            .emit_clicked();
+        drain();
+        assert!(!page.is_mapped());
+        assert_eq!(
+            next_request(&requests).request,
+            DaemonRequest::ListEvents {
+                category: EventCategory::All
+            }
+        );
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            before,
+            "event history never edits routing configuration"
+        );
+        window.destroy();
+        drain();
     }
 
     fn assert_usage_screens(app: &adw::Application, language: routelane::config::Language) {
@@ -2047,6 +2734,7 @@ mod tests {
             })
             .unwrap();
         drain();
+        answer_initial_overview_reads(&requests, &events);
         // Exercise the same read-only controller action used by the usage poll.
         gtk::prelude::WidgetExt::activate_action(&window, "win.refresh-usage", None).unwrap();
         let read = next_request(&requests);
@@ -2454,6 +3142,7 @@ mod tests {
             drain();
         };
         snapshot(1);
+        answer_initial_overview_reads(&requests, &events);
         find_named(window.upcast_ref(), "connections")
             .unwrap()
             .downcast::<gtk::ToggleButton>()
@@ -2619,6 +3308,7 @@ mod tests {
                 })
                 .unwrap();
             drain();
+            answer_initial_overview_reads(&requests, &events);
             find_named(window.upcast_ref(), "connections")
                 .unwrap()
                 .downcast::<gtk::ToggleButton>()

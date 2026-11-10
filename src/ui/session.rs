@@ -6,7 +6,10 @@ use routelane::ipc::{
     DaemonEvent, DaemonRequest, DaemonResponse, DaemonResult, DaemonStatus, IpcError,
     IPC_PROTOCOL_VERSION,
 };
-use routelane::usage::{events::UsageEvent, service::UsageReport};
+use routelane::usage::{
+    events::{EventCategory, UsageEvent},
+    service::UsageReport,
+};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,9 +187,16 @@ impl UiSession {
     pub fn usage(&self) -> Option<&UsageReport> {
         self.usage.as_ref()
     }
-    #[allow(dead_code)] // Task 8 event-history API.
     pub fn events(&self) -> &[UsageEvent] {
         &self.events
+    }
+
+    /// Associates an event reply with the filter that requested it.
+    pub fn pending_event_category(&self, request_id: &str) -> Option<EventCategory> {
+        match self.usage_requests.get(request_id) {
+            Some(DaemonRequest::ListEvents { category }) => Some(*category),
+            _ => None,
+        }
     }
 
     pub fn snapshot_known(&self) -> bool {

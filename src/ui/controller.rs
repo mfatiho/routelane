@@ -213,7 +213,6 @@ impl UiController {
         }
         self.request(DaemonRequest::SetQuota { lane_id, quota }, None)
     }
-    #[allow(dead_code)] // Task 8 event-history API.
     pub fn clear_events(self: &Rc<Self>) -> bool {
         self.request(DaemonRequest::ClearEvents, None)
     }
@@ -230,7 +229,6 @@ impl UiController {
         self.event_category.set(category);
         self.request(DaemonRequest::ListEvents { category }, None);
     }
-    #[allow(dead_code)] // Task 8 quota toast API.
     pub fn connect_quota_crossed(&self, callback: QuotaCallback) {
         self.quota_observers.borrow_mut().push(callback);
     }

@@ -31,3 +31,5 @@ mod tests {
 pub mod lane_detail;
 pub mod quota_dialog;
 pub mod usage_widgets;
+
+pub mod events_page;

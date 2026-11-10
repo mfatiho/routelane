@@ -162,6 +162,10 @@ pub struct Overview {
     pub root: gtk::Box,
     pub reapply: gtk::Button,
     pub refresh: gtk::Button,
+    pub events_open: gtk::Button,
+    usage: gtk::Box,
+    events: gtk::ListBox,
+    rendered_events: std::cell::RefCell<Vec<super::events_page::EventText>>,
     summary: gtk::Label,
     primary: gtk::Label,
     lanes: gtk::Box,
@@ -245,10 +249,44 @@ impl Overview {
         ] {
             root.append(widget);
         }
+        let usage = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        usage.set_widget_name("overview-usage");
+        let events = gtk::ListBox::new();
+        events.set_widget_name("overview-events");
+        events.set_selection_mode(gtk::SelectionMode::None);
+        events.add_css_class("boxed-list");
+        let events_open = gtk::Button::with_label(texts.usage.show_all);
+        events_open.set_widget_name("events-open");
+        events_open.set_halign(gtk::Align::End);
+        let usage_card = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let events_card = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        for (card, title) in [
+            (&usage_card, texts.usage.usage_overview),
+            (&events_card, texts.usage.recent_events),
+        ] {
+            card.add_css_class("card");
+            card.set_margin_top(8);
+            let heading = gtk::Label::builder()
+                .label(title)
+                .xalign(0.0)
+                .wrap(true)
+                .build();
+            heading.add_css_class("heading");
+            card.append(&heading);
+        }
+        usage_card.append(&usage);
+        events_card.append(&events);
+        events_card.append(&events_open);
+        root.insert_child_after(&usage_card, Some(&summary));
+        root.insert_child_after(&events_card, Some(&usage_card));
         Self {
             root,
             reapply,
             refresh,
+            events_open,
+            usage,
+            events,
+            rendered_events: std::cell::RefCell::new(vec![]),
             summary,
             primary,
             lanes,
@@ -260,7 +298,101 @@ impl Overview {
         }
     }
 
+    fn update_usage(&self, profile: &Profile, session: &UiSession) {
+        use super::usage_widgets::{format_gb, format_limit, QuotaBar};
+        while let Some(child) = self.usage.first_child() {
+            self.usage.remove(&child);
+        }
+        let Some(report) = session.usage() else {
+            self.usage
+                .append(&gtk::Label::new(Some(self.texts.ux.checking)));
+            return;
+        };
+        for lane in &profile.lanes {
+            let Some(usage) = report.lanes.iter().find(|usage| usage.lane_id == lane.id) else {
+                continue;
+            };
+            let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            let text = if let Some(quota) =
+                usage.quota.as_ref().filter(|quota| quota.settings.enabled)
+            {
+                let bar = QuotaBar::new(quota, self.texts.language);
+                bar.area
+                    .set_widget_name(&format!("overview-quota-{}", lane.id.as_str()));
+                body.append(&bar.area);
+                format!(
+                    "{} · {}",
+                    lane.name,
+                    self.texts
+                        .usage
+                        .used_summary
+                        .replace("{used}", &format_gb(quota.used_bytes, self.texts.language))
+                        .replace(
+                            "{limit}",
+                            &format_limit(quota.settings.limit_bytes, self.texts.language)
+                        )
+                )
+            } else {
+                let (rx, tx) = usage
+                    .daily
+                    .iter()
+                    .fold((0u64, 0u64), |(rx, tx), (_, totals)| {
+                        (rx.saturating_add(totals.rx), tx.saturating_add(totals.tx))
+                    });
+                self.texts
+                    .usage
+                    .overview_lane_totals
+                    .replace("{lane}", &lane.name)
+                    .replace("{down}", &format_gb(rx, self.texts.language))
+                    .replace("{up}", &format_gb(tx, self.texts.language))
+            };
+            body.prepend(
+                &gtk::Label::builder()
+                    .label(&text)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .build(),
+            );
+            if usage.quota.is_none() {
+                // The daemon report supplies seven daily totals for unmetered lanes.
+                let timeframe = gtk::Label::builder()
+                    .label(self.texts.usage.last_seven_days)
+                    .xalign(0.0)
+                    .build();
+                timeframe.add_css_class("dim-label");
+                body.append(&timeframe);
+            }
+            self.usage.append(&body);
+        }
+    }
+
+    pub fn update_events(
+        &self,
+        profile: &Profile,
+        events: &[routelane::usage::events::UsageEvent],
+    ) {
+        use super::events_page::{event_row, event_text, now_unix_ms, EventNames};
+        let names = EventNames::from_profile(profile);
+        let now = now_unix_ms();
+        let rows: Vec<_> = events
+            .iter()
+            .take(3)
+            .map(|event| event_text(event, &names, now, self.texts.language))
+            .collect();
+        if *self.rendered_events.borrow() == rows {
+            return;
+        }
+        while let Some(child) = self.events.first_child() {
+            self.events.remove(&child);
+        }
+        for (i, text) in rows.iter().enumerate() {
+            self.events.append(&event_row(text, i, false));
+        }
+        *self.rendered_events.borrow_mut() = rows;
+    }
+
     pub fn update(&self, profile: &Profile, session: &UiSession) {
+        self.update_usage(profile, session);
         let texts = self.texts;
         let (lanes, rules, apps) = profile_counts(profile);
         self.summary.set_label(&format!(
