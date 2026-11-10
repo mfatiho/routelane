@@ -3,10 +3,14 @@ use crate::ui::session::{AfterSave, UiEffect, UiSession};
 use async_channel::Sender;
 use routelane::backend::RoutingPreview;
 use routelane::config::{ConfigV4, PersistenceRequest, PersistenceWorker};
-use routelane::domain::Profile;
+use routelane::domain::{LaneId, Profile};
+use routelane::ipc::DaemonEvent;
 use routelane::ipc::{DaemonRequest, DaemonResult, IpcError};
+use routelane::usage::{events::EventCategory, quota::LaneQuota, store::QuotaCrossing};
 use std::cell::{Cell, Ref, RefCell};
 use std::rc::Rc;
+
+type QuotaCallback = Rc<dyn Fn(&LaneId, &QuotaCrossing)>;
 
 pub struct UiController {
     session: RefCell<UiSession>,
@@ -22,6 +26,8 @@ pub struct UiController {
     quit: RefCell<Option<Rc<dyn Fn()>>>,
     /// The outstanding preview request, its draft and the caller's callback.
     preview_ready: RefCell<Option<PreviewWait>>,
+    quota_observers: RefCell<Vec<QuotaCallback>>,
+    event_category: Cell<EventCategory>,
 }
 
 type PreviewCallback = Box<dyn FnOnce(Result<RoutingPreview, IpcError>)>;
@@ -51,6 +57,8 @@ impl UiController {
             completed_id: RefCell::new(None),
             quit: RefCell::new(None),
             preview_ready: RefCell::new(None),
+            quota_observers: RefCell::new(vec![]),
+            event_category: Cell::new(EventCategory::All),
         });
         if let Some(worker) = persistence {
             let weak = Rc::downgrade(&controller);
@@ -196,6 +204,59 @@ impl UiController {
         }
     }
 
+    pub fn refresh_usage(self: &Rc<Self>, fast_lane: Option<LaneId>) {
+        self.request(DaemonRequest::GetUsage { fast_lane }, None);
+    }
+    pub fn save_quota(self: &Rc<Self>, lane_id: LaneId, quota: Option<LaneQuota>) -> bool {
+        if quota.as_ref().is_some_and(|q| q.validate().is_err()) {
+            return false;
+        }
+        self.request(DaemonRequest::SetQuota { lane_id, quota }, None)
+    }
+    #[allow(dead_code)] // Task 8 event-history API.
+    pub fn clear_events(self: &Rc<Self>) -> bool {
+        self.request(DaemonRequest::ClearEvents, None)
+    }
+    pub fn correct_usage(self: &Rc<Self>, lane_id: LaneId, used_bytes: u64) -> bool {
+        self.request(
+            DaemonRequest::CorrectUsage {
+                lane_id,
+                used_bytes,
+            },
+            None,
+        )
+    }
+    pub fn refresh_events(self: &Rc<Self>, category: EventCategory) {
+        self.event_category.set(category);
+        self.request(DaemonRequest::ListEvents { category }, None);
+    }
+    #[allow(dead_code)] // Task 8 quota toast API.
+    pub fn connect_quota_crossed(&self, callback: QuotaCallback) {
+        self.quota_observers.borrow_mut().push(callback);
+    }
+
+    /// Weak ownership stops polling when its window is destroyed. A detail window
+    /// owns its own one-second poll; the main window polls every thirty seconds.
+    pub fn poll_usage(
+        self: &Rc<Self>,
+        window: &impl gtk4::prelude::IsA<gtk4::Window>,
+        fast_lane: Option<LaneId>,
+    ) {
+        use gtk4::prelude::*;
+        let weak = Rc::downgrade(self);
+        let window = window.as_ref().downgrade();
+        let seconds = if fast_lane.is_some() { 1 } else { 30 };
+        glib::timeout_add_seconds_local(seconds, move || {
+            let (Some(controller), Some(window)) = (weak.upgrade(), window.upgrade()) else {
+                return glib::Continue(false);
+            };
+            if window.is_visible() {
+                controller.refresh_usage(fast_lane.clone());
+            }
+            glib::Continue(true)
+        });
+    }
+
     pub fn refresh(self: &Rc<Self>) {
         self.execute(vec![UiEffect::RefreshSnapshot]);
     }
@@ -226,6 +287,14 @@ impl UiController {
 
     pub fn receive(self: &Rc<Self>, message: DaemonToUi) {
         let is_snapshot = matches!(message, DaemonToUi::Snapshot { .. });
+        let usage_notice = match &message {
+            DaemonToUi::Event { epoch, event } if *epoch == self.session().connection_epoch() => {
+                Some(event.clone())
+            }
+            _ => None,
+        };
+        let quota_saved = matches!(&message, DaemonToUi::Response { epoch, response }
+            if *epoch == self.session().connection_epoch() && response.error.is_none() && matches!(response.result, Some(DaemonResult::QuotaSaved)));
         if let DaemonToUi::Response { epoch, response } = &message {
             let session = self.session.borrow();
             if session.accepts_reply(*epoch, &response.request_id) {
@@ -295,6 +364,24 @@ impl UiController {
                     false,
                 );
             }
+        }
+        if quota_saved {
+            self.refresh_usage(None);
+        }
+        match usage_notice {
+            Some(DaemonEvent::QuotaCrossed {
+                lane_id, crossing, ..
+            }) => {
+                let callbacks = self.quota_observers.borrow().clone();
+                for callback in callbacks {
+                    callback(&lane_id, &crossing);
+                }
+                self.refresh_usage(None);
+            }
+            Some(DaemonEvent::EventRecorded { .. }) => {
+                self.refresh_events(self.event_category.get())
+            }
+            _ => {}
         }
         self.notify();
     }
@@ -431,6 +518,64 @@ mod tests {
                 test(controller, requests, written, results, &context);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn usage_events_refresh_without_changing_routing_state() {
+        run(false, |controller, requests, _, _, context| {
+            let calls = Rc::new(Cell::new(0));
+            let counted = calls.clone();
+            controller.connect_quota_crossed(Rc::new(move |id, crossing| {
+                assert_eq!(id.as_str(), "vinn");
+                assert!(matches!(
+                    crossing,
+                    QuotaCrossing::Warning {
+                        used: 16_000_000_000,
+                        limit: 20_000_000_000
+                    }
+                ));
+                counted.set(counted.get() + 1);
+            }));
+            let state = controller.session().save_state();
+            controller.receive(DaemonToUi::Event {
+                epoch: 0,
+                event: DaemonEvent::QuotaCrossed {
+                    sequence: 1,
+                    lane_id: "vinn".into(),
+                    crossing: QuotaCrossing::Warning {
+                        used: 16_000_000_000,
+                        limit: 20_000_000_000,
+                    },
+                },
+            });
+            assert_eq!(calls.get(), 0, "stale connections cannot notify");
+            controller.receive(DaemonToUi::Event {
+                epoch: 1,
+                event: DaemonEvent::QuotaCrossed {
+                    sequence: 1,
+                    lane_id: "vinn".into(),
+                    crossing: QuotaCrossing::Warning {
+                        used: 16_000_000_000,
+                        limit: 20_000_000_000,
+                    },
+                },
+            });
+            controller.receive(DaemonToUi::Event {
+                epoch: 1,
+                event: DaemonEvent::EventRecorded { sequence: 2 },
+            });
+            drain(context);
+            assert_eq!(calls.get(), 1);
+            assert!(
+                matches!(requests.try_recv().unwrap(), UiToDaemon::Request(request) if request.request == DaemonRequest::GetUsage { fast_lane: None })
+            );
+            assert!(
+                matches!(requests.try_recv().unwrap(), UiToDaemon::Request(request) if request.request == DaemonRequest::ListEvents { category: EventCategory::All })
+            );
+            assert!(requests.try_recv().is_err());
+            assert_eq!(controller.session().save_state(), state);
+            assert!(!controller.session().is_busy());
+        });
     }
 
     #[test]

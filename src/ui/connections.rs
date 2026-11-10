@@ -1,5 +1,6 @@
 use crate::ui::{
     confirm::{confirm_destructive_action, confirm_destructive_action_with_label},
+    controller::UiController,
     form::Form,
     i18n::Texts,
     list_page::ListPage,
@@ -8,6 +9,7 @@ use crate::ui::{
     },
     settings::{add_lane, delete_lane, lane_edit_error_text, rename_lane, routed_rule_count},
     shell::Section,
+    usage_widgets::{format_bytes, format_gb, format_limit, QuotaBar},
 };
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
@@ -445,6 +447,8 @@ pub struct ConnectionsPage {
     rows: Rc<RefCell<Vec<adw::ActionRow>>>,
     rendered: Rc<RefCell<Option<Vec<Lane>>>>,
     primary: Rc<PrimaryControls>,
+    controller: Rc<UiController>,
+    usage_rows: RefCell<Vec<(LaneId, adw::ActionRow, gtk::Box)>>,
 }
 
 impl ConnectionsPage {
@@ -453,6 +457,7 @@ impl ConnectionsPage {
         texts: Texts,
         profile: Rc<RefCell<Profile>>,
         on_save: Rc<dyn Fn(Profile) -> bool>,
+        controller: Rc<UiController>,
     ) -> Self {
         let primary = Rc::new(PrimaryControls::new(
             texts,
@@ -468,6 +473,8 @@ impl ConnectionsPage {
             rows: Rc::new(RefCell::new(vec![])),
             rendered: Rc::new(RefCell::new(None)),
             primary,
+            controller,
+            usage_rows: RefCell::new(vec![]),
         };
         // Below the connection list: Add stays the first control of the page.
         page.list.root.append(&page.primary.group);
@@ -620,27 +627,60 @@ impl ConnectionsPage {
         self.primary.backups.set_sensitive(editing_enabled);
         render_primary(&self.primary);
         let profile = self.profile.borrow().clone();
+        self.update_usage();
         if self.rendered.borrow().as_ref() == Some(&profile.lanes) {
             return;
         }
         *self.rendered.borrow_mut() = Some(profile.lanes.clone());
+        self.usage_rows.borrow_mut().clear();
         for row in self.rows.borrow_mut().drain(..) {
             self.list.group.remove(&row);
         }
         self.list.set_empty(profile.lanes.is_empty(), false);
         for lane in &profile.lanes {
-            let policy = match lane.failure_policy {
-                LaneFailurePolicy::Block => self.texts.ux.fail_block,
-                LaneFailurePolicy::Direct => self.texts.ux.fail_direct,
-                LaneFailurePolicy::Inactive => self.texts.ux.fail_inactive,
-            };
             let row = adw::ActionRow::builder()
                 .title(&glib::markup_escape_text(&lane.name))
-                .subtitle(&glib::markup_escape_text(&format!(
-                    "{} · {policy}",
-                    lane.interface.as_str()
-                )))
+                .activatable(true)
                 .build();
+            row.set_widget_name(&format!("lane-row-{}", lane.id.as_str()));
+            let usage_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            usage_box.set_valign(gtk::Align::Center);
+            row.add_suffix(&usage_box);
+            self.usage_rows
+                .borrow_mut()
+                .push((lane.id.clone(), row.clone(), usage_box));
+            let parent = self.parent.clone();
+            let lane_copy = lane.clone();
+            let controller = self.controller.clone();
+            let texts = self.texts;
+            let live_profile = self.profile.clone();
+            let on_save = self.on_save.clone();
+            row.connect_activated(move |_| {
+                if let Some(window) = parent.upgrade() {
+                    let parent = parent.clone();
+                    let profile = live_profile.clone();
+                    let save = on_save.clone();
+                    let id = lane_copy.id.clone();
+                    let edit = Rc::new(move || {
+                        if let Some(parent) = parent.upgrade() {
+                            open_connection_editor(
+                                &parent,
+                                texts,
+                                profile.clone(),
+                                Some(id.clone()),
+                                save.clone(),
+                            );
+                        }
+                    });
+                    crate::ui::lane_detail::open(
+                        &window,
+                        texts,
+                        lane_copy.clone(),
+                        controller.clone(),
+                        edit,
+                    );
+                }
+            });
             let edit = gtk::Button::with_label(self.texts.ux.edit);
             edit.set_valign(gtk::Align::Center);
             let parent = self.parent.clone();
@@ -717,6 +757,59 @@ impl ConnectionsPage {
             row.add_suffix(&delete);
             self.list.group.add(&row);
             self.rows.borrow_mut().push(row);
+        }
+        self.update_usage();
+    }
+
+    fn update_usage(&self) {
+        let session = self.controller.session();
+        for (id, row, box_) in self.usage_rows.borrow().iter() {
+            let profile = self.profile.borrow();
+            let Some(lane) = profile.lanes.iter().find(|lane| &lane.id == id) else {
+                continue;
+            };
+            let usage = session
+                .usage()
+                .and_then(|report| report.lanes.iter().find(|u| &u.lane_id == id));
+            let texts = self.texts.usage;
+            let language = self.texts.language;
+            let subtitle = match usage {
+                Some(usage) if !usage.available => texts.not_connected.to_owned(),
+                Some(usage) => match &usage.quota {
+                    Some(quota) => texts
+                        .period_used
+                        .replace("{used}", &format_gb(quota.used_bytes, language))
+                        .replace(
+                            "{limit}",
+                            &format_limit(quota.settings.limit_bytes, language),
+                        ),
+                    None => texts
+                        .today_down_up
+                        .replace("{down}", &format_bytes(usage.today.rx, language))
+                        .replace("{up}", &format_bytes(usage.today.tx, language)),
+                },
+                None => self.texts.ux.checking.to_owned(),
+            };
+            row.set_subtitle(&glib::markup_escape_text(&format!(
+                "{} · {subtitle}",
+                lane.interface.as_str()
+            )));
+            while let Some(child) = box_.first_child() {
+                box_.remove(&child);
+            }
+            if let Some(quota) = usage.filter(|u| u.available).and_then(|u| u.quota.as_ref()) {
+                let percent = (quota.used_bytes as f64 / quota.settings.limit_bytes.max(1) as f64
+                    * 100.0)
+                    .round();
+                let badge = gtk::Label::new(Some(
+                    &texts
+                        .quota_badge
+                        .replace("{percent}", &format!("{percent:.0}")),
+                ));
+                badge.add_css_class("caption");
+                box_.append(&badge);
+                box_.append(&QuotaBar::new(quota, language).area);
+            }
         }
     }
 }

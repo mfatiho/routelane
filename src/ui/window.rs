@@ -958,6 +958,7 @@ fn build_window_with_repository(
                 .upgrade()
                 .is_some_and(|ui| ui.save_profile(candidate, None))
         }),
+        controller.clone(),
     );
     shell.add_page(Section::Overview, &overview.root);
     shell.add_page(Section::Rules, &rules.root);
@@ -1132,6 +1133,15 @@ fn build_window_with_repository(
             }
         }
     });
+    ui.controller.poll_usage(&window, None);
+    let refresh_usage = gtk::gio::SimpleAction::new("refresh-usage", None);
+    let weak = Rc::downgrade(&ui.controller);
+    refresh_usage.connect_activate(move |_, _| {
+        if let Some(controller) = weak.upgrade() {
+            controller.refresh_usage(None);
+        }
+    });
+    window.add_action(&refresh_usage);
     ui.render();
     let live_ui = ui.clone();
     let source = glib::MainContext::ref_thread_default().spawn_local(async move {
@@ -1882,6 +1892,7 @@ mod tests {
             routelane::config::Language::En,
         ] {
             assert_routing_scope_and_activation_preview(&app, language);
+            assert_usage_screens(&app, language);
         }
     }
 
@@ -1959,6 +1970,421 @@ mod tests {
             .find(|dialog| {
                 dialog.is_visible() && dialog.transient_for().as_ref() == Some(window.upcast_ref())
             })
+    }
+
+    fn assert_usage_screens(app: &adw::Application, language: routelane::config::Language) {
+        use routelane::{
+            domain::{Lane, LaneFailurePolicy},
+            usage::{
+                quota::LaneQuota,
+                service::{LaneUsage, QuotaStatus, UsageRate, UsageReport},
+                LocalDate, UsageTotals,
+            },
+        };
+        fn has_label(widget: &gtk::Widget, text: &str) -> bool {
+            if widget
+                .downcast_ref::<gtk::Label>()
+                .is_some_and(|label| label.text() == text)
+            {
+                return true;
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if has_label(&current, text) {
+                    return true;
+                }
+                child = current.next_sibling();
+            }
+            false
+        }
+        let texts = language.texts();
+        let tr = language == routelane::config::Language::Tr;
+        let tag = if tr { "tr" } else { "en" };
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        let mut profile = empty_default_profile();
+        profile.lanes = [
+            ("ethernet", "Ethernet", "eth0"),
+            ("vinn", "VINN", "usb0"),
+            ("wifi", "Wi-Fi", "wlp2s0"),
+        ]
+        .into_iter()
+        .map(|(id, name, interface)| Lane {
+            id: id.into(),
+            name: name.into(),
+            interface: interface.into(),
+            fallback_lane: None,
+            failure_policy: LaneFailurePolicy::Block,
+        })
+        .collect();
+        let document = ConfigV4 {
+            language,
+            profiles: vec![profile],
+            ..ConfigV4::default()
+        };
+        ConfigRepository::new(&path).save(&document).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let (sender, requests) = async_channel::unbounded();
+        let (events, receiver) = async_channel::unbounded();
+        let window =
+            build_window_with_repository(app, sender, receiver, ConfigRepository::new(&path));
+        events
+            .try_send(DaemonToUi::ConnectionEstablished { epoch: 1 })
+            .unwrap();
+        events
+            .try_send(DaemonToUi::Snapshot {
+                epoch: 1,
+                status: DaemonStatus {
+                    generation: 0,
+                    event_sequence: 0,
+                    health: HealthReport::inactive(),
+                    desired_profile_id: None,
+                    applied_profile_id: None,
+                    last_error: None,
+                    primary: Default::default(),
+                },
+                profiles: vec![],
+            })
+            .unwrap();
+        drain();
+        // Exercise the same read-only controller action used by the usage poll.
+        gtk::prelude::WidgetExt::activate_action(&window, "win.refresh-usage", None).unwrap();
+        let read = next_request(&requests);
+        assert_eq!(read.request, DaemonRequest::GetUsage { fast_lane: None });
+        let date = |value| LocalDate::parse(value).unwrap();
+        let report = UsageReport {
+            lanes: vec![
+                LaneUsage {
+                    lane_id: "ethernet".into(),
+                    interface: "eth0".into(),
+                    available: true,
+                    today: UsageTotals {
+                        rx: 3_100_000_000,
+                        tx: 420_000_000,
+                    },
+                    quota: None,
+                    daily: vec![(
+                        date("2026-11-09"),
+                        UsageTotals {
+                            rx: 3_100_000_000,
+                            tx: 420_000_000,
+                        },
+                    )],
+                    rate: None,
+                    recent_rates: vec![],
+                },
+                LaneUsage {
+                    lane_id: "vinn".into(),
+                    interface: "usb0".into(),
+                    available: true,
+                    today: UsageTotals {
+                        rx: 1_000_000_000,
+                        tx: 100_000_000,
+                    },
+                    quota: Some(QuotaStatus {
+                        settings: LaneQuota {
+                            enabled: true,
+                            limit_bytes: 20_000_000_000,
+                            reset_day: 1,
+                            warn_percent: 80,
+                        },
+                        period_start: date("2026-11-01"),
+                        next_reset: date("2026-12-01"),
+                        used_bytes: 12_400_000_000,
+                        measured: UsageTotals {
+                            rx: 11_100_000_000,
+                            tx: 1_300_000_000,
+                        },
+                    }),
+                    daily: (1..=9)
+                        .map(|day| {
+                            (
+                                LocalDate {
+                                    year: 2026,
+                                    month: 11,
+                                    day,
+                                },
+                                UsageTotals {
+                                    rx: 1_100_000_000,
+                                    tx: 100_000_000,
+                                },
+                            )
+                        })
+                        .collect(),
+                    rate: Some(UsageRate {
+                        rx_per_second: 1_800_000,
+                        tx_per_second: 120_000,
+                    }),
+                    recent_rates: vec![
+                        UsageRate {
+                            rx_per_second: 1_800_000,
+                            tx_per_second: 120_000
+                        };
+                        60
+                    ],
+                },
+                LaneUsage {
+                    lane_id: "wifi".into(),
+                    interface: "wlp2s0".into(),
+                    available: false,
+                    today: UsageTotals::default(),
+                    quota: None,
+                    daily: vec![],
+                    rate: None,
+                    recent_rates: vec![],
+                },
+            ],
+        };
+        events
+            .try_send(DaemonToUi::Response {
+                epoch: 1,
+                response: routelane::ipc::DaemonResponse::success(
+                    read.request_id,
+                    DaemonResult::Usage(report),
+                ),
+            })
+            .unwrap();
+        find_named(window.upcast_ref(), "connections")
+            .unwrap()
+            .downcast::<gtk::ToggleButton>()
+            .unwrap()
+            .emit_clicked();
+        drain();
+        let row = |id| {
+            find_named(window.upcast_ref(), &format!("lane-row-{id}"))
+                .unwrap()
+                .downcast::<adw::ActionRow>()
+                .unwrap()
+        };
+        let ethernet = row("ethernet");
+        let vinn = row("vinn");
+        let wifi = row("wifi");
+        assert_eq!(
+            ethernet.subtitle().as_deref(),
+            Some(if tr {
+                "eth0 · Bugün ↓ 3,1 GB ↑ 420 MB"
+            } else {
+                "eth0 · Today ↓ 3.1 GB ↑ 420 MB"
+            })
+        );
+        assert_eq!(
+            vinn.subtitle().as_deref(),
+            Some(if tr {
+                "usb0 · Bu dönem 12,4 / 20 GB"
+            } else {
+                "usb0 · This period 12.4 / 20 GB"
+            })
+        );
+        assert_eq!(
+            wifi.subtitle().as_deref(),
+            Some(if tr {
+                "wlp2s0 · Bağlı değil"
+            } else {
+                "wlp2s0 · Not connected"
+            })
+        );
+        assert!(has_label(
+            vinn.upcast_ref(),
+            if tr { "Kota %62" } else { "Quota 62%" }
+        ));
+        assert!(!has_label(
+            ethernet.upcast_ref(),
+            if tr { "Kota %62" } else { "Quota 62%" }
+        ));
+        assert!(
+            find_button(vinn.upcast_ref(), texts.ux.edit).is_some(),
+            "Edit remains available"
+        );
+        assert!(vinn.is_activatable());
+        screenshot(&window, &format!("connections-usage-{tag}.png"));
+        vinn.emit_by_name::<()>("activated", &[]);
+        let fast = next_request(&requests);
+        assert_eq!(
+            fast.request,
+            DaemonRequest::GetUsage {
+                fast_lane: Some("vinn".into())
+            }
+        );
+        // Keep this poll outstanding so screenshot delays cannot introduce extra reads.
+        let detail = transient(&window);
+        assert_eq!(detail.widget_name(), "lane-detail");
+        assert!(has_label(
+            detail.upcast_ref(),
+            if tr {
+                "12,4 GB / 20 GB kullanıldı · yaklaşık"
+            } else {
+                "12.4 GB / 20 GB used · approximate"
+            }
+        ));
+        assert!(has_label(
+            detail.upcast_ref(),
+            if tr {
+                "Kalan 7,6 GB · 1 Aralık'ta sıfırlanır · %80 uyarı"
+            } else {
+                "7.6 GB left · resets on 1 December · 80% warning"
+            }
+        ));
+        assert!(has_label(
+            detail.upcast_ref(),
+            if tr {
+                "↓ İndirme (bu dönem)\n11,1 GB · yaklaşık"
+            } else {
+                "↓ Download (this period)\n11.1 GB · approximate"
+            }
+        ));
+        assert!(has_label(
+            detail.upcast_ref(),
+            if tr {
+                "↑ Yükleme (bu dönem)\n1,3 GB · yaklaşık"
+            } else {
+                "↑ Upload (this period)\n1.3 GB · approximate"
+            }
+        ));
+        for label in [
+            texts.usage.period,
+            texts.usage.last_seven_days,
+            texts.usage.live_rate,
+        ] {
+            find_button(detail.upcast_ref(), label)
+                .unwrap()
+                .emit_clicked();
+            drain();
+        }
+        find_button(detail.upcast_ref(), texts.usage.period)
+            .unwrap()
+            .emit_clicked();
+        drain();
+        screenshot(&detail, &format!("lane-detail-{tag}.png"));
+        let open_quota = || {
+            find_named(detail.upcast_ref(), "quota-open")
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap()
+                .emit_clicked();
+            drain();
+            transient(&detail)
+        };
+        let dialog = open_quota();
+        assert_eq!(dialog.title().as_deref(), Some(texts.usage.quota_open));
+        let spin = |dialog: &gtk::Window, name| {
+            find_named(dialog.upcast_ref(), name)
+                .unwrap()
+                .downcast::<gtk::SpinButton>()
+                .unwrap()
+        };
+        assert!(find_named(dialog.upcast_ref(), "quota-enabled")
+            .unwrap()
+            .downcast::<gtk::Switch>()
+            .unwrap()
+            .is_active());
+        assert_eq!(spin(&dialog, "quota-limit").value(), 20.0);
+        assert_eq!(spin(&dialog, "quota-reset-day").value(), 1.0);
+        assert_eq!(spin(&dialog, "quota-warn").value(), 80.0);
+        assert!((spin(&dialog, "quota-used").value() - 12.4).abs() < 0.001);
+        assert!(has_label(dialog.upcast_ref(), texts.usage.quota_note));
+        screenshot(&dialog, &format!("quota-dialog-{tag}.png"));
+        escape(&dialog);
+        assert!(requests.try_recv().is_err(), "Escape sends no request");
+        let dialog = open_quota();
+        find_button(dialog.upcast_ref(), texts.cancel)
+            .unwrap()
+            .emit_clicked();
+        drain();
+        assert!(requests.try_recv().is_err(), "Cancel sends no request");
+        let dialog = open_quota();
+        dialog.close();
+        drain();
+        assert!(requests.try_recv().is_err(), "Close sends no request");
+        let dialog = open_quota();
+        // Invalid manual text keeps the dialog open and sends nothing.
+        spin(&dialog, "quota-limit").set_text("invalid");
+        let invalid_save = find_named(dialog.upcast_ref(), "quota-save")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        invalid_save.emit_clicked();
+        drain();
+        assert!(dialog.is_visible());
+        assert!(requests.try_recv().is_err(), "invalid quota sends nothing");
+        spin(&dialog, "quota-limit").set_value(25.0);
+        let save = find_named(dialog.upcast_ref(), "quota-save")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        save.emit_clicked();
+        save.emit_clicked();
+        let saved = next_request(&requests);
+        assert_eq!(
+            saved.request,
+            DaemonRequest::SetQuota {
+                lane_id: "vinn".into(),
+                quota: Some(LaneQuota {
+                    enabled: true,
+                    limit_bytes: 25_000_000_000,
+                    reset_day: 1,
+                    warn_percent: 80
+                })
+            }
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "double Save sends exactly one SetQuota, unchanged usage sends no correction"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "quota never changes the routing configuration"
+        );
+        // An enabled quota with edited usage sends one correction after SetQuota.
+        let dialog = open_quota();
+        spin(&dialog, "quota-used").set_value(16.0);
+        let save = find_named(dialog.upcast_ref(), "quota-save")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        save.emit_clicked();
+        save.emit_clicked();
+        assert!(
+            matches!(next_request(&requests).request, DaemonRequest::SetQuota { lane_id, quota: Some(_) } if lane_id.as_str() == "vinn")
+        );
+        assert_eq!(
+            next_request(&requests).request,
+            DaemonRequest::CorrectUsage {
+                lane_id: "vinn".into(),
+                used_bytes: 16_000_000_000
+            }
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "double Save sends one correction"
+        );
+        let dialog = open_quota();
+        spin(&dialog, "quota-used").set_value(17.0);
+        find_named(dialog.upcast_ref(), "quota-enabled")
+            .unwrap()
+            .downcast::<gtk::Switch>()
+            .unwrap()
+            .set_active(false);
+        let save = find_named(dialog.upcast_ref(), "quota-save")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        save.emit_clicked();
+        save.emit_clicked();
+        assert_eq!(
+            next_request(&requests).request,
+            DaemonRequest::SetQuota {
+                lane_id: "vinn".into(),
+                quota: None
+            }
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "disabled quota sends no correction"
+        );
+        detail.destroy();
+        window.destroy();
+        drain();
     }
 
     /// Scope selection and the preview gate on a profile with a lab rule.

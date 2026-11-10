@@ -6,6 +6,8 @@ use routelane::ipc::{
     DaemonEvent, DaemonRequest, DaemonResponse, DaemonResult, DaemonStatus, IpcError,
     IPC_PROTOCOL_VERSION,
 };
+use routelane::usage::{events::UsageEvent, service::UsageReport};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
@@ -88,6 +90,9 @@ pub struct UiSession {
     profiles: Vec<Profile>,
     result: Option<DaemonResult>,
     preview: Option<BoundPreview>,
+    usage: Option<UsageReport>,
+    events: Vec<UsageEvent>,
+    usage_requests: BTreeMap<String, DaemonRequest>,
 }
 
 /// A preview approves only the exact draft it was computed for, on the
@@ -117,6 +122,9 @@ impl UiSession {
             profiles: vec![],
             result: None,
             preview: None,
+            usage: None,
+            events: vec![],
+            usage_requests: BTreeMap::new(),
         }
     }
 
@@ -171,6 +179,14 @@ impl UiSession {
         )?;
         self.preview = None;
         Ok(effects)
+    }
+
+    pub fn usage(&self) -> Option<&UsageReport> {
+        self.usage.as_ref()
+    }
+    #[allow(dead_code)] // Task 8 event-history API.
+    pub fn events(&self) -> &[UsageEvent] {
+        &self.events
     }
 
     pub fn snapshot_known(&self) -> bool {
@@ -288,6 +304,38 @@ impl UiSession {
         request: DaemonRequest,
         submitted_profile: Option<Profile>,
     ) -> Result<Vec<UiEffect>, UiGateError> {
+        if matches!(
+            request,
+            DaemonRequest::GetUsage { .. }
+                | DaemonRequest::ListEvents { .. }
+                | DaemonRequest::SetQuota { .. }
+                | DaemonRequest::CorrectUsage { .. }
+                | DaemonRequest::ClearEvents
+        ) {
+            if !self.known
+                && !matches!(
+                    request,
+                    DaemonRequest::GetUsage { .. } | DaemonRequest::ListEvents { .. }
+                )
+            {
+                return Err(UiGateError::StateUnknown);
+            }
+            // Coalesce polling reads while a response is in flight.
+            if matches!(
+                request,
+                DaemonRequest::GetUsage { .. } | DaemonRequest::ListEvents { .. }
+            ) && self
+                .usage_requests
+                .values()
+                .any(|pending| pending == &request)
+            {
+                return Ok(vec![]);
+            }
+            let tracked = UiRequest::new(request.clone());
+            self.usage_requests
+                .insert(tracked.request_id.clone(), request);
+            return Ok(vec![UiEffect::Send(tracked)]);
+        }
         if matches!(
             request,
             DaemonRequest::GetStatus | DaemonRequest::ListProfiles | DaemonRequest::Subscribe
@@ -423,6 +471,9 @@ impl UiSession {
                     return vec![];
                 }
                 self.epoch = epoch;
+                self.usage_requests.clear();
+                self.usage = None;
+                self.events.clear();
                 self.known = false;
                 self.preview = None;
                 self.accepted_revision = None;
@@ -583,6 +634,37 @@ impl UiSession {
     }
 
     fn handle_response(&mut self, response: DaemonResponse) -> Vec<UiEffect> {
+        if let Some(request) = self.usage_requests.remove(&response.request_id) {
+            if response.protocol_version != IPC_PROTOCOL_VERSION {
+                return vec![];
+            }
+            if let Some(error) = response.error {
+                self.error = Some(error);
+                return vec![];
+            }
+            match (request, response.result) {
+                (DaemonRequest::GetUsage { .. }, Some(DaemonResult::Usage(report))) => {
+                    self.usage = Some(report)
+                }
+                (DaemonRequest::ListEvents { .. }, Some(DaemonResult::Events(events))) => {
+                    self.events = events
+                }
+                (DaemonRequest::ClearEvents, Some(DaemonResult::EventsCleared)) => {
+                    self.events.clear()
+                }
+                (
+                    DaemonRequest::SetQuota { .. } | DaemonRequest::CorrectUsage { .. },
+                    Some(DaemonResult::QuotaSaved),
+                ) => {}
+                _ => {
+                    self.error = Some(IpcError::new(
+                        "IPC_INVALID_RESPONSE",
+                        "unexpected usage reply",
+                    ))
+                }
+            }
+            return vec![];
+        }
         let matches_pending = self.pending.as_ref().is_some_and(|p| {
             p.stage == OperationStage::AwaitingReply
                 && p.request_id.as_ref() == Some(&response.request_id)
@@ -772,6 +854,61 @@ mod tests {
             UiEffect::Send(request) => request,
             other => panic!("expected send, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn usage_reads_do_not_block_or_change_save_state() {
+        use routelane::usage::events::EventCategory;
+        let mut s = session(true, false);
+        let before = s.save_state();
+        let usage = sent(
+            s.begin_request(DaemonRequest::GetUsage { fast_lane: None }, None)
+                .unwrap(),
+        );
+        assert!(!s.is_busy());
+        assert_eq!(s.save_state(), before);
+        s.begin_request(DaemonRequest::ApplyProfile(profile()), Some(profile()))
+            .unwrap();
+        let applying = s.operation();
+        let state = s.save_state();
+        let fast = sent(
+            s.begin_request(
+                DaemonRequest::GetUsage {
+                    fast_lane: Some("vinn".into()),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            fast.request,
+            DaemonRequest::GetUsage { fast_lane: Some(_) }
+        ));
+        let events = sent(
+            s.begin_request(
+                DaemonRequest::ListEvents {
+                    category: EventCategory::All,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        s.handle_daemon(DaemonToUi::Response {
+            epoch: 1,
+            response: DaemonResponse::success(
+                usage.request_id,
+                DaemonResult::Usage(UsageReport { lanes: vec![] }),
+            ),
+        });
+        assert_eq!(s.usage().unwrap().lanes.len(), 0);
+        s.handle_daemon(DaemonToUi::Response {
+            epoch: 1,
+            response: DaemonResponse::success(events.request_id, DaemonResult::Events(vec![])),
+        });
+        assert!(s.events().is_empty());
+        assert_eq!(s.operation(), applying);
+        assert_eq!(s.save_state(), state);
+        assert!(s.is_busy());
     }
 
     fn applied_response(id: &str, generation: u64) -> DaemonResponse {
