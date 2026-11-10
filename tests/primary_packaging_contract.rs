@@ -144,12 +144,34 @@ fn readme_documents_selective_scope_and_protocol_versions() {
         "usage-settings.json",
         "events-v1.jsonl",
         "never stops or throttles traffic",
+        "saved as schema version 4",
     ] {
         assert!(readme.contains(fact), "README must document {fact}");
     }
     assert_eq!(IPC_PROTOCOL_VERSION, 4);
     assert_eq!(RUNTIME_PROTOCOL_VERSION, 3);
     assert_eq!(routelane::config::CURRENT_SCHEMA_VERSION, 4);
+}
+
+#[test]
+fn rootless_ci_runs_every_gate_but_never_root_tests() {
+    let ci = read(".github/workflows/ci.yml");
+    for command in [
+        "cargo fmt --all -- --check",
+        "cargo clippy --all-targets -- -D warnings",
+        "cargo clippy --all-targets --features root-integration -- -D warnings",
+        "cargo test --all-targets --no-fail-fast",
+        "cargo test --test root --features root-integration --no-run",
+        "libgtk-4-dev",
+        "libadwaita-1-dev",
+    ] {
+        assert!(ci.contains(command), "CI must run {command}");
+    }
+    assert!(
+        !ci.contains("run-root-integration"),
+        "root tests never run in CI"
+    );
+    assert!(!ci.contains("sudo cargo"), "CI never runs cargo as root");
 }
 
 #[test]

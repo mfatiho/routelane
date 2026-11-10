@@ -447,7 +447,9 @@ warning requires `--acknowledge-routing-impact`. Without the flag, it explains
 the impact and returns exit code 6 before `ApplyProfile`, leaving the input file
 unchanged. An unavailable preview (`DAEMON_PREVIEW_UNAVAILABLE`) always refuses
 with exit code 4, even with the flag. Apply is sent once; a timeout is reported
-and never replayed.
+and never replayed. The CLI never rewrites its input file, so a
+migrated document asks for the flag on every run until it is saved as schema version 4
+(for example by opening and saving it in the desktop application).
 
 CLI exit codes:
 

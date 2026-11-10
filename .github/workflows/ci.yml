@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  BUILD_DEPS: libgtk-4-dev libadwaita-1-dev pkg-config nftables iproute2
+
+jobs:
+  lint:
+    name: Format and Clippy (stable)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK4/Libadwaita build dependencies (libgtk-4-dev libadwaita-1-dev)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $BUILD_DEPS
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features root-integration -- -D warnings
+
+  test:
+    name: Rootless tests (Rust ${{ matrix.rust }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.87 is the declared rust-version (MSRV) in Cargo.toml.
+        rust: ["1.87", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK4/Libadwaita build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $BUILD_DEPS
+      - run: rustup toolchain install ${{ matrix.rust }} --profile minimal && rustup default ${{ matrix.rust }}
+      # Root/kernel tests run only inside an approved disposable VM, never here.
+      - run: cargo test --all-targets --no-fail-fast
+      - run: cargo test --test root --features root-integration --no-run
