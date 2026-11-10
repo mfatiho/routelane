@@ -2,9 +2,9 @@
 
 RouteLane is a Linux desktop application for policy-based multi-lane routing.
 It can route selected domains, IP addresses, CIDR ranges, or applications
-through different network interfaces. While a profile is active, traffic that
-matches no rule currently leaves through the primary connection; leaving it to
-the operating system instead is being implemented (see
+through different network interfaces. By default, traffic that matches no
+enabled rule keeps the operating system's route. Routing that traffic through
+the primary connection is an explicit choice (see
 [Unmatched traffic](#unmatched-traffic-selective-routing)).
 
 Current capabilities:
@@ -141,19 +141,21 @@ authorization lifetime, and a missing desktop Polkit agent yields
 
 ### Primary connection and automatic failover
 
-In Connections, choose which connection carries traffic that no rule assigns,
-or keep following the system default, and order the approved backups.
+In Connections, choose the primary connection for managed traffic, or follow
+the system default, and order the approved backups. In `PreserveSystem`, only
+rule-matched traffic uses RouteLane lanes; `Direct` uses the primary connection.
+`UsePrimary` also manages unmatched internet traffic.
 Changing the primary asks for confirmation; Cancel and Escape change nothing.
 Enabling the profile requests one Polkit authorization that covers exactly
 that policy, those connections and that user for the current boot. If the
 primary loses carrier, its address or its default route, the helper sends new
-connections through the first available backup without another prompt, and
-returns to the primary once it has been stable for five seconds. Any change
-to the policy, the connections or the user needs a fresh authorization. An
-address family with no available approved connection is blocked instead of
-leaving through another interface. Existing connections are not moved.
-Overview shows the saved preference separately from the verified effective
-connection.
+managed connections through the first available backup without another prompt,
+and returns to the primary once it has been stable for five seconds. Any change
+to the policy, the connections or the user needs a fresh authorization. If an
+address family has no available approved connection, its managed traffic is
+blocked instead of leaving through another interface. Existing connections
+are not moved. Overview shows the saved preference separately from the verified
+effective connection.
 
 Failover reacts to local link evidence (carrier, address and default-route
 loss), not to internet reachability: a link that stays up while the upstream
@@ -167,19 +169,68 @@ link evidence is acted on at once.
 Every schema-version-4 profile records what happens to traffic that matches no
 enabled rule in `routing.unmatched_traffic`:
 
-| Value | Intended behavior |
+| Value | Behavior |
 | --- | --- |
 | `PreserveSystem` | Unmatched traffic keeps the operating system's own routing; RouteLane does not mark, NAT or reroute it. Default for new and migrated profiles. |
 | `UsePrimary` | Unmatched internet traffic is also sent through the primary connection and its approved backups. Requires the user's explicit choice. |
 
-**Status:** the setting is stored, validated and migrated, but the kernel plan
-does not use it yet. Until the selective routing work is complete, an active
-profile sends unmatched traffic through the primary connection whatever the
-value, so local bridges such as Multipass, Docker or other VPN networks can be
-affected. The GUI does not offer the choice yet. The design and plan are
-[docs/superpowers/specs/2026-10-22-selective-routing-design.md](docs/superpowers/specs/2026-10-22-selective-routing-design.md)
-and
-[docs/superpowers/plans/2026-10-22-selective-routing.md](docs/superpowers/plans/2026-10-22-selective-routing.md).
+The kernel plan uses this setting. `UsePrimary` retains the previous behavior;
+it is never selected automatically for new or migrated profiles. The GUI labels
+`Direct` as “Use the primary connection” / “Ana hattı kullan”; it does not
+bypass RouteLane through the operating system.
+
+In `PreserveSystem`, unmatched traffic carrying another tool's packet or
+connection mark, such as a VPN mark, is left untouched. An explicit `Route`
+or `Direct` match on that traffic is rejected as an unsupported conflict,
+never re-marked. `Block` rules still apply. During a transition, the temporary
+guard holds back only the managed scope: the union of active and pending
+explicit rules and RouteLane-owned flows. Unmatched traffic keeps flowing.
+Entering or leaving `UsePrimary` keeps a broad guard.
+
+Connections offers an “Other traffic” (“Diğer trafik”) selector with choices
+“Route only matching rules” (“Yalnız kuralları yönlendir”) and “Also route
+other traffic through the primary” (“Diğer trafiği de ana hatta yönlendir”).
+A change asks for confirmation; Cancel, Escape or closing the dialog changes
+nothing. Every GUI activation first requests a read-only preview. The migration
+notice, `UsePrimary` and any preview warnings require confirmation before
+anything is saved or applied. If the preview is unavailable, nothing is saved
+or applied. Overview shows saved scope separately from helper-verified applied
+scope, including “Other traffic: managed by the operating system”.
+
+The daemon IPC request `PreviewProfile` returns
+`RoutingPreview { policy_hash, warnings }` for the exact profile and resolution
+snapshot. `LocalNetworkRule { rule_id, network }` warns when an enabled
+source-`Any` `Route`, `Direct` or `Block` rule overlaps a network the helper
+observes as directly connected, such as a lab or VM bridge.
+`AllTrafficRule { rule_id }` warns for an enabled source-`Any`, target-`Any`
+rule. Local or lab access covered by an explicit rule follows that rule even
+in `PreserveSystem`; edit or disable the rule if that is unintended. The
+preview describes local policy only; it does not prove a site or lab is
+reachable.
+
+[Selective routing verification](docs/selective-routing-verification.md)
+records PASS evidence only in an Ubuntu 24.04 x86_64 disposable VM, including
+lab/unmatched traffic, explicit lanes, guarded rollback, foreign marks,
+schema-2 journal cleanup and the installed package's system-bus/Polkit
+acceptance with a test Polkit rule. The interactive Polkit agent, Debian,
+Fedora and aarch64 are **NOT VERIFIED**; the record lists the remaining gaps. The [design](docs/superpowers/specs/2026-10-22-selective-routing-design.md)
+and [plan](docs/superpowers/plans/2026-10-22-selective-routing.md) describe the
+feature decisions.
+
+### Protocol versions and upgrades
+
+Configuration and desired-profile documents use schema version 4. Clients
+and the daemon use IPC protocol 3; runtime activation uses runtime protocol 3,
+with helper journal version 3. A protocol-2 GUI or CLI request is rejected with
+`IPC_UNSUPPORTED_PROTOCOL_VERSION`. A helper that cannot answer
+`GetRuntimeProtocol` with 3 causes `DAEMON_HELPER_PROTOCOL_MISMATCH` before any
+configuration save or kernel change. Install matching daemon and helper versions.
+
+A schema-2 helper journal from an older RouteLane installation is cleanup-only.
+Read-only `Inspect` reports `DAEMON_LEGACY_CLEANUP_REQUIRED`, and modern
+activation is refused. Authorized cleanup removes exactly the ownership-verified
+RouteLane resources; then activate the profile again with fresh authorization.
+Sessions RouteLane marked earlier are not migrated; open new connections.
 
 ## Build
 
@@ -335,6 +386,7 @@ routelanectl doctor
 routelanectl doctor --json
 routelanectl apply-profile ./profile.json
 routelanectl apply-profile ./config.json --profile Work
+routelanectl apply-profile ./config.json --profile Work --acknowledge-routing-impact
 routelanectl deactivate
 ```
 
@@ -342,6 +394,29 @@ routelanectl deactivate
 commands; `doctor` runs local installation checks. Its Phase 1 surface is intentionally limited to the commands above. `status` also prints
 the runtime phase and the preferred and effective exit for each address
 family.
+
+```text
+routelanectl apply-profile <config.json> [--profile <id-or-name>] [--acknowledge-routing-impact]
+```
+
+`apply-profile` always requests a read-only preview before `ApplyProfile`.
+A migrated document (`routing_notice_pending`), `UsePrimary`, or any preview
+warning requires `--acknowledge-routing-impact`. Without the flag, it explains
+the impact and returns exit code 6 before `ApplyProfile`, leaving the input file
+unchanged. An unavailable preview (`DAEMON_PREVIEW_UNAVAILABLE`) always refuses
+with exit code 4, even with the flag. Apply is sent once; a timeout is reported
+and never replayed.
+
+CLI exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success (doctor may still report warnings) |
+| 2 | Invalid command or arguments |
+| 3 | Invalid configuration or profile selection |
+| 4 | Daemon/IPC failure, including unavailable preview or timeout |
+| 5 | At least one doctor installation check failed |
+| 6 | Routing-impact acknowledgement required; nothing applied |
 
 `apply-profile` reads the same schema-version-4 configuration document as the
 desktop application. Schema-version-3, version-2 and legacy documents are
@@ -457,14 +532,19 @@ kernel, system-bus/Polkit, upgrade, reboot and removal runs for the primary
 failover work (26.04 with intermittent failures in two counter- and
 threshold-based root tests). Debian, Fedora (the rpm was only built in a
 container), aarch64, the interactive Polkit agent, GTK launch per distribution
-and CI are **NOT VERIFIED**. Selective routing has no kernel evidence yet.
-Details: [docs/primary-failover-verification.md](docs/primary-failover-verification.md).
+and CI are **NOT VERIFIED**. These are primary-failover results, not selective
+routing release validation. Selective routing has Ubuntu 24.04 x86_64 VM kernel
+and system-bus evidence only; its interactive Polkit agent, Debian, Fedora and
+aarch64 gates remain **NOT VERIFIED**. Details:
+[primary failover verification](docs/primary-failover-verification.md) and
+[selective routing verification](docs/selective-routing-verification.md).
 
 ## Testing
 
 See [the reliability audit](docs/reliability-audit.md) for earlier fixes and
-[the failover verification record](docs/primary-failover-verification.md) for
-the current kernel, package and distribution evidence. Historical results are
+[the failover verification record](docs/primary-failover-verification.md) and
+[selective routing verification](docs/selective-routing-verification.md) for
+kernel, package and distribution evidence. Historical results are
 not current evidence; rerun the commands below.
 
 Rootless checks:

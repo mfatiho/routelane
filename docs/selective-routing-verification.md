@@ -1,7 +1,7 @@
 # Seçici yönlendirme — doğrulama kaydı
 
 Bu belge planın (`docs/superpowers/plans/2026-10-22-selective-routing.md`)
-Task 9 gerçek kernel kanıtını tutar. Her satır ya **PASS** (komut, ortam ve
+Task 9 gerçek kernel ve Task 10 system-bus kanıtını tutar. Her satır ya **PASS** (komut, ortam ve
 gözlenen çıktı ile), ya **NOT VERIFIED** (altyapı yok ya da çalıştırılmadı)
 olarak yazılır. Exit 77, “derlendi” ve rootless test PASS değildir.
 
@@ -70,9 +70,33 @@ guard'ın IPv4 lab'ı geçiş sırasında tuttuğu bu koşuda ayrıca gösterilm
 
 Koşular sonrası `ip netns list` boş, `/tmp` altında run durumu yok.
 
+### Gerçek system bus ve Polkit (Task 10, 10 Kasım 2026)
+
+`routelane_0.1.1_amd64.deb` (sha256
+`5809d7efe6e5c2d4dfb2587cad7d9676011a18fe22d9999587b214526ffc8815`,
+`packaging/deb/build-deb.sh`, `e9bb59b` + README/contract çalışma ağacı)
+yalnız VM içine kuruldu; `ROUTELANE_DISPOSABLE_VM=$(hostname) sh
+system_bus_acceptance.sh routelane_0.1.1_amd64.deb` → **PASS**
+(`t10-vm-system-bus.log`). Betik protocol 3 ve açık `UsePrimary` ile
+güncellendi (geniş yedeğe geçiş senaryosu bu opt-in'e aittir).
+
+| Kanıt | Sonuç |
+|---|---|
+| Root olmayan kullanıcı `GetRuntimeProtocol` = 3 okur, yetki gerekmez | PASS |
+| Yetkili `ActivateRuntime` Armed; durum `unmatched_traffic: "UsePrimary"` raporlar | PASS |
+| Gerçek servis run'a ait netns içinde; `src_valid_mark` yalnız hat arayüzlerinde (all=0) | PASS |
+| Yetki geri alınınca Cleanup, politika değişimi, hat ekleme, yabancı UID reddedilir (AccessDenied) | PASS |
+| Taşıyıcı kaybında yetkisiz otomatik yedeğe geçiş, root olmayan kullanıcıya `RuntimeChanged` | PASS |
+| `kill -9` sonrası systemd yeniden başlatır, Armed sürer; geri dönüş 5 s sonra | PASS |
+| Yetkili cleanup durumu kaldırır, `src_valid_mark=0` geri yüklenir; teardown 0 namespace/paket/kullanıcı | PASS |
+
+Polkit kararı test kuralıyla (`polkit.addRule`) verildi; etkileşimli
+masaüstü Polkit ajanı **NOT VERIFIED**.
+
 ### NOT VERIFIED
 
-- Gerçek system-bus/Polkit etkileşimli ajan, paket kurulumu ve `tests/root/system_bus_acceptance.sh` (bu turda çalıştırılmadı).
+- Etkileşimli Polkit ajanı ve GUI'nin kurulu paketle gerçek oturumu.
+- Paket yükseltmesi (eski sürüm → bu sürüm) silahlıyken; betiğin ikinci `.deb` yolu bu turda çalıştırılmadı.
 - Daemon/helper sürüm karışımı gerçek bus üzerinde (yalnız rootless contract).
 - V1 legacy cleanup ve V3 kesinti/yeniden başlatma gerçek kernel'de (rootless birim testleri var).
 - Uygulama cgroup seçimi seçici modda gerçek kernel'de.

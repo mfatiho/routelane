@@ -122,6 +122,34 @@ fn unit_values<'a>(unit: &'a str, key: &str) -> Vec<&'a str> {
 }
 
 #[test]
+fn readme_documents_selective_scope_and_protocol_versions() {
+    let readme = read("README.md");
+    for fact in [
+        "--acknowledge-routing-impact",
+        "PreserveSystem",
+        "UsePrimary",
+        "DAEMON_HELPER_PROTOCOL_MISMATCH",
+        "IPC_UNSUPPORTED_PROTOCOL_VERSION",
+        "DAEMON_LEGACY_CLEANUP_REQUIRED",
+        "DAEMON_PREVIEW_UNAVAILABLE",
+        "docs/selective-routing-verification.md",
+        "schema version 4",
+        "IPC protocol 3",
+        "runtime protocol 3",
+        "helper journal version 3",
+        "exit code 6",
+        "Ubuntu 22.04/24.04/26.04",
+        "Debian 12/13",
+        "Fedora 43/44",
+    ] {
+        assert!(readme.contains(fact), "README must document {fact}");
+    }
+    assert_eq!(IPC_PROTOCOL_VERSION, 3);
+    assert_eq!(RUNTIME_PROTOCOL_VERSION, 3);
+    assert_eq!(routelane::config::CURRENT_SCHEMA_VERSION, 4);
+}
+
+#[test]
 fn packages_ship_helper2_policy_and_consistent_versions() {
     // Each package installs every owned file exactly once, with one mode.
     assert_eq!(sorted(deb_installs()), expected(), "deb file list");

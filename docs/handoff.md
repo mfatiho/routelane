@@ -2,6 +2,36 @@
 
 Tarih: 22 Ekim 2026. Bu belge, devralan geliştiricinin geçmiş kararları bulması ve yarım kalan işi güvenli şekilde sürdürmesi içindir. Kalıcı devir kaydı `docs/handoff.md` dosyasıdır; `/tmp` kopyasına veya oturumlar arası asistan hafızasına bağımlı değildir. Ayrıntılı değişiklik geçmişinin kaynağı Git ve aşağıdaki depo belgeleridir.
 
+## En son kayıt — seçici yönlendirme Task 9–10 (10 Kasım 2026)
+
+- Kullanıcı açık onayıyla tek kullanımlık VM `routelane-test-u2404-20261109` (Ubuntu 24.04.5, 6.8.0-147) oluşturuldu; root testleri ve paket kurulumu yalnız onun içinde. Diğer Multipass VM'lerine, host ağına ve kurulu pakete dokunulmadı.
+- `e9bb59b` Task 9: `tests/root/selective_routing.rs` + harness'e hat olmayan lab köprüsü (`10.65.201.0/24`, `fd00:65::/64`); 5 gerçek trafik senaryosu PASS, `UsePrimary` taban RED 5/5 gerçek assertion'da; tam root suite 25/25 standart ve strict RPF (bir strict koşuda mevcut bir senaryoda tek prob fazlası → aralıklı, çözülmedi). Kanıt: `docs/selective-routing-verification.md`.
+- Task 10: README seçici kapsam, önizleme/onay, CLI `--acknowledge-routing-impact` (çıkış 6), protocol 3, schema-2 cleanup→yeniden yetkilendirme ile güncellendi (taslağı sous-chef:fire/Codex yazdı, satır satır incelendi); paket contract'ı README/sürüm sabitlerini sabitler. `system_bus_acceptance.sh` protocol 3 + açık `UsePrimary` ile VM'de kurulu `.deb` (sha256 `5809d7ef…`) üzerinde PASS (test Polkit kuralı).
+- Doğrulama (10 Kasım): rootless suite 529 passed, 1 bilinen Snap hatası, 2 ignored; fmt, clippy (iki özellik seti), `git diff --check`, release build, GTK smoke, root no-run temiz.
+- NOT VERIFIED: etkileşimli Polkit ajanı, silahlıyken paket yükseltmesi, gerçek bus'ta sürüm karışımı, V1/V3 kesinti gerçek kernel'de, seçici modda uygulama cgroup'u, gerçek D-Bus topology yakalaması, Debian/Fedora/aarch64, CI.
+- Host paket güncellemesi, canlı RouteLane'in yeniden etkinleştirilmesi, mevcut lab kuralının düzenlenmesi ayrı kullanıcı kararıdır; bu plan yürütmesinden çıkarılmaz. Push yapılmadı.
+
+### Sonraki adım
+
+Son bütün-dal incelemesi (öz-inceleme; istenirse sous-chef:taste ile çapraz model), ardından onaylı kullanım/olay tasarımının (`docs/superpowers/specs/2026-11-09-usage-and-events-design.md`) uygulama planı (`writing-plans`).
+
+## En son kayıt — seçici yönlendirme Task 3–8 tamamlandı (9 Kasım 2026)
+
+- Plan `docs/superpowers/plans/2026-10-22-selective-routing.md` main üzerinde inline (alt ajan/worktree yok) yürütülüyor; ayrıntılı karar defteri `.superpowers/sdd/2026-10-22-selective-routing/progress.md` (yerel). Task 1–8 tamam, ledger'da `Task N: complete` satırları var:
+  - `7a7c636` Task 3: journal V3, cleanup-only V2; boş V2 journal canlı kaynakları sahiplenmez.
+  - `0b5164a` Task 4: `KernelPlan.unmatched_traffic`; PreserveSystem'de eşleşmeyen trafik işaretsiz/NAT'sız OS'ye kalır, foreign mark yalnız açık Route/Direct kapsamında reddedilir.
+  - `9284a96` Task 5: seçici guard yalnız active∪pending açık kural kapsamı + sahip akışlar; aktivasyon fazında guard değiştirilen neslin kapsamını da tutar (`render_activated_nft_document`, journal V3 activated fingerprint aynı renderer).
+  - `dceda46` Task 6: IPC/runtime protocol 3, helper `GetRuntimeProtocol` ön kontrolü (kayıt/cleanup/orphan öncesi), `RuntimeStatus.unmatched_traffic` helper kaydından; daemon plan moduyla eşleştirir.
+  - `560c843` Task 7: salt okunur `PreviewProfile`/`routing_preview` (bağlı ağ çakışması, Any/Any uyarısı); helper bus sınırında taze topology; CLI `--acknowledge-routing-impact`, onaysız çıkış kodu 6, önizleme yoksa her zaman ret.
+  - `c8da514` Task 8: GTK `routing-scope` seçici, önizleme→etki onayı (draft+epoch bağlı, tek kullanımlık), Genel Bakış kayıtlı/uygulanan kapsam ayrı, Direct = “Ana hattı kullan”. TR/EN ekran görüntüleri `.superpowers/sdd/2026-10-22-selective-routing/screens/`.
+- Doğrulama (9 Kasım, `c8da514`): `cargo test --all-targets --no-fail-fast` → 528 passed, 1 failed (önceden bilinen `ui::desktop_catalog::tests::sandbox_launcher_is_not_selectable_as_a_host_application`, Snap symlink), 2 ignored; fmt ve clippy (default + root-integration) temiz; izole GTK smoke (`scripts/run-gtk-smoke.sh`) 1 passed. Suite tam yeşil değil.
+- NOT VERIFIED: gerçek kernel/nft trafiği, helper'ın gerçek topology yakalaması (`inspect_with_observed_networks`), gerçek system-bus/Polkit, Debian/Fedora/aarch64. Onaylı tek kullanımlık VM yok (`multipass list`: yalnız kullanıcının central/master/slave/pits VM'leri; dokunulmadı).
+- Push yapılmadı; main origin'in önünde. Host kurulum/servis/profil/canlı ağ değişmedi.
+
+### Sonraki adım
+
+Task 9 (gerçek kernel/lab/yükseltme kabulü) yeni bir `routelane-test-*` tek kullanımlık VM gerektirir; **kullanıcının açık onayı olmadan VM oluşturma**. Onay gelirse `tests/root/selective_routing.rs` + `docs/selective-routing-verification.md`; gelmezse compile-only + NOT VERIFIED kaydı. Ardından Task 10 (README, paket contract, `.deb` içerik kontrolü, handoff) ve son bütün-dal incelemesi. Sonra onaylı kullanım/olay tasarımının (`docs/superpowers/specs/2026-11-09-usage-and-events-design.md`) uygulama planı.
+
 ## En son kayıt — seçici yönlendirme uygulama planı (22 Ekim 2026)
 
 - Kullanıcı son “Devam et” ile yazılı seçici yönlendirme tasarımını onayladı. `writing-plans` kullanılarak `docs/superpowers/plans/2026-10-22-selective-routing.md` yazıldı; tasarımın durum satırı onaylandı olarak güncellendi. Yalnız bu iki belge `d09124d` (`docs(routing): plan selective routing implementation`) commit'ine alındı. Önceki tasarım commit'i `8e96baf` korunuyor.
