@@ -308,6 +308,8 @@ pub struct Texts {
     pub tray_quit: &'static str,
     pub tray_tooltip: &'static str,
     pub settings_title: &'static str,
+    pub about_title: &'static str,
+    pub version_title: &'static str,
     pub health_title: &'static str,
     pub lane_name: &'static str,
     pub delete_lane: &'static str,
@@ -385,6 +387,8 @@ impl LanguageTexts for Language {
                 tray_quit: "Çıkış",
                 tray_tooltip: "RouteLane",
                 settings_title: "Tercihler",
+                about_title: "Hakkında",
+                version_title: "Sürüm",
                 health_title: "Bağlantı Sağlığı",
 
                 lane_name: "Rota adı",
@@ -458,6 +462,8 @@ impl LanguageTexts for Language {
                 tray_quit: "Quit",
                 tray_tooltip: "RouteLane",
                 settings_title: "Preferences",
+                about_title: "About",
+                version_title: "Version",
                 health_title: "Connection Health",
 
                 lane_name: "Lane name",

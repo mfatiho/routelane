@@ -179,8 +179,23 @@ pub fn build_general_settings_dialog(
     });
     language_group.add(&language);
     page.add(&language_group);
+    let about = adw::PreferencesGroup::builder()
+        .title(texts.about_title)
+        .build();
+    let version = adw::ActionRow::builder()
+        .title(texts.version_title)
+        .subtitle(app_version())
+        .build();
+    version.set_widget_name("app-version");
+    about.add(&version);
+    page.add(&about);
     dialog.add(&page);
     dialog
+}
+
+/// The version of this build, from Cargo.toml.
+pub fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 #[cfg(test)]

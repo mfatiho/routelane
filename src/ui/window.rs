@@ -1640,6 +1640,14 @@ mod tests {
             .emit_clicked();
         drain();
         let preferences = transient(&window);
+        let version = find_named(preferences.upcast_ref(), "app-version")
+            .expect("Preferences shows the application version")
+            .downcast::<adw::ActionRow>()
+            .unwrap();
+        assert_eq!(
+            version.subtitle().as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
         let language = find_named(preferences.upcast_ref(), "language-choice")
             .unwrap()
             .downcast::<adw::ComboRow>()
