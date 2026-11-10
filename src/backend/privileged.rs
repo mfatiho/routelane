@@ -9720,6 +9720,109 @@ mod tests {
         fixture
     }
 
+    /// Knows the fixture's real identities and records every write.
+    #[derive(Clone, Default)]
+    struct RecordingRpf {
+        identities: std::collections::BTreeMap<String, crate::backend::InterfaceIdentity>,
+        values: Arc<Mutex<std::collections::BTreeMap<String, u8>>>,
+        writes: Arc<Mutex<Vec<(String, u8)>>>,
+    }
+
+    impl super::MarkAwareRpfBackend for RecordingRpf {
+        fn identity(
+            &mut self,
+            name: &str,
+        ) -> Result<crate::backend::InterfaceIdentity, PrivilegedError> {
+            self.identities
+                .get(name)
+                .cloned()
+                .ok_or_else(|| PrivilegedError::new("interface no longer exists"))
+        }
+        fn rp_filter(&mut self, _: &str) -> Result<u8, PrivilegedError> {
+            Ok(1)
+        }
+        fn src_valid_mark(&mut self, name: &str) -> Result<u8, PrivilegedError> {
+            Ok(*self.values.lock().unwrap().get(name).unwrap_or(&0))
+        }
+        fn set_src_valid_mark(
+            &mut self,
+            identity: &crate::backend::InterfaceIdentity,
+            value: u8,
+        ) -> Result<(), PrivilegedError> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(identity.name.clone(), value);
+            self.writes
+                .lock()
+                .unwrap()
+                .push((identity.name.clone(), value));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn v2_cleanup_restores_journaled_interface_settings_exactly() {
+        let identities = up().interface_identities();
+        for (bytes, key, current, expected_writes) in [
+            // Committed receipt, value still ours: restored.
+            (
+                include_bytes!("../../tests/fixtures/legacy-v2/committed.json").as_slice(),
+                "interface_settings",
+                1,
+                vec![("eth0".to_owned(), 0)],
+            ),
+            // A receipt journaled for an interrupted pending transition.
+            (
+                include_bytes!("../../tests/fixtures/legacy-v2/pending.json").as_slice(),
+                "pending_interface_settings",
+                1,
+                vec![("eth0".to_owned(), 0)],
+            ),
+            // Already back at its previous value: nothing to write.
+            (
+                include_bytes!("../../tests/fixtures/legacy-v2/committed.json").as_slice(),
+                "interface_settings",
+                0,
+                vec![],
+            ),
+        ] {
+            let mut journal: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            journal[key] = serde_json::json!([{
+                "identity": identities["eth0"],
+                "previous": 0,
+                "applied": 1,
+            }]);
+            let fixture = v2_fixture(&serde_json::to_vec(&journal).unwrap());
+            let settings = RecordingRpf {
+                identities: identities.clone(),
+                ..RecordingRpf::default()
+            };
+            settings
+                .values
+                .lock()
+                .unwrap()
+                .insert("eth0".to_owned(), current);
+            let mut backend = CommandPrivilegedBackend::with_store(
+                FakeCommandExecutor {
+                    state: Arc::clone(&fixture.kernel),
+                },
+                fixture.store.clone(),
+            )
+            .with_interface_settings(settings.clone())
+            .with_runtime_environment(fixture.environment.clone());
+            let response = backend.cleanup().unwrap();
+            assert!(response.cleaned, "{key}");
+            assert_eq!(*settings.writes.lock().unwrap(), expected_writes, "{key}");
+            assert!(
+                response.diagnostics.is_empty(),
+                "{key}: {:?}",
+                response.diagnostics
+            );
+            assert!(fixture.store.state.lock().unwrap().is_none());
+        }
+    }
+
     #[test]
     fn v2_inspect_and_refresh_never_mutate() {
         for bytes in [
