@@ -166,9 +166,11 @@ impl UsageService {
                     .last_save
                     .is_none_or(|last| now.saturating_sub(last) >= 30))
         {
-            match state.store.save() {
-                Ok(()) => state.last_save = Some(now),
-                Err(error) => log::warn!("save usage samples: {error}"),
+            // A failed attempt also restarts the 30 s cadence, so a full or
+            // read-only disk is retried (and logged) twice a minute, not every second.
+            state.last_save = Some(now);
+            if let Err(error) = state.store.save() {
+                log::warn!("save usage samples: {error}");
             }
         }
         crossings

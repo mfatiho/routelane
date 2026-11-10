@@ -639,6 +639,29 @@ fn same_second_samples_carry_into_the_next_rate() {
 }
 
 #[tokio::test]
+async fn a_failing_save_is_retried_on_the_thirty_second_cadence() {
+    let f = fixture();
+    let lanes = [lane("vinn")];
+    // A non-empty directory where the store file belongs makes every save fail.
+    let path = f._dir.path().join("usage-v1.json");
+    let _ = std::fs::remove_file(&path);
+    std::fs::create_dir_all(path.join("blocker")).unwrap();
+    let start = f.clock.load(Ordering::SeqCst);
+    *f.counters.0.lock().unwrap() = Some(InterfaceSample {
+        ifindex: 1,
+        rx_bytes: 1000,
+        tx_bytes: 100,
+    });
+    assert!(f.usage.tick(&lanes).is_empty());
+    f.clock.store(start + 1, Ordering::SeqCst);
+    assert!(
+        f.usage.interval() >= std::time::Duration::from_secs(29),
+        "a failed save must not make the sampler retry every second: {:?}",
+        f.usage.interval()
+    );
+}
+
+#[tokio::test]
 async fn fast_ticks_write_at_most_every_thirty_seconds_and_flush_on_demand() {
     use std::os::unix::fs::MetadataExt;
     let f = fixture();
