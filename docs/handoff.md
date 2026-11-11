@@ -2,6 +2,21 @@
 
 Tarih: 22 Ekim 2026. Bu belge, devralan geliştiricinin geçmiş kararları bulması ve yarım kalan işi güvenli şekilde sürdürmesi içindir. Kalıcı devir kaydı `docs/handoff.md` dosyasıdır; `/tmp` kopyasına veya oturumlar arası asistan hafızasına bağımlı değildir. Ayrıntılı değişiklik geçmişinin kaynağı Git ve aşağıdaki depo belgeleridir.
 
+## En son kayıt — korumalı geri alma, strict-RPF ve yeni arayüz (11 Kasım 2026)
+
+- Denetim planı Görev 9–10, kullanıcının onayladığı tek kullanımlık VM `routelane-test-u2404-20261111` (Ubuntu 24.04 x86_64) ile tamamlandı; VM iş sonunda silindi. Defter: `.superpowers/sdd/2026-11-10-audit-fixes/progress.md`.
+- Görev 9 (E5) `9950eac`: geri alma önce yalnız korumadan oluşan belgeyle tabloyu atomik değiştirir, sonra kuralları/rotaları kurar, en son sahipli kural setini geri yükler. Çökme için `RestoreGuard` evresi (parmak izi journal'daki aktif plandan hesaplanır; journal 3 değişmedi). Gerçek kernel: eski kodla RED (`managed destination escaped … 10.10.2.2`), yeni kodla PASS.
+- Bağımsız inceleme (Fable 5.2, ayrı bağlam): 0 Critical, 2 Important, 5 Minor. I1 düzeltildi `0bf1883`: geri alma hiç tamamlanamazsa yetkili `Cleanup`, kurtarmanın tam sahiplik kanıtı geçerse journal'daki planların kaynaklarını kaldırır; kanıt yoksa hiçbir şeye dokunmaz. I2 için eksik çökme penceresi testleri eklendi. M1, M3, M4 defterde ertelendi.
+- Görev 10 (E6) `bae6b0b`: aralıklı strict-RPF hatası ürün değil ölçüm hatasıydı; sink'in çerçeve sayacı IPv6 link-local trafiğini (RS/MLD) sayıyordu (tanı derlemesi: fazlalık tam olarak `Ip6InReceives`, IPv4 sayaçları sabit). Sayaç artık sink namespace'inin IPv4 `Ip InReceives` değeri. Ayrıca `runtime_refresh` hız eşiği (`exchanges > 20`) geri dönüş sonrası en az 5 değişim şartına çevrildi.
+- Kanıt (11 Kasım, son ikililer root `1293f433…`, helper `cd977b5a…`, `.deb` `0bf1883`'ten): tam root suite standart ve strict 26/26; system-bus + Polkit kabulü PASS; yavaş (5 s) Polkit kararı eşzamanlı `Inspect`'i bloklamıyor (0,13 s). Ayrıntı `docs/selective-routing-verification.md`.
+- **Yeni açık bulgu (hipotez, doğrulanmadı):** `UsePrimary` modunda geçici koruma geniş `reject` uygular ve yalnız `ct mark 0` oturumlarını geçirir; çalışma zamanı geçişinin koruma aralığında RouteLane'e ait kurulu bir yedek UDP akışının paketi reddedilebilir (`send` → `EPERM`; 15 koşuda 1). TCP yeniden gönderimle sürer. "Mevcut yedek akışlar koparılmaz" kuralıyla çelişebilir; koruma sayaçlı kernel kanıtı ve tasarım kararı gerekir.
+- Arayüz `acd3023` (kullanıcı isteği, advisor danışılarak; Codex bileti, baş aşçı incelemesi): Genel Bakış özet ekranı (Dikkat gerektirenler, trafik çıkışı IPv4/IPv6 ve kayıtlı/uygulanan kapsam ayrı, bağlantılar, tanım sayıları); veri kullanımı her bağlantının kendi satırında (son 7 gün, kota çubuğu); olay geçmişi ayrı "Olaylar" sekmesinde. GTK smoke TR/EN geçti, ekran görüntüleri `.superpowers/sdd/2026-11-10-audit-fixes/ui-screens/`.
+- Rootless suite (11 Kasım, `0bf1883`): 608 passed, 0 failed; fmt, clippy (iki özellik seti), diff-check temiz. Push yapılmadı; CI çalışmadı (NOT VERIFIED).
+
+### Sonraki adım
+
+Kullanıcı kararı: `UsePrimary` korumasının kurulu sahipli akışlara davranışı (yeni VM onayıyla sayaçlı kanıt, sonra tasarım). Ardından kullanım Plan 2 için `writing-plans`. Push/CI, MSRV 1.89 ve `uuid` sabitlemesi hâlâ kullanıcıda.
+
 ## En son kayıt — inceleme bulguları düzeltmeleri (10 Kasım 2026)
 
 - 10 Kasım proje incelemesinin 5 hatası (H1–H5) ve 11 eksiği (E1–E11) `docs/superpowers/plans/2026-11-10-audit-fixes.md` (`4e41925`) planına alındı; kullanıcı `/sous-chef:fire` ile yürüttü (Codex biletleri, baş aşçı satır satır inceleme ve yerel doğrulama). Defter: `.superpowers/sdd/2026-11-10-audit-fixes/progress.md`.

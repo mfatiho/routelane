@@ -96,9 +96,10 @@ routelane-daemon  --(system D-Bus + Polkit io.github.routelane.apply)-->  routel
 ## Current state (changes often; verify every session)
 
 - Primary/failover: all 12 plan tasks committed (through `55906e8`); evidence in `docs/primary-failover-verification.md`.
-- Selective routing: all 10 tasks committed (`7a7c636` … `69928ac`, review fix `1bf11cc`); Ubuntu 24.04 x86_64 kernel and installed-package system-bus evidence in `docs/selective-routing-verification.md` (one intermittent strict-RPF over-count, unresolved).
+- Selective routing: all 10 tasks committed (`7a7c636` … `69928ac`, review fix `1bf11cc`); Ubuntu 24.04 x86_64 kernel and installed-package system-bus evidence in `docs/selective-routing-verification.md` (the intermittent strict-RPF over-count was a test measurement error, fixed in `bae6b0b`).
 - Usage Plan 1 (interface totals, quota, notifications, 30-day event history and their screens): committed `7d753c5` … `7a92986`. Plans 2 and 3 not started.
-- Audit fixes plan (`docs/superpowers/plans/2026-11-10-audit-fixes.md`): Tasks 1–3 `656ce38`, Tasks 4–5 `b321835`; check its ledger `.superpowers/sdd/2026-11-10-audit-fixes/progress.md` for the rest. Tasks 9–10 need a newly approved disposable VM.
+- Audit fixes plan (`docs/superpowers/plans/2026-11-10-audit-fixes.md`): Tasks 1–3 `656ce38`, Tasks 4–5 `b321835`; check its ledger `.superpowers/sdd/2026-11-10-audit-fixes/progress.md` for the rest. All tasks done: guarded rollback `9950eac` + review fix `0bf1883`, strict-RPF test fix `bae6b0b` (VM `routelane-test-u2404-20261111`, deleted). Open, unverified: the `UsePrimary` temporary guard may reject packets of established owned backup flows during a runtime transition (see `docs/handoff.md`, 11 Nov).
+- UI `acd3023`: summary Overview, per-connection usage on Connections, separate Events tab.
 - Version 0.1.2 (`b04e421`). Since `656ce38` the rootless suite has **no known failures** (the Snap symlink test was a real bug, fixed). Rerun before quoting numbers.
 - The first-release gate is **open**: Debian 12/13, Fedora 43/44, aarch64, interactive Polkit agent, GTK launch per distro, firewalld/SELinux and CI runs are NOT VERIFIED.
 - For the exact state, first run `rtk git status --short --branch`, then read the newest record in `docs/handoff.md`.
