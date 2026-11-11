@@ -79,7 +79,14 @@ route, rule, nftables, ownership, and conflict evidence.
    processes requires a scope confirmation; other windows and browser tabs may
    be affected, and existing connections are not guaranteed to move.
 
-Overview summarizes what needs attention, where IPv4 and IPv6 traffic leaves now (saved and applied scope shown separately), every configured connection with its health and role, and the rule and application counts.
+Overview highlights what needs attention and the verified applied scope and
+IPv4/IPv6 exits. Saved preferences and local health evidence remain available
+under Routing details. A connection selector shows up to seven measured days
+of total interface traffic, with a quota bar only when configured; shortcuts
+lead to the existing connection, rule and application pages.
+The system-tray menu shows verified status and offers the same guarded routing
+actions as the window. "Quit interface" leaves routing running; turning routing
+off is a separate action. See [Overview and tray behavior](docs/overview-and-tray.md).
 Rules and Applications keep Add and Search above their lists; contextual menus
 provide editing, deletion and ordering without permanently expanded controls.
 Ctrl+F focuses search, Ctrl+N opens the current section's editor, and Escape
@@ -243,8 +250,9 @@ networks counts them too; the quota window says so for wireless adapters.
 Quotas by Wi-Fi network (SSID) are a later item.
 
 Each row on Connections shows that connection's own usage: today's totals,
-the last seven days, or the quota bar for this period. Overview lists a quota
-in its "needs attention" group once it reaches the warning threshold. The
+the last seven days, or the quota bar for this period. Overview also shows a
+selected connection's daily chart and configured quota, and lists quota warnings
+in its "needs attention" group once they reach the warning threshold. The
 Events tab holds the event history: profile applied or turned off, failed
 applies and their rollback, rules applied, failover and failback, attention
 states and quota thresholds, with filters. Events are kept for 30 days (at most 5,000)

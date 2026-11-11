@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 
 use async_channel::{Receiver, Sender};
 use gtk4::{self as gtk, prelude::*};
@@ -36,7 +36,7 @@ use crate::ui::rule_row::{
 use crate::ui::session::{AfterSave, SaveState, UiSession};
 use crate::ui::settings::build_general_settings_dialog;
 use crate::ui::shell::{Section, Shell};
-use crate::ui::tray::{spawn_tray, TrayCommand, APP_ICON_NAME};
+use crate::ui::tray::{spawn_tray, TrayCommand, TrayPresentation, APP_ICON_NAME};
 
 fn empty_default_profile() -> Profile {
     Profile {
@@ -136,9 +136,42 @@ struct WindowUi {
     recovery_dialog_open: Cell<bool>,
     quick_application: gtk::Button,
     preferences: gtk::Button,
+    tray_updates: mpsc::Sender<TrayPresentation>,
+    last_tray: RefCell<Option<TrayPresentation>>,
 }
 
 impl WindowUi {
+    fn route_from_tray(self: &Rc<Self>, action: crate::ui::tray::TrayRoutingAction) {
+        let allowed = TrayPresentation::from_session(
+            &self.profile.borrow(),
+            &self.controller.session(),
+            self.texts.language,
+        )
+        .allows(action);
+        if !allowed {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        window.present();
+        // A tray click must not bypass or replace an open confirmation dialog.
+        if let Some(dialog) = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+            .find(|dialog| {
+                dialog.is_visible()
+                    && dialog.is_modal()
+                    && dialog.transient_for().as_ref() == Some(window.upcast_ref())
+            })
+        {
+            dialog.present();
+            return;
+        }
+        // Exactly the same preview, confirmation and authorization flow.
+        self.shell.primary.emit_clicked();
+    }
+
     fn save_profile(
         self: &Rc<Self>,
         candidate: Profile,
@@ -718,15 +751,32 @@ impl WindowUi {
         let state = dashboard_state(&profile, &session);
         let (title, detail) = status_copy(&session, self.texts);
         self.shell.status_row.set_title(title);
-        self.shell.status_row.set_subtitle(detail);
-        self.shell.primary.set_label(match state.primary_action {
+        self.shell
+            .status_row
+            .set_subtitle(if title == detail { "" } else { detail });
+        let tray = TrayPresentation::from_session(&profile, &session, self.texts.language);
+        if self.last_tray.borrow().as_ref() != Some(&tray) {
+            let _ = self.tray_updates.send(tray.clone());
+            *self.last_tray.borrow_mut() = Some(tray);
+        }
+        let primary_label = match state.primary_action {
             PrimaryAction::OpenConnections => self.texts.ux.add_connection,
             PrimaryAction::OpenRuleDialog => self.texts.add_rule,
             PrimaryAction::ReviewDefinitions => self.texts.ux.review_definitions,
             PrimaryAction::RefreshStatus => self.texts.ux.refresh,
+            PrimaryAction::EnableRouting => self.texts.dashboard.enable,
+            PrimaryAction::DisableRouting => self.texts.dashboard.disable,
+        };
+        self.shell.primary.set_label(primary_label);
+        let full_action = match state.primary_action {
             PrimaryAction::EnableRouting => self.texts.enable_routing,
             PrimaryAction::DisableRouting => self.texts.disable_routing,
-        });
+            _ => primary_label,
+        };
+        self.shell
+            .primary
+            .update_property(&[gtk::accessible::Property::Label(full_action)]);
+        self.shell.primary.set_tooltip_text(Some(full_action));
         self.shell
             .primary
             .set_sensitive(state.primary_action_enabled);
@@ -1005,6 +1055,7 @@ fn build_window_with_repository(
     body.append(&header);
     body.append(&toast);
     window.set_content(Some(&body));
+    let (tray_updates, tray_update_receiver) = mpsc::channel();
     let ui = Rc::new(WindowUi {
         window: window.downgrade(),
         texts,
@@ -1031,6 +1082,8 @@ fn build_window_with_repository(
         recovery_dialog_open: Cell::new(false),
         quick_application,
         preferences,
+        tray_updates,
+        last_tray: RefCell::new(None),
     });
     *weak_slot.borrow_mut() = Rc::downgrade(&ui);
     #[cfg(test)]
@@ -1321,8 +1374,11 @@ fn build_window_with_repository(
     });
     let (tray_sender, tray_receiver) =
         glib::MainContext::channel::<TrayCommand>(glib::PRIORITY_DEFAULT);
-    let tray_available = spawn_tray(tray_sender, Arc::new(Mutex::new(language)));
+    let initial_tray =
+        TrayPresentation::from_session(&ui.profile.borrow(), &ui.controller.session(), language);
+    let tray_available = spawn_tray(tray_sender, initial_tray, tray_update_receiver);
     let weak_window = window.downgrade();
+    let weak_ui = Rc::downgrade(&ui);
     let app_quit = app.clone();
     tray_receiver.attach(None, move |command| {
         match command {
@@ -1331,7 +1387,27 @@ fn build_window_with_repository(
                     window.present();
                 }
             }
-            TrayCommand::Quit => app_quit.quit(),
+            TrayCommand::Routing(action) => {
+                if let Some(ui) = weak_ui.upgrade() {
+                    ui.route_from_tray(action);
+                }
+            }
+            TrayCommand::ShowProblem => {
+                if let Some(ui) = weak_ui.upgrade() {
+                    ui.shell.select(Section::Overview);
+                    if let Some(window) = weak_window.upgrade() {
+                        window.present();
+                    }
+                }
+            }
+            TrayCommand::Quit => {
+                if weak_ui
+                    .upgrade()
+                    .is_some_and(|ui| !ui.controller.session().is_busy())
+                {
+                    app_quit.quit();
+                }
+            }
         };
         glib::Continue(true)
     });
@@ -1360,6 +1436,15 @@ mod tests {
     fn find_named(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
         if widget.widget_name().as_str() == name {
             return Some(widget.clone());
+        }
+        // GTK unparents a collapsed Expander's content from its widget tree.
+        if let Some(child) = widget
+            .downcast_ref::<gtk::Expander>()
+            .and_then(|expander| expander.child())
+        {
+            if let Some(found) = find_named(&child, name) {
+                return Some(found);
+            }
         }
         let mut child = widget.first_child();
         while let Some(current) = child {
@@ -2337,17 +2422,21 @@ mod tests {
                             .into_iter()
                             .map(|(id, quota)| LaneUsage {
                                 lane_id: id.into(),
-                                interface: id.into(),
+                                interface: if id == "ethernet" { "eth0" } else { "usb0" }.into(),
                                 available: true,
                                 today: UsageTotals::default(),
                                 quota,
-                                daily: vec![(
-                                    LocalDate::parse("2026-11-10").unwrap(),
-                                    UsageTotals {
-                                        rx: 3_100_000_000,
-                                        tx: 420_000_000,
-                                    },
-                                )],
+                                daily: (4..=10)
+                                    .map(|day| {
+                                        (
+                                            LocalDate::parse(&format!("2026-11-{day:02}")).unwrap(),
+                                            UsageTotals {
+                                                rx: day as u64 * 310_000_000,
+                                                tx: day as u64 * 42_000_000,
+                                            },
+                                        )
+                                    })
+                                    .collect(),
                                 rate: None,
                                 recent_rates: vec![],
                             })
@@ -2437,9 +2526,63 @@ mod tests {
         let overview = stack.child_by_name("overview").unwrap();
         assert!(!has_text(&overview, texts.usage.usage_overview));
         assert!(!has_text(&overview, texts.usage.recent_events));
-        for name in ["overview-usage", "overview-events", "events-open"] {
+        for name in ["overview-events", "events-open", "overview-counts"] {
             assert!(find_named(&overview, name).is_none());
         }
+        let details = find_named(&overview, "overview-routing-details")
+            .unwrap()
+            .downcast::<gtk::Expander>()
+            .unwrap();
+        assert!(!details.is_expanded(), "technical rows start collapsed");
+        let selector = find_named(&overview, "overview-usage-connection")
+            .unwrap()
+            .downcast::<gtk::ComboBoxText>()
+            .unwrap();
+        assert_eq!(selector.active_id().as_deref(), Some("ethernet"));
+        assert!(find_named(&overview, "overview-usage-chart")
+            .unwrap()
+            .is_visible());
+        let caption = find_named(&overview, "overview-usage-caption")
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert!(caption.text().contains("2026-11-04") && caption.text().contains("2026-11-10"));
+        assert!(
+            caption
+                .text()
+                .contains(if tr { "3,5 GB" } else { "3.5 GB" }),
+            "a visible scale accompanies the bars"
+        );
+        let quota = find_named(&overview, "overview-quota").unwrap();
+        assert!(
+            !quota.is_visible(),
+            "no quota UI for an unlimited connection"
+        );
+        selector.set_active_id(Some("vinn"));
+        drain();
+        assert!(quota.is_visible());
+        assert!(
+            (find_named(&overview, "overview-quota-bar")
+                .unwrap()
+                .downcast::<gtk::ProgressBar>()
+                .unwrap()
+                .fraction()
+                - 0.8)
+                .abs()
+                < 0.001
+        );
+        let ui = LAST_UI.with(|slot| slot.borrow().upgrade().unwrap());
+        ui.render();
+        assert_eq!(
+            selector.active_id().as_deref(),
+            Some("vinn"),
+            "polling preserves the selected connection"
+        );
+        ui.route_from_tray(crate::ui::tray::TrayRoutingAction::Disable);
+        assert!(
+            requests.try_recv().is_err(),
+            "stale tray deactivation cannot change an inactive profile"
+        );
         assert!(find_named(&overview, "overview-traffic").is_some());
         for name in [
             "overview-ipv4",
@@ -2450,6 +2593,77 @@ mod tests {
             assert!(find_named(&overview, name).is_some());
         }
         screenshot(&window, &format!("overview-{tag}.png"));
+        // Broadway has no browser client to acknowledge a resize of a mapped
+        // window. Exercise the same widgets in a fresh, initially narrow surface.
+        let narrow_shell = Shell::new(texts);
+        let narrow_overview = Overview::new(texts);
+        narrow_overview.update(&ui.profile.borrow(), &ui.controller.session());
+        find_named(
+            narrow_overview.root.upcast_ref(),
+            "overview-usage-connection",
+        )
+        .unwrap()
+        .downcast::<gtk::ComboBoxText>()
+        .unwrap()
+        .set_active_id(Some("vinn"));
+        narrow_shell.add_page(Section::Overview, &narrow_overview.root);
+        narrow_shell.status_row.set_title(texts.routing_inactive);
+        narrow_shell.primary.set_label(texts.dashboard.enable);
+        let narrow = adw::Window::builder()
+            .title("RouteLane")
+            .default_width(420)
+            .default_height(760)
+            .content(&narrow_shell.root)
+            .build();
+        narrow.present();
+        wait_for(|| narrow.width() > 0);
+        assert!(
+            narrow.width() <= 420 && narrow_overview.root.width() <= 420,
+            "overview fits a narrow window"
+        );
+        narrow_shell.primary.grab_focus();
+        screenshot(&narrow, &format!("overview-narrow-{tag}.png"));
+        // Loading, empty, and disconnected states must not masquerade as a
+        // current zero-usage measurement or leave a stale quota on screen.
+        let current_profile = ui.profile.borrow().clone();
+        let mut usage_session = crate::ui::overview::tests::applied_session(&current_profile);
+        narrow_overview.update(&current_profile, &usage_session);
+        let empty = find_named(narrow_overview.root.upcast_ref(), "overview-usage-empty")
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        let chart = find_named(narrow_overview.root.upcast_ref(), "overview-usage-chart").unwrap();
+        let quota = find_named(narrow_overview.root.upcast_ref(), "overview-quota").unwrap();
+        assert_eq!(empty.text(), texts.dashboard.usage_loading);
+        assert!(!chart.is_visible() && !quota.is_visible());
+        let usage_id = usage_session
+            .begin_request(DaemonRequest::GetUsage { fast_lane: None }, None)
+            .unwrap()
+            .into_iter()
+            .find_map(|effect| match effect {
+                crate::ui::session::UiEffect::Send(request) => Some(request.request_id),
+                _ => None,
+            })
+            .unwrap();
+        usage_session.handle_daemon(DaemonToUi::Response {
+            epoch: 1,
+            response: DaemonResponse::success(
+                usage_id,
+                DaemonResult::Usage(UsageReport { lanes: vec![] }),
+            ),
+        });
+        narrow_overview.update(&current_profile, &usage_session);
+        assert_eq!(empty.text(), texts.dashboard.usage_empty);
+        assert!(!chart.is_visible() && !quota.is_visible());
+        usage_session.handle_daemon(DaemonToUi::DaemonUnavailable {
+            epoch: 1,
+            request_id: None,
+            error: routelane::ipc::IpcError::new("OFFLINE", "offline"),
+        });
+        narrow_overview.update(&current_profile, &usage_session);
+        assert_eq!(empty.text(), texts.dashboard.usage_unavailable);
+        assert!(!chart.is_visible() && !quota.is_visible());
+        narrow.destroy();
         find_named(&overview, "overview-lane-ethernet")
             .unwrap()
             .downcast::<adw::ActionRow>()
@@ -2475,9 +2689,9 @@ mod tests {
         assert_eq!(
             totals.text(),
             if tr {
-                "Son 7 gün ↓ 3,1 GB ↑ 0,4 GB"
+                "Son 7 gün ↓ 15,2 GB ↑ 2,1 GB"
             } else {
-                "Last 7 days ↓ 3.1 GB ↑ 0.4 GB"
+                "Last 7 days ↓ 15.2 GB ↑ 2.1 GB"
             }
         );
         wait_for(|| totals.is_mapped());
@@ -3430,7 +3644,15 @@ mod tests {
         };
 
         // The lab rule is disclosed before any save; Cancel sends nothing.
-        let preview = activate();
+        let ui = LAST_UI.with(|slot| slot.borrow().upgrade().unwrap());
+        ui.route_from_tray(crate::ui::tray::TrayRoutingAction::Enable);
+        ui.route_from_tray(crate::ui::tray::TrayRoutingAction::Enable);
+        let preview = next_request(&requests);
+        assert!(matches!(preview.request, DaemonRequest::PreviewProfile(_)));
+        assert!(
+            requests.try_recv().is_err(),
+            "double tray activation previews only once"
+        );
         reply_preview(
             &events,
             1,
@@ -3446,6 +3668,11 @@ mod tests {
             Some(texts.primary.impact_heading)
         );
         screenshot(&dialog, &format!("impact-confirmation-{tag}.png"));
+        ui.route_from_tray(crate::ui::tray::TrayRoutingAction::Enable);
+        assert!(
+            requests.try_recv().is_err(),
+            "an open confirmation cannot be bypassed from the tray"
+        );
         escape(&dialog);
         drain();
         assert!(

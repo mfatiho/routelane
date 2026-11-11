@@ -44,6 +44,13 @@ impl Shell {
         let primary = gtk::Button::with_label(texts.ux.refresh);
         primary.set_widget_name("routing-primary");
         crate::ui::form::wrap_button(&primary);
+        if let Some(label) = primary
+            .child()
+            .and_then(|child| child.downcast::<gtk::Label>().ok())
+        {
+            // Keep action words intact when ActionRow allocates its suffix.
+            label.set_wrap_mode(gtk::pango::WrapMode::Word);
+        }
         primary.add_css_class("suggested-action");
         primary.set_valign(gtk::Align::Center);
         let status_layout = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -55,8 +62,8 @@ impl Shell {
         status_row.set_selectable(false);
         status_row.set_focusable(false);
         status_list.append(&status_row);
+        status_row.add_suffix(&primary);
         status_layout.append(&status_list);
-        status_layout.append(&primary);
         root.append(&status_layout);
         let stack = gtk::Stack::builder()
             .vexpand(true)

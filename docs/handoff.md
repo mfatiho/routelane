@@ -1,6 +1,41 @@
 # RouteLane — geliştirici devir belgesi
 
-Tarih: 22 Ekim 2026. Bu belge, devralan geliştiricinin geçmiş kararları bulması ve yarım kalan işi güvenli şekilde sürdürmesi içindir. Kalıcı devir kaydı `docs/handoff.md` dosyasıdır; `/tmp` kopyasına veya oturumlar arası asistan hafızasına bağımlı değildir. Ayrıntılı değişiklik geçmişinin kaynağı Git ve aşağıdaki depo belgeleridir.
+Güncelleme: 11 Kasım 2026. Bu belge, devralan geliştiricinin geçmiş kararları bulması ve yarım kalan işi güvenli şekilde sürdürmesi içindir. Kalıcı devir kaydı `docs/handoff.md` dosyasıdır; `/tmp` kopyasına veya oturumlar arası asistan hafızasına bağımlı değildir. Ayrıntılı değişiklik geçmişinin kaynağı Git ve aşağıdaki depo belgeleridir.
+
+## Güncel hafıza kontrol noktası — 11 Kasım 2026
+
+Kullanıcı önce son yapılanları kaydetmeyi, ardından Genel Bakış ekranı ve tepsi menüsünün yenilenmesini istedi; önerileri “Uygundur … güncelle” diyerek onayladı. UI yenilemesi kaynakta tamamlandı ve aşağıdaki kontrollerden geçti. Kurulum/servis değişikliği yapılmadı. Aşağıdaki eski yarım-görev notlarından uygulamayı yeniden başlatma.
+
+### Doğrulanan depo durumu
+
+- Başlangıçta HEAD `3cf41f1`, dal `main...origin/main` **18 commit ileride**; izlenen dosyalar temiz, `.superpowers/` untracked idi. UI dosyaları, README, `.gitignore`, bu devir belgesi, yeni davranış belgesi ve dört ekran görüntüsü kullanıcının commit isteği kapsamında `feat(ui): refresh overview and tray menu` mesajıyla tek commit olarak kaydediliyor. Kesin hash için `rtk git log -1 --oneline` kullan. Push/kurulum yapılmadı. Scratch kayıtlarını silme/stage etme.
+- Seçici yönlendirme planı Task 1–10, kullanım/kota/olay Plan 1 ve sonraki denetim düzeltmeleri tamamlanmış. Ekim'deki “Task 3 in_progress”, “plan onay bekliyor” ve Snap testi başarısız kayıtları tarihsel; güncel devam noktası değiller. Geçmiş hash'ler 9 Kasım tarihçe yeniden yazımı nedeniyle değişmiş; eski hash yerine Git ve defterlerdeki eşlemeyi kullan.
+- Kaynaktaki sürümler: Config/desired schema **4**, daemon IPC **4**, runtime activation **3**, journal **3**. `Cargo.toml` MSRV **1.87**; MSRV yükseltmesi ayrı kullanıcı kararıdır.
+- En son kayıtlı doğrulama: 11 Kasım `0bf1883` için rootless **608 passed / 0 failed**; Ubuntu 24.04 disposable VM'de standart/strict **26/26** root kabulü ve gerçek helper SIGKILL/yeniden başlatma senaryoları PASS. Kanıt ve sınırları `docs/selective-routing-verification.md`; bu hafıza turunda testler veya canlı ağ yeniden doğrulanmadı. Eski Snap testi sonradan düzeltildi; artık onu bilinen kırık baseline diye sunma.
+- `9950eac` korumalı rollback, `0bf1883` kurtarması tamamlanamayan rollback'te yetkili exact cleanup, `1e91538` gerçek kernel çökme kabulünü içeriyor. Bağımsız inceleme yalnız `9950eac`'i kapsadı; `0bf1883` için bağımsız inceleme yapıldı deme. Strict-RPF sayaç hatası ölçüm kaynaklıydı; `bae6b0b` IPv4 alım sayacı ve geri dönüş sonrası değişim koşulunu düzeltti.
+- Açık konu: UsePrimary geçici guard'ında mevcut sahipli UDP akışının nadiren EPERM alması **hipotez**, nftrace/sayaçla kök neden doğrulanmış değil. Bu yeni UI isteği onu düzeltme veya yeni VM oluşturma yetkisi vermez. Debian/Fedora/aarch64, etkileşimli Polkit ve CI'ın gerçek çalışması için eksik kabul kapılarını koru.
+
+### Tamamlanan UI yenilemesi
+
+- Davranış ve sınırlar: [Genel Bakış ve tepsi menüsü](overview-and-tray.md). Yeni TR/EN ve 420 piksel örnekleri `docs/screenshots/overview-tray/` altında; test verisidir, hostun gerçek yönlendirmesinin kanıtı değildir. `.gitignore` yalnız bu belge ve dört görüntü için dar istisnalar aldı; diğer scratch belgeleri açılmadı.
+- `src/ui/overview.rs`: uygulanan kapsam ve doğrulanmış IPv4/IPv6 özeti görünür; ayrıntılar kapalı başlar. Bağlantı seçmeli en fazla yedi günlük grafik, görünür tarih/tepe miktarı ve yalnız etkin kota için yerel GTK progress bar. Seçim poll sırasında korunur. Kullanım raporu bağlantı kimliği ve arayüz adıyla eşleşir; bilinmeyen durumda eski veri güncel gösterilmez. Kısayollar ve bağlantı/olay ayrıntıları korunur.
+- `src/ui/tray.rs`: sahipli, GTK içermeyen `TrayPresentation`, durum/kapsam/çıkış/yeniden yetkilendirme/sorun bilgisi. GTK güncellemeleri kanal üzerinden tepsi işçisine gider ve native menü yenilenir. İşçi GTK ana döngüsünü D-Bus'ta bekletmez.
+- `src/ui/window.rs`: `Enable` ve `Disable` ayrı komutlar; tıklama anında tekrar kontrol, mevcut ana eylem/önizleme/onay/Polkit akışına geçiş, açık modal pencereyi öne getirme. Meşgulken yönlendirme eylemleri ve menüden çıkış kilitli. “Arayüzden çık” daemon yönlendirmesini kapatmaz; menü bunu açıklar.
+- `src/ui/{shell,i18n}.rs`: tek kompakt durum kartı, kısa buton metni + tam erişilebilir etiket, TR/EN metinler; yinelenen durum altyazısı ve kullanılmayan eski başlık metinleri kaldırıldı. Yeni bağımlılık/IPC şeması/ayrıcalıklı komut yok.
+- Kullanım hâlâ **toplam arayüz trafiği**; RouteLane'e özgü sayaç, gecikme veya paket kaybı değil. Kota dönemi yeni başlamışsa daemon daha az gün döndürebilir; gerçek tarih aralığı gösterilir, eksik veri uydurulmaz. Kullanım Plan 2 eklenmedi.
+
+### Bu UI değişikliğinin doğrulaması
+
+- Başlangıç köksüz suite: **608 passed**, 2 ignored. Son `rtk cargo test --all-targets --no-fail-fast`: **615 passed**, 2 ignored, 0 failed. Eklenen 7 köksüz test: arayüz kimliği eşleştirme ve tepsi durumu/eylem/scope/yetkilendirme sınırları.
+- `rtk proxy bash scripts/run-gtk-smoke.sh`: özel D-Bus/Broadway oturumunda **1 passed**, TR/EN, 420 piksel ve var olan büyük yazı denetimi; grafik/kota seçimi, sayısal/tarih özeti, yüklenme/boş/bilinmeyen durum, çift tepsi tıklaması ve açık onayı atlayamama. Normal sandbox özel D-Bus soketine izin vermedi; test yalnız izole oturum için izinli çalıştırıldı. Ana ağ/servis değiştirilmedi.
+- `rtk proxy cargo fmt --all -- --check`, Clippy `--all-targets` ve `--features root-integration` ile `-D warnings`, release `--bins` derlemesi, `git diff --check`: temiz. Diff standart ve onaylı istek bakımından yerel olarak kontrol edildi; bağımsız inceleme iddiası yok.
+- Native tepsi menüsünün gerçek GNOME uzantısında görünümü, etkileşimli Polkit, canlı trafik ve dağıtımlar yeniden test edilmedi. Eski VM kabulünü bu UI değişikliğine aitmiş gibi sunma. Paket kurulmadı, servis yeniden başlatılmadı; kurulu uygulama henüz bu değişikliği içermez.
+
+### Suggested Skills ve kesin devam noktası
+
+UI işi için tekrar tasarım/Task 3 başlatma. Yeni bir hata raporunda `systematic-debugging`; kapsamlı yeni özellikte güncel `brainstorming` (7.0.1), onaylı kapsamı uygularken TDD/`implement`, son iddialardan önce `verification-before-completion`; devir kaydında `handoff` kullan. Kullanıcının tercihi bu dosyanın `/tmp` yerine kalıcı kayıt olmasıdır.
+
+İlk komut: `rtk git status --short --branch`; ardından `rtk proxy sed -n '1,100p' docs/handoff.md` ve `rtk proxy sed -n '1,160p' docs/overview-and-tray.md`. Kullanıcı isterse push/paketleme/kurulum ayrı adımdır. Host paket/servis/ağ ve mevcut kullanıcı lab VM'leri bu işte değişmeden kalmalı; açık UsePrimary UDP hipotezi ayrı yetki ve kanıt gerektirir.
 
 ## En son kayıt — korumalı geri alma, strict-RPF ve yeni arayüz (11 Kasım 2026)
 

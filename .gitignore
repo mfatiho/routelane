@@ -24,3 +24,12 @@ dist/*.deb
 docs/*
 !docs/reliability-audit.md
 !docs/handoff.md
+!docs/overview-and-tray.md
+!docs/screenshots/
+docs/screenshots/*
+!docs/screenshots/overview-tray/
+docs/screenshots/overview-tray/*
+!docs/screenshots/overview-tray/overview-tr.png
+!docs/screenshots/overview-tray/overview-en.png
+!docs/screenshots/overview-tray/overview-narrow-tr.png
+!docs/screenshots/overview-tray/overview-narrow-en.png

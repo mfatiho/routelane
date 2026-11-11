@@ -6,9 +6,7 @@ pub struct UxTexts {
     pub fallback_in_use: &'static str,
     pub events: &'static str,
     pub attention: &'static str,
-    pub traffic_now: &'static str,
     pub status: &'static str,
-    pub counts: &'static str,
     pub primary_role: &'static str,
     pub backup_role: &'static str,
     pub in_use_now: &'static str,
@@ -74,8 +72,8 @@ pub struct UxTexts {
 }
 
 const UX_TR: UxTexts = UxTexts {
-    events: "Olaylar", attention: "Dikkat gerektirenler", traffic_now: "Trafik şu an nereden çıkıyor",
-    status: "Durum", counts: "Tanımlar", primary_role: "Birincil", backup_role: "Yedek", in_use_now: "Şu an kullanımda",
+    events: "Olaylar", attention: "Dikkat gerektirenler",
+    status: "Durum", primary_role: "Birincil", backup_role: "Yedek", in_use_now: "Şu an kullanımda",
     quota_attention: "{lane}: kotanın %{percent}{suffix} kullanıldı",
     seven_day_totals: "Son 7 gün ↓ {down} GB ↑ {up} GB", help: "Yardım",
     duplicate_rule: "Bu hedef ve işlem için zaten bir kural var. Yeni kayıt yerine mevcut kuralı düzenleyin.",
@@ -105,8 +103,8 @@ const UX_TR: UxTexts = UxTexts {
 };
 
 const UX_EN: UxTexts = UxTexts {
-    events: "Events", attention: "Needs attention", traffic_now: "Where traffic leaves now",
-    status: "Status", counts: "Definitions", primary_role: "Primary", backup_role: "Backup", in_use_now: "In use now",
+    events: "Events", attention: "Needs attention",
+    status: "Status", primary_role: "Primary", backup_role: "Backup", in_use_now: "In use now",
     quota_attention: "{lane}: {percent}% of quota used",
     seven_day_totals: "Last 7 days ↓ {down} GB ↑ {up} GB", help: "Help",
     duplicate_rule: "A rule with this target and action already exists. Edit the existing rule instead.",
@@ -290,8 +288,64 @@ const PRIMARY_EN: PrimaryTexts = PrimaryTexts {
 };
 
 #[derive(Debug, Clone, Copy)]
+pub struct DashboardTexts {
+    pub enable: &'static str,
+    pub disable: &'static str,
+    pub routing_summary: &'static str,
+    pub routing_details: &'static str,
+    pub usage_title: &'static str,
+    pub usage_note: &'static str,
+    pub choose_connection: &'static str,
+    pub usage_empty: &'static str,
+    pub usage_unavailable: &'static str,
+    pub usage_loading: &'static str,
+    pub today: &'static str,
+    pub history_summary: &'static str,
+    pub authorization_required: &'static str,
+    pub quick_actions: &'static str,
+    pub tray_problem: &'static str,
+}
+
+const DASHBOARD_TR: DashboardTexts = DashboardTexts {
+    enable: "Etkinleştir",
+    disable: "Devre dışı bırak",
+    routing_summary: "Uygulanan yönlendirme",
+    routing_details: "Yönlendirme ayrıntıları",
+    usage_title: "Son 7 gün · veri kullanımı",
+    usage_note:
+        "Arayüzün toplam indirme + yükleme trafiği · yaklaşık. Yalnızca RouteLane trafiği değildir.",
+    choose_connection: "Grafikte gösterilecek bağlantı",
+    usage_empty: "Henüz kullanım geçmişi yok. Ölçümler geldikçe grafik burada görünecek.",
+    usage_unavailable: "Güncel kullanım bilgisi alınamadı. Yenile ile tekrar deneyin.",
+    usage_loading: "Kullanım bilgisi alınıyor…",
+    today: "Bugün: {value} · yaklaşık",
+    history_summary: "{start} – {end} · En yüksek: {value}/gün",
+    authorization_required: "Yönetici izni gerekiyor",
+    quick_actions: "Kısayollar",
+    tray_problem: "Sorunu görüntüle",
+};
+const DASHBOARD_EN: DashboardTexts = DashboardTexts {
+    enable: "Enable",
+    disable: "Disable",
+    routing_summary: "Applied routing",
+    routing_details: "Routing details",
+    usage_title: "Last 7 days · data usage",
+    usage_note: "Total interface download + upload · approximate. Not just RouteLane traffic.",
+    choose_connection: "Connection shown in the chart",
+    usage_empty: "No usage history yet. The chart will appear as measurements arrive.",
+    usage_unavailable: "Current usage is unavailable. Use Refresh to try again.",
+    usage_loading: "Loading usage…",
+    today: "Today: {value} · approximate",
+    history_summary: "{start} – {end} · Peak: {value}/day",
+    authorization_required: "Administrator authorization required",
+    quick_actions: "Shortcuts",
+    tray_problem: "View problem",
+};
+
+#[derive(Debug, Clone, Copy)]
 pub struct Texts {
     pub language: Language,
+    pub dashboard: DashboardTexts,
     pub usage: UsageTexts,
     pub ux: UxTexts,
     pub primary: PrimaryTexts,
@@ -361,7 +415,7 @@ impl LanguageTexts for Language {
     fn texts(self) -> Texts {
         match self {
             Self::Tr => Texts {
-                language: self, usage: USAGE_TR,
+                language: self, usage: USAGE_TR, dashboard: DASHBOARD_TR,
                 confirm_delete_rule_heading: "Kural silinsin mi?",
                 ux: UX_TR,
                 primary: PRIMARY_TR,
@@ -404,9 +458,9 @@ impl LanguageTexts for Language {
                     "Dil paketini güncellemeden önce uygulamayı yeniden başlatmanız gerekiyor. Dil paketi değişikliğini onaylıyor musunuz?",
                 confirm: "Onayla",
 
-                tray_description: "RouteLane yönlendirme durumunu yönetir",
-                tray_show: "Göster",
-                tray_quit: "Çıkış",
+                tray_description: "Arayüz kapansa da yönlendirme çalışmaya devam eder.",
+                tray_show: "RouteLane’i aç",
+                tray_quit: "Arayüzden çık",
                 tray_tooltip: "RouteLane",
                 settings_title: "Tercihler",
                 about_title: "Hakkında",
@@ -437,7 +491,7 @@ impl LanguageTexts for Language {
                 copy_error: "Kopyala",
             },
             Self::En => Texts {
-                language: self, usage: USAGE_EN,
+                language: self, usage: USAGE_EN, dashboard: DASHBOARD_EN,
                 confirm_delete_rule_heading: "Delete this rule?",
                 ux: UX_EN,
                 primary: PRIMARY_EN,
@@ -480,9 +534,9 @@ impl LanguageTexts for Language {
                     "The application must restart before updating the language pack. Do you want to confirm the language pack change?",
                 confirm: "Confirm",
 
-                tray_description: "Manages RouteLane routing state",
-                tray_show: "Show",
-                tray_quit: "Quit",
+                tray_description: "Routing continues when the interface is closed.",
+                tray_show: "Open RouteLane",
+                tray_quit: "Quit interface",
                 tray_tooltip: "RouteLane",
                 settings_title: "Preferences",
                 about_title: "About",
