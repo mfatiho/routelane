@@ -3041,15 +3041,7 @@ where
             }
             // Test-only: hold the guarded transition open until the test
             // removes the pause file, so traffic can be observed mid-flight.
-            if let Some(pause) = std::env::var_os("ROUTELANE_TEST_FAIL_PAUSE") {
-                let pause = std::path::PathBuf::from(pause);
-                std::fs::write(&pause, b"paused")
-                    .map_err(|error| RunnerError::new(format!("write pause file: {error}")))?;
-                let deadline = Instant::now() + Duration::from_secs(30);
-                while pause.exists() && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
+            root_integration_pause("ROUTELANE_TEST_FAIL_PAUSE")?;
             return Err(RunnerError::new(
                 "root integration fail point before activate_nft",
             ));
@@ -3117,6 +3109,26 @@ where
             plans.push(next.clone());
         }
 
+        if let Some(state) = state {
+            // Hold the restored generation's managed scope back before any of
+            // its policy rules or routes disappear, in one atomic replace, so
+            // nothing in that scope can leave through the OS default meanwhile.
+            let mode = if self.table_present {
+                TableMode::Replace
+            } else {
+                TableMode::Create
+            };
+            run_nft_batch(
+                self.executor,
+                render_restore_guard_ruleset(state.plan(), mode)?,
+                "hold back the restored RouteLane scope during rollback",
+            )?;
+            self.table_present = true;
+            // The transaction guard is gone; a later remove_guard must not strip
+            // the restore guard if this rollback stops before it finishes.
+            self.guard_installed = false;
+        }
+
         remove_plan_policy_rules(self.executor, &plans)?;
         for step in rollback_table_order(&plans) {
             run_routing_step(
@@ -3126,7 +3138,7 @@ where
             )?;
         }
 
-        if self.table_present {
+        if state.is_none() && self.table_present {
             run_nft_batch(
                 self.executor,
                 b"delete table inet routelane\n".to_vec(),
@@ -3135,6 +3147,9 @@ where
             self.table_present = false;
         }
         self.guard_installed = false;
+        // Test-only: no RouteLane policy rule or route remains at this point.
+        #[cfg(feature = "root-integration")]
+        root_integration_pause("ROUTELANE_TEST_RESTORE_PAUSE")?;
 
         if let Some(state) = state {
             // Restoring the previous generation must not resurrect a unicast
@@ -3150,7 +3165,7 @@ where
                     "restore previous RouteLane route or policy rule",
                 )?;
             }
-            let batch = render_owned_ruleset(state.plan(), TableMode::Create, false)?;
+            let batch = render_owned_ruleset(state.plan(), TableMode::Replace, false)?;
             run_nft_batch(
                 self.executor,
                 batch,
@@ -3213,6 +3228,38 @@ fn capture_snapshot(executor: &mut impl CommandExecutor) -> Result<CapturedSnaps
         ipv4_routes,
         ipv6_routes,
     })
+}
+
+/// Test-only: blocks while the file named by `variable` exists (at most 30 s),
+/// so a root test can observe traffic at a precise transaction step.
+#[cfg(feature = "root-integration")]
+fn root_integration_pause(variable: &str) -> Result<(), RunnerError> {
+    if let Some(pause) = std::env::var_os(variable) {
+        let pause = std::path::PathBuf::from(pause);
+        std::fs::write(&pause, b"paused")
+            .map_err(|error| RunnerError::new(format!("write pause file: {error}")))?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while pause.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    Ok(())
+}
+
+/// The rollback's guard-only batch; the runner, the crash classifier and the
+/// tests all use this one renderer.
+fn render_restore_guard_ruleset(
+    previous: &KernelPlan,
+    mode: TableMode,
+) -> Result<Vec<u8>, RunnerError> {
+    render_nft_command_document(&super::render_restore_guard_document(previous), mode)
+}
+
+/// Recomputed from the journaled active plan rather than stored, so journals
+/// written before this interim state existed (0.1.2) still classify it.
+fn restore_guard_nft_fingerprint(active: &KernelPlan) -> Result<String, PrivilegedError> {
+    nft_document_fingerprint(&super::render_restore_guard_document(active))
+        .map_err(|error| PrivilegedError::new(error.to_string()))
 }
 
 fn render_guarded_ruleset(
@@ -3533,7 +3580,13 @@ fn verify_pending_table_ownership(
         .then(|| live_nft_fingerprint(executor))
         .transpose()
         .map_err(|error| PrivilegedError::new(error.to_string()))?;
+    let restore_guard = active
+        .map(|state| restore_guard_nft_fingerprint(state.plan()))
+        .transpose()?;
     let phase = match (active, active_nft_fingerprint, live_fingerprint.as_deref()) {
+        (Some(_), _, Some(live)) if restore_guard.as_deref() == Some(live) => {
+            PendingNftPhase::RestoreGuard
+        }
         (None, None, None) => PendingNftPhase::Untouched,
         (Some(_), Some(expected), Some(live)) if live == expected => PendingNftPhase::Untouched,
         (Some(_), Some(_), None) => PendingNftPhase::RollbackAbsent,
@@ -3565,6 +3618,9 @@ enum PendingNftPhase {
     Activated,
     Committed,
     RollbackAbsent,
+    /// A rollback replaced the table with the restored generation's guard-only
+    /// document and stopped while rebuilding its rules and routes.
+    RestoreGuard,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -3624,6 +3680,26 @@ fn routing_state_reachable_for_phase<P: RoutingPlan>(
         return Ok(build_absent_rollback_states(active)
             .iter()
             .any(|state| state == live));
+    }
+    if phase == PendingNftPhase::RestoreGuard {
+        // The guard went in before any removal: the routing is anywhere on
+        // the rollback path from a forward crash state, or rebuilt partway.
+        if build_absent_rollback_states(active)
+            .iter()
+            .any(|state| state == live)
+        {
+            return Ok(true);
+        }
+        for forward in [
+            PendingNftPhase::Guard,
+            PendingNftPhase::Activated,
+            PendingNftPhase::Committed,
+        ] {
+            if routing_state_reachable_for_phase(live, active, pending, forward)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
     }
     if phase == PendingNftPhase::Committed {
         let committed = build_forward_routing_states(active, pending, PendingNftPhase::Committed)?;
@@ -3776,7 +3852,8 @@ fn build_forward_routing_states<P: RoutingPlan>(
         PendingNftPhase::Committed => Ok(vec![committed_state]),
         PendingNftPhase::Untouched
         | PendingNftPhase::Guard
-        | PendingNftPhase::GuardlessTransaction => unreachable!(),
+        | PendingNftPhase::GuardlessTransaction
+        | PendingNftPhase::RestoreGuard => unreachable!(),
         PendingNftPhase::RollbackAbsent => Err(PrivilegedError::new(
             "rollback-without-nft routing states use the restore-prefix model",
         )),
@@ -5446,13 +5523,13 @@ mod tests {
     use super::{
         authorization_result, build_pending_expectations, command_invocation,
         execute_invocation_with_timeout, nft_document_fingerprint, render_guarded_ruleset,
-        render_owned_ruleset, render_transaction_ruleset, run_nft_batch, validate_privileged_plan,
-        validate_root_owned_file_attributes, AppliedStateStore, ApplyResponse, AuthorizationError,
-        Authorizer, CleanupResponse, CommandExecutor, CommandInvocation, CommandOutput,
-        CommandPrivilegedBackend, InspectResponse, InterfaceSettingReceipt, OrphanRecoveryResponse,
-        PrivilegedBackend, PrivilegedError, PrivilegedService, RestoreReceipt, RestoreResponse,
-        ServiceError, StoredAppliedState, ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES,
-        NFT_BINARY,
+        render_owned_ruleset, render_restore_guard_ruleset, render_transaction_ruleset,
+        run_nft_batch, validate_privileged_plan, validate_root_owned_file_attributes,
+        AppliedStateStore, ApplyResponse, AuthorizationError, Authorizer, CleanupResponse,
+        CommandExecutor, CommandInvocation, CommandOutput, CommandPrivilegedBackend,
+        InspectResponse, InterfaceSettingReceipt, OrphanRecoveryResponse, PrivilegedBackend,
+        PrivilegedError, PrivilegedService, RestoreReceipt, RestoreResponse, ServiceError,
+        StoredAppliedState, ValidationError, IP_BINARY, MAX_PLAN_JSON_BYTES, NFT_BINARY,
     };
     use crate::backend::{
         CommandSpec, CompiledAction, CompiledRule, CompiledTarget, IpFamily, KernelPlan,
@@ -8227,6 +8304,68 @@ mod tests {
     }
 
     #[test]
+    fn restore_never_deletes_the_table_while_a_previous_generation_exists() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let mut active = fixture_valid_plan();
+        active.unmatched_traffic = crate::domain::UnmatchedTraffic::PreserveSystem;
+        let mut next = active.clone();
+        next.generation += 1;
+        next.rules[0].target = CompiledTarget::Network("192.0.2.0/24".parse().unwrap());
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            FakeAppliedStateStore::default(),
+        );
+        backend.apply(&active).unwrap();
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.commands.clear();
+            // Only the activation of `next` carries its state chain.
+            kernel.fail_activation_containing = Some(super::state_chain_name(&next));
+        }
+        backend.apply(&next).unwrap_err();
+
+        let commands = kernel.lock().unwrap().commands.clone();
+        let guard = render_restore_guard_ruleset(&active, TableMode::Replace).unwrap();
+        let guard_at = commands
+            .iter()
+            .position(|command| command.stdin.as_ref() == Some(&guard))
+            .expect("the rollback first holds the previous scope back");
+        let first_rule_removal = commands
+            .iter()
+            .position(|command| {
+                command.program == Program::Ip
+                    && command.args.windows(2).any(|pair| pair == ["rule", "del"])
+            })
+            .expect("the rollback removes policy rules");
+        assert!(
+            guard_at < first_rule_removal,
+            "guard before any rule removal"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.stdin.as_deref() == Some(b"delete table inet routelane\n")),
+            "the table is never deleted on its own while a generation is restored"
+        );
+        let owned = render_owned_ruleset(&active, TableMode::Replace, false).unwrap();
+        let owned_at = commands
+            .iter()
+            .rposition(|command| command.stdin.as_ref() == Some(&owned))
+            .expect("the previous generation is reinstated atomically");
+        assert!(guard_at < owned_at);
+        assert_eq!(
+            backend.inspect().unwrap().generation,
+            Some(active.generation)
+        );
+        assert!(
+            !kernel.lock().unwrap().has_guard,
+            "no guard left after the rollback"
+        );
+    }
+
+    #[test]
     fn selective_activation_guard_keeps_the_replaced_scope() {
         let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
         let mut active = fixture_valid_plan();
@@ -8262,12 +8401,16 @@ mod tests {
             Untouched,
             Activated,
             Committed,
+            /// A rollback held the previous scope back with its guard-only
+            /// document, then the helper died before finishing.
+            RestoreGuard,
         }
 
         let windows = [
             CrashWindow::Untouched,
             CrashWindow::Activated,
             CrashWindow::Committed,
+            CrashWindow::RestoreGuard,
         ];
         // Both modes; the selective transition also changes the managed
         // scope, so its union guard differs from either generation's own.
@@ -8318,6 +8461,9 @@ mod tests {
                 }
                 CrashWindow::Committed => {
                     Some(render_owned_ruleset(&pending, TableMode::Replace, false).unwrap())
+                }
+                CrashWindow::RestoreGuard => {
+                    Some(render_restore_guard_ruleset(&active, TableMode::Replace).unwrap())
                 }
             };
             if let Some(batch) = batch {

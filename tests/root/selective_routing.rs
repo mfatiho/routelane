@@ -42,6 +42,9 @@ const UNMATCHED: &str = "198.51.100.10";
 const LANE_A_TARGET: &str = "203.0.113.10";
 const DIRECT_TARGET: &str = "203.0.113.11";
 const FOREIGN_MARK: &str = "0x1234";
+/// Reachable through lane A (a managed rule) and through lane B, the OS
+/// default, so a leak during a rollback shows up as lane B's source address.
+const SHARED_ROUTED: &str = "198.18.0.10";
 
 fn lab_and_uplinks(names: &RunNames) -> Vec<EchoServer> {
     vec![
@@ -78,6 +81,16 @@ fn v2_upgrade_requires_exact_cleanup_then_reauthorization() {
 }
 
 #[test]
+fn rollback_keeps_the_previous_managed_scope_guarded() {
+    run_worker_scenario(WORKER, "rollback_guard", |names| {
+        let mut servers = lab_and_uplinks(names);
+        servers.push(EchoServer::spawn(&names.sinks[0], &["198.18.0.10:7000"]));
+        servers.push(EchoServer::spawn(&names.sinks[1], &["198.18.0.10:7000"]));
+        servers
+    });
+}
+
+#[test]
 fn selective_worker() {
     let Ok(scenario) = env::var(SCENARIO_ENV) else {
         return;
@@ -89,6 +102,7 @@ fn selective_worker() {
         "switch_failure" => switch_failure(&names),
         "foreign_and_forwarded" => foreign_and_forwarded(&names),
         "v2_upgrade" => v2_upgrade(&names),
+        "rollback_guard" => rollback_guard(&names),
         other => panic!("unknown selective scenario {other}"),
     }
 }
@@ -371,6 +385,71 @@ fn switch_failure(names: &RunNames) {
         "10.10.3.2"
     );
     assert_lab_reachable("after rollback");
+    routing.cleanup();
+}
+
+fn rollback_guard(names: &RunNames) {
+    let mut routing = Routing::start(names);
+    let managed = || {
+        vec![rule(
+            "shared-site",
+            5,
+            &format!("{SHARED_ROUTED}/32"),
+            CompiledAction::Mark(MARK_BASE),
+        )]
+    };
+    routing.apply(&plan(1, names, managed()));
+    assert_eq!(
+        fresh_source(SHARED_ROUTED).expect("managed route before the transition"),
+        "10.10.1.2"
+    );
+    let next = plan(2, names, vec![vinn_rule()]);
+    let (helper, state) = routing.helper();
+    let pause = state.join("rollback-paused");
+    helper.ok(json!({
+        "method": "set_fail_point",
+        "value": "activate_nft",
+        "restore_pause_file": pause.to_str().unwrap(),
+    }));
+    std::thread::scope(|scope| {
+        let pause_file = pause.clone();
+        let transition = scope.spawn(move || {
+            helper.error(json!({
+                "method": "apply",
+                "plan_json": serde_json::to_string(&next).unwrap(),
+            }))
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !pause_file.exists() {
+            assert!(Instant::now() < deadline, "the rollback never paused");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Mid-rollback, no RouteLane policy rule remains. The previous
+        // generation's managed destination must be held back, never sent
+        // out through the OS default; unmanaged traffic still flows.
+        let leaked = fresh_source(SHARED_ROUTED);
+        assert_lab_reachable("during the rollback");
+        let unmatched = fresh_source(UNMATCHED);
+        std::fs::remove_file(&pause_file).unwrap();
+        let error = transition.join().unwrap();
+        assert!(error.contains("fail point"), "injected failure: {error}");
+        assert!(
+            leaked.is_err(),
+            "managed destination escaped during the rollback via {leaked:?}"
+        );
+        assert_eq!(
+            unmatched.expect("unmatched traffic flows mid-rollback"),
+            "10.10.2.2"
+        );
+        evidence("rollback: managed destination held back, lab and unmatched flowed");
+    });
+    let (helper, _) = routing.helper();
+    helper.ok(json!({"method": "set_fail_point", "value": null}));
+    assert_eq!(helper.ok(json!({"method": "inspect"}))["generation"], 1);
+    assert_eq!(
+        fresh_source(SHARED_ROUTED).expect("previous route restored"),
+        "10.10.1.2"
+    );
     routing.cleanup();
 }
 

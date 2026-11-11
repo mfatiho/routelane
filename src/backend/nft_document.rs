@@ -448,6 +448,14 @@ pub fn render_activated_nft_document(next: &KernelPlan, replaced: Option<&Kernel
     render(Some(next), None, Some(&scope))
 }
 
+/// A rollback's interim document: only the temporary guard, holding back the
+/// managed scope of the generation being restored while its policy rules and
+/// routes are rebuilt. Unmanaged traffic keeps flowing; nothing is marked.
+pub fn render_restore_guard_document(previous: &KernelPlan) -> Value {
+    let scope = vec![previous];
+    render(None, None, Some(&scope))
+}
+
 /// `guard` is the set of plans whose managed scope the temporary guard
 /// holds back; `None` renders no guard chain.
 fn render(

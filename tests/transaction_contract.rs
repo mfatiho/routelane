@@ -317,6 +317,17 @@ impl KernelRunner for InMemoryKernel {
 
     fn restore(&mut self, state: Option<&AppliedKernelState>) -> Result<(), RunnerError> {
         self.record_mutation();
+        if let Some(state) = state {
+            // Production rollback first replaces the table with a guard-only
+            // document holding back the restored generation's managed scope,
+            // and only then rebuilds its policy rules and routes.
+            let document = routelane::backend::render_restore_guard_document(state.plan());
+            for mut packet in self.watched.clone() {
+                let verdict = nft_eval::execute(&document, "guard", &mut packet);
+                self.probes
+                    .push(("restore-guard", false, packet.destination, verdict));
+            }
+        }
         self.route_generations.clear();
         self.active_nft = None;
         if let Some(state) = state {
@@ -697,6 +708,15 @@ fn rollback_never_blocks_unmatched_packets() {
 
         assert_eq!(runner.kernel_plan_hash(), Some(old.plan_hash), "{point:?}");
         assert!(!runner.probes.is_empty(), "{point:?}");
+        assert!(
+            runner
+                .probes
+                .iter()
+                .any(|(step, _, destination, verdict)| *step == "restore-guard"
+                    && *destination == old_managed
+                    && *verdict == "reject"),
+            "{point:?}: the restored scope {old_managed} was not held back during rollback"
+        );
         for (step, guarded, destination, verdict) in &runner.probes {
             if unmanaged.contains(destination) {
                 assert!(
