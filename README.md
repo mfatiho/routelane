@@ -79,7 +79,7 @@ route, rule, nftables, ownership, and conflict evidence.
    processes requires a scope confirmation; other windows and browser tabs may
    be affected, and existing connections are not guaranteed to move.
 
-Overview summarizes every configured connection and local health evidence.
+Overview summarizes what needs attention, where IPv4 and IPv6 traffic leaves now (saved and applied scope shown separately), every configured connection with its health and role, and the rule and application counts.
 Rules and Applications keep Add and Search above their lists; contextual menus
 provide editing, deletion and ordering without permanently expanded controls.
 Ctrl+F focuses search, Ctrl+N opens the current section's editor, and Escape
@@ -242,10 +242,12 @@ interface, so a phone's Wi-Fi hotspot on the same Wi-Fi adapter as other
 networks counts them too; the quota window says so for wireless adapters.
 Quotas by Wi-Fi network (SSID) are a later item.
 
-Overview shows this period's usage and the last three events; "Tümünü göster"
-opens the event history: profile applied or turned off, failed applies and
-their rollback, rules applied, failover and failback, attention states and
-quota thresholds, with filters. Events are kept for 30 days (at most 5,000)
+Each row on Connections shows that connection's own usage: today's totals,
+the last seven days, or the quota bar for this period. Overview lists a quota
+in its "needs attention" group once it reaches the warning threshold. The
+Events tab holds the event history: profile applied or turned off, failed
+applies and their rollback, rules applied, failover and failback, attention
+states and quota thresholds, with filters. Events are kept for 30 days (at most 5,000)
 and can be cleared; they never contain connection addresses.
 
 Files, all mode 0600 and never sent anywhere:
