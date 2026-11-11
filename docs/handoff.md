@@ -2,6 +2,19 @@
 
 Güncelleme: 11 Kasım 2026. Bu belge, devralan geliştiricinin geçmiş kararları bulması ve yarım kalan işi güvenli şekilde sürdürmesi içindir. Kalıcı devir kaydı `docs/handoff.md` dosyasıdır; `/tmp` kopyasına veya oturumlar arası asistan hafızasına bağımlı değildir. Ayrıntılı değişiklik geçmişinin kaynağı Git ve aşağıdaki depo belgeleridir.
 
+## En son kayıt — GNOME HIG arayüz incelemesi, aşama 1: Genel Bakış (11 Kasım 2026)
+
+- Kullanıcı bir UI/UX inceleme briefi verdi; rapor ve üç tasarım yaklaşımı: https://claude.ai/artifact/16LVRKQqvuXfu1Zjhm7L58 (özel). Kullanıcı **A: yerel Adwaita** yaklaşımını seçti.
+- `76594b4` Tercihler penceresi ikinci açılıştan sonra X ile kapanmıyordu (yok edilmiş pencere yeniden gösteriliyordu); `hide_on_close`.
+- `cd0f535` Genel Bakış A tasarımı: Yönlendirme (durum simgesi; etkinken IPv4/IPv6 ve uygulanan kapsam ayrı satır; kapalı/bilinmiyorken ayrıntılarda), Dikkat gerektirenler, Bağlantılar (sağlık, rol, şu an kullanımda, `QuotaBar`). `8db9fa9`'in kaldırdığı bağlantı özeti A maketinde olduğu için geri geldi; kullanıcı onayı bekleniyor.
+- Smoke'a yalnız test kodu olarak ekran görüntüsü matrisi eklendi: `ROUTELANE_SMOKE_SCHEME=dark`, `ROUTELANE_SMOKE_SIZE=560x600`, `ROUTELANE_SMOKE_DPI=120` (GNOME Büyük metin). Broadway `gtk-xft-dpi` değerini -1 bırakıyor; bu Libadwaita'nın sp tabanlı `Clamp` genişliğini sıfırladığı için smoke artık 96 DPI ayarlıyor. İnceleme bulguları Y1 (Tercihler sıkışması) ve O7 (büyük metin) bu yüzden yanılgıydı, geri çekildi.
+- Doğrulama (`cd0f535`): rootless 631 passed, 0 failed; GTK smoke açık/koyu/560×600/120 DPI, TR/EN geçti; fmt, clippy iki özellik seti temiz. Gerçek GNOME oturumunda ekran okuyucu ve yüksek kontrast NOT VERIFIED. Push yapılmadı.
+- Ekran görüntüleri ve inceleme kopyası yerel: `.superpowers/sdd/2026-11-11-ui-review/`.
+
+### Sonraki adım
+
+Kullanıcı Genel Bakış'ı onaylarsa aşama 2: gezinme `ViewSwitcherTitle`/`ViewSwitcherBar` ile başlık çubuğunda, durum kartı yerine başlık çubuğunda ana eylem (önizleme/onay akışı aynen), düzenleyicilere başlık çubuğu ve kırpılmayan Kaydet, ana menü, onay renkleri. Ardından boş durumlar, Bağlantılar, Olaylar, grafik renkleri.
+
 ## Güncel kaynak değişikliği — sistem ana hattı ve sade Genel Bakış (11 Kasım 2026)
 
 Kullanıcı, aşağıdaki manuel NetworkManager düzeltmesinin ürün üzerinden yapılmasını istedi. Birinci yaklaşım (seçici yönlendirmeyi koruyarak ayrı onaylı sistem önceliği işlemi) için **“Uygula”** dedi. Ayrıca Genel Bakış'tan Kısayollar/Bağlantılar'ın kaldırılmasını ve kullanım grafiği için **ikinci seçeneği, yalnız bağlantı detayını** seçti. Bu ikinci seçim routing'de `UsePrimary` seçimi değildir.
