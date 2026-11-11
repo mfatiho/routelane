@@ -1156,7 +1156,9 @@ where
         self.ensure_inspection_ready()?;
         // Cleanup is authorized by the service. Inspection is not, and must never
         // replay a journal or change kernel state on its own.
-        self.ensure_reconciled()?;
+        if let Err(error) = self.ensure_reconciled() {
+            return self.cleanup_unrecoverable_pending(restore_receipt, error);
+        }
         if self.legacy_v2.is_some() {
             return self.cleanup_legacy_v2();
         }
@@ -1209,6 +1211,101 @@ where
         self.current = None;
         self.current_nft_fingerprint = None;
         self.restore_receipt = restore_receipt;
+        Ok(CleanupResponse {
+            cleaned: true,
+            diagnostics,
+        })
+    }
+
+    /// A pending transaction whose rollback cannot finish (for example the
+    /// previous generation's route can no longer be installed) keeps its
+    /// restore guard, and recovery alone would retry forever. An authorized
+    /// cleanup may still remove it, but only when the live state is exactly a
+    /// state this journal's transaction can produce: the same ownership proof
+    /// recovery uses. Anything else keeps the original refusal.
+    fn cleanup_unrecoverable_pending(
+        &mut self,
+        restore_receipt: Option<RestoreReceipt>,
+        error: PrivilegedError,
+    ) -> Result<CleanupResponse, PrivilegedError> {
+        let Some(record) = self.store.load()? else {
+            return Err(error);
+        };
+        let Some(pending) = record.pending.clone() else {
+            return Err(error);
+        };
+        if record.legacy_v2.is_some()
+            || record.legacy_v1.is_some()
+            || record.cleanup_pending
+            || record.orphan_cleanup.is_some()
+        {
+            return Err(error);
+        }
+        validate_stored_plan(record.active.as_ref(), "active")?;
+        validate_stored_plan(Some(&pending), "pending")?;
+        validate_stored_fingerprint_pair(
+            record.active.as_ref(),
+            record.active_nft_fingerprint.as_deref(),
+        )?;
+        validate_pending_expectations(
+            record.active.as_ref(),
+            Some(&pending),
+            record.pending_expectations.as_ref(),
+        )?;
+        validate_restore_receipt(&record)?;
+        validate_setting_receipts(&record)?;
+        let expectations = record
+            .pending_expectations
+            .as_ref()
+            .expect("validated pending state has exact expectations");
+        let active = record.active.as_ref().map(AppliedKernelState::from_plan);
+        verify_pending_table_ownership(
+            &mut self.executor,
+            active.as_ref(),
+            record.active_nft_fingerprint.as_deref(),
+            &pending,
+            expectations,
+        )
+        .map_err(|proof| {
+            PrivilegedError::new(format!(
+                "{error}; cleanup refused, ownership not proven: {proof}"
+            ))
+        })?;
+        // Revoke runtime authority before any resource changes.
+        self.runtime = None;
+        self.runtime_restore = None;
+        self.runtime_loaded = true;
+        let lost = expectations.lost_unicast.clone();
+        let mut runner =
+            CommandKernelRunner::new(&mut self.executor, active).with_lost_unicast(&lost);
+        runner.next = Some(pending);
+        runner
+            .snapshot()
+            .and_then(|_| runner.restore(None))
+            .map_err(|cleanup| {
+                PrivilegedError::new(format!(
+                    "{error}; cleanup of the unfinished transaction failed: {cleanup}"
+                ))
+            })?;
+        let mut receipts = record.interface_settings.clone();
+        for receipt in &record.pending_interface_settings {
+            if !receipts.contains(receipt) {
+                receipts.push(receipt.clone());
+            }
+        }
+        let diagnostics = restore_setting_receipts(&mut *self.settings, &receipts);
+        self.interface_settings.clear();
+        match restore_receipt.clone() {
+            Some(receipt) => {
+                self.store
+                    .save(&StoredAppliedState::committed(None, None, Some(receipt)))?
+            }
+            None => self.store.clear()?,
+        }
+        self.current = None;
+        self.current_nft_fingerprint = None;
+        self.restore_receipt = restore_receipt;
+        self.initialized = true;
         Ok(CleanupResponse {
             cleaned: true,
             diagnostics,
@@ -6218,6 +6315,7 @@ mod tests {
         fail_activation_containing: Option<String>,
         fail_rollback: bool,
         fail_route_flush: bool,
+        fail_route_replace: bool,
         tamper_json_result: bool,
         foreign_reserved_route: bool,
         /// Everything beyond the legacy IPv4 table-20000 unicast/rule flags.
@@ -6376,6 +6474,9 @@ mod tests {
                                 .map(|(_, rule)| rule.clone()),
                         );
                         Ok(CommandOutput::success(serde_json::to_vec(&body).unwrap()))
+                    }
+                    ["route", "replace", ..] if state.fail_route_replace => {
+                        Ok(CommandOutput::failure("injected route install failure"))
                     }
                     ["route", "replace", ..] if fake_flag_route(spec) => {
                         state.has_route = true;
@@ -8366,6 +8467,107 @@ mod tests {
     }
 
     #[test]
+    fn a_rollback_that_cannot_finish_still_allows_an_authorized_cleanup() {
+        // The previous generation cannot be reinstated (its route install keeps
+        // failing), so the restore guard stays and the journal stays pending.
+        // Recovery alone would retry forever; an authorized cleanup of the
+        // exactly classified state must still remove what RouteLane owns.
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let active = fixture_valid_plan();
+        let mut next = active.clone();
+        next.generation += 1;
+        next.rules[0].target = CompiledTarget::Network("192.0.2.0/24".parse().unwrap());
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        backend.apply(&active).unwrap();
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.fail_activation_containing = Some(super::state_chain_name(&next));
+            kernel.fail_route_replace = true;
+        }
+        backend.apply(&next).unwrap_err();
+        assert!(store
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|state| state.pending.is_some()));
+        assert!(kernel.lock().unwrap().has_guard, "the restore guard holds");
+
+        let mut restarted = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        let cleaned = restarted.cleanup().unwrap();
+        assert!(cleaned.cleaned, "{:?}", cleaned.diagnostics);
+        let kernel = kernel.lock().unwrap();
+        assert!(
+            !kernel.has_table && !kernel.has_guard,
+            "owned table removed"
+        );
+        assert!(
+            !kernel.has_rule && !kernel.has_route,
+            "owned routing removed"
+        );
+        assert!(
+            store
+                .state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|state| state.pending.is_none() && state.active.is_none()),
+            "the journal no longer claims a transaction"
+        );
+    }
+
+    #[test]
+    fn an_unfinished_transaction_without_ownership_proof_is_never_cleaned() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let active = fixture_valid_plan();
+        let mut next = active.clone();
+        next.generation += 1;
+        next.rules[0].target = CompiledTarget::Network("192.0.2.0/24".parse().unwrap());
+        let mut backend = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        backend.apply(&active).unwrap();
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.fail_activation_containing = Some(super::state_chain_name(&next));
+            kernel.fail_route_replace = true;
+        }
+        backend.apply(&next).unwrap_err();
+        // Someone else changed the RouteLane table: it is no longer a state
+        // this transaction can produce.
+        kernel.lock().unwrap().extra_nft_rule = true;
+        let journal_before = store.state.lock().unwrap().clone();
+        let mutations_before = mutation_count(&kernel.lock().unwrap());
+
+        let mut restarted = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        let error = restarted.cleanup().unwrap_err();
+        assert!(error.to_string().contains("refused"), "{error}");
+        assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
+        assert_eq!(*store.state.lock().unwrap(), journal_before);
+        assert!(kernel.lock().unwrap().has_guard, "nothing was removed");
+    }
+
+    #[test]
     fn selective_activation_guard_keeps_the_replaced_scope() {
         let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
         let mut active = fixture_valid_plan();
@@ -8509,6 +8711,123 @@ mod tests {
                 assert!(!tuples[..index].contains(tuple), "duplicate {tuple:?}");
             }
         }
+    }
+
+    #[test]
+    fn restart_during_restore_guard_completes_the_rollback() {
+        // The real interrupted state: the restore guard is live, every policy
+        // rule is removed, the tables are flushed and nothing is reinstalled.
+        for selective in [false, true] {
+            let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+            let store = FakeAppliedStateStore::default();
+            let mut active = fixture_valid_plan();
+            if selective {
+                active.unmatched_traffic = crate::domain::UnmatchedTraffic::PreserveSystem;
+            }
+            let mut next = active.clone();
+            next.generation += 1;
+            next.rules[0].target = CompiledTarget::Network("192.0.2.0/24".parse().unwrap());
+            {
+                let mut backend = CommandPrivilegedBackend::with_store(
+                    FakeCommandExecutor {
+                        state: Arc::clone(&kernel),
+                    },
+                    store.clone(),
+                );
+                backend.apply(&active).unwrap();
+                let mut kernel = kernel.lock().unwrap();
+                kernel.fail_activation_containing = Some(super::state_chain_name(&next));
+                kernel.fail_route_replace = true;
+                drop(kernel);
+                backend.apply(&next).unwrap_err();
+            }
+            {
+                let mut kernel = kernel.lock().unwrap();
+                assert!(kernel.has_guard && !kernel.has_rule && !kernel.has_route);
+                kernel.fail_activation_containing = None;
+                kernel.fail_route_replace = false;
+            }
+            let mut restarted = CommandPrivilegedBackend::with_store(
+                FakeCommandExecutor {
+                    state: Arc::clone(&kernel),
+                },
+                store.clone(),
+            );
+            let journal_before = store.state.lock().unwrap().clone();
+            let mutations_before = mutation_count(&kernel.lock().unwrap());
+            assert_eq!(
+                restarted.inspect().unwrap().generation,
+                Some(active.generation)
+            );
+            assert_eq!(
+                *store.state.lock().unwrap(),
+                journal_before,
+                "inspect never replays"
+            );
+            assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
+            restarted.ensure_reconciled().unwrap();
+            let persisted = store.state.lock().unwrap().clone().unwrap();
+            assert_eq!(persisted.active.as_ref(), Some(&active));
+            assert!(persisted.pending.is_none());
+            let kernel = kernel.lock().unwrap();
+            assert!(!kernel.has_guard, "selective={selective}: guard removed");
+            assert!(kernel.has_rule && kernel.has_route, "previous routing back");
+        }
+    }
+
+    #[test]
+    fn a_restore_guard_for_another_plan_is_refused_without_mutation() {
+        let kernel = Arc::new(Mutex::new(FakeKernelState::default()));
+        let store = FakeAppliedStateStore::default();
+        let mut active = fixture_valid_plan();
+        active.unmatched_traffic = crate::domain::UnmatchedTraffic::PreserveSystem;
+        {
+            let mut backend = CommandPrivilegedBackend::with_store(
+                FakeCommandExecutor {
+                    state: Arc::clone(&kernel),
+                },
+                store.clone(),
+            );
+            backend.apply(&active).unwrap();
+        }
+        let mut pending = active.clone();
+        pending.generation = 2;
+        {
+            let mut persisted = store.state.lock().unwrap();
+            let fingerprint = persisted.as_ref().unwrap().active_nft_fingerprint.clone();
+            *persisted = Some(StoredAppliedState {
+                active: Some(active.clone()),
+                active_nft_fingerprint: fingerprint,
+                pending: Some(pending.clone()),
+                pending_expectations: Some(
+                    build_pending_expectations(Some(&active), &pending).unwrap(),
+                ),
+                ..StoredAppliedState::default()
+            });
+        }
+        // A guard-only document, but for a scope neither journaled plan has.
+        let mut other = active.clone();
+        other.rules[0].target = CompiledTarget::Network("198.51.100.0/24".parse().unwrap());
+        run_nft_batch(
+            &mut FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            render_restore_guard_ruleset(&other, TableMode::Replace).unwrap(),
+            "simulate a foreign guard-only table",
+        )
+        .unwrap();
+        let journal_before = store.state.lock().unwrap().clone();
+        let mutations_before = mutation_count(&kernel.lock().unwrap());
+        let mut restarted = CommandPrivilegedBackend::with_store(
+            FakeCommandExecutor {
+                state: Arc::clone(&kernel),
+            },
+            store.clone(),
+        );
+        restarted.ensure_reconciled().unwrap_err();
+        restarted.cleanup().unwrap_err();
+        assert_eq!(*store.state.lock().unwrap(), journal_before);
+        assert_eq!(mutation_count(&kernel.lock().unwrap()), mutations_before);
     }
 
     #[test]

@@ -103,11 +103,20 @@ Bulgu (E5): başarısız bir geçişin geri alınması RouteLane tablosunu boşa
 önceki neslin politika kuralları ve rotaları yeniden kurulana kadar o neslin
 yönettiği hedefleri korumasız bırakıyordu. Düzeltme (`9950eac`): geri alma
 önce yalnız korumayı içeren bir belgeyle tabloyu atomik olarak değiştirir
-(önceki neslin yönetilen kapsamı reddedilir, yönetilmeyen trafik akmaya devam
-eder), sonra kuralları/rotaları kurar ve sahipli kural setini atomik olarak
-geri yükler. Bu aralıkta çöken helper için yeni `RestoreGuard` kurtarma evresi
-eklendi; parmak izi journal'daki aktif plandan hesaplanır, journal biçimi
-değişmedi.
+(önceki neslin yönetilen kapsamı reddedilir; seçici modda yönetilmeyen trafik
+akmaya devam eder, `UsePrimary` modunda koruma bilinçli olarak tüm yerel olmayan
+çıkışı tutar), sonra kuralları/rotaları kurar ve sahipli kural setini atomik
+olarak geri yükler. Bu aralıkta çöken helper için yeni `RestoreGuard` kurtarma
+evresi eklendi; parmak izi journal'daki aktif plandan hesaplanır, journal
+biçimi değişmedi.
+
+Bağımsız inceleme (11 Kasım 2026, ayrı model) bir Important bulgu verdi:
+geri alma hiç tamamlanamazsa (ör. önceki neslin rotası kurulamıyor) koruma
+kalıyordu ve `Cleanup` da kurtarmanın arkasında takılıyordu; `UsePrimary`
+için yeniden başlatmaya kadar tüm çıkış kapalı. Düzeltme: yetkili `Cleanup`,
+canlı durum kurtarmanın kullandığı tam sahiplik kanıtını geçerse yalnız
+journal'daki iki planın kaynaklarını kaldırır ve journal'ı temizler; kanıt
+yoksa hiçbir şeye dokunmadan reddeder (rootless testlerle, mutasyon dahil).
 
 | Kanıt | Sonuç |
 |---|---|
