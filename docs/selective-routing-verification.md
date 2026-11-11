@@ -151,9 +151,12 @@ dönüşten sonra en az 5 yedek akış değişimi ister.
 | `runtime_refresh…` 15× | 14/15; 1 hata **yeni ve ayrı bir bulgu**: yedek UDP akışının `send` çağrısı `EPERM` aldı |
 
 Açık bulgu (doğrulanmadı, hipotez): `UsePrimary` modunda geçici koruma
-(`guard`) geniş `reject` uygular ve yalnız sahipsiz (`ct mark 0`) oturumları
-geçirir. Bu yüzden bir çalışma zamanı geçişinin kısa koruma aralığında
-RouteLane'e ait, kurulu bir yedek akışın paketi de reddedilebilir. TCP yeniden
+(`guard`) geniş `reject` uygular ve kurulu oturumları ayırmaz
+(`preserve_unmanaged_sessions` yalnız sahipli kural setinde çağrılır). Bu yüzden
+bir çalışma zamanı geçişinin kısa koruma aralığında sahipli ya da sahipsiz,
+kurulu her yerel olmayan akışın paketi reddedilebilir. İkinci aday: sahipli
+işaretli paketi rotası yokken düşüren egress kuralı. Hangisinin düşürdüğü
+`nftrace` ile ayrıca kanıtlanmalı. TCP yeniden
 gönderimle sürer; UDP uygulamaya `EPERM` döner ve datagram kaybolur. Ürün
 kuralı "mevcut yedek akışlar koparılmaz" ile çelişebilir. Koruma sayaçlarıyla
 gerçek kernel kanıtı ve tasarım kararı gerekiyor; test bunu gizlemesin diye
