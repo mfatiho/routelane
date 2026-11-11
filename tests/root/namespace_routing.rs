@@ -398,7 +398,7 @@ fn root_worker_exercises_real_helper_transport() {
     assert!(nft_counter("203.0.113.10") > routed_before);
 
     let block_before = nft_counter("192.0.2.99");
-    let sink_before = sink_rx_packets(&names);
+    let sink_before = sink_ipv4_received(&names);
     let blocked = command_output(Command::new("/usr/bin/ping").args([
         "-n",
         "-c",
@@ -411,7 +411,7 @@ fn root_worker_exercises_real_helper_transport() {
         !blocked.status.success(),
         "block target unexpectedly replied"
     );
-    assert_eq!(sink_rx_packets(&names), sink_before);
+    assert_eq!(sink_ipv4_received(&names), sink_before);
     assert!(nft_counter("192.0.2.99") > block_before);
 
     helper.ok(json!({"method": "set_fail_point", "value": "activate_nft"}));
@@ -917,7 +917,7 @@ fn assert_probe_reaches_only(
     names: &RunNames,
     initial_mark: Option<u32>,
 ) {
-    let before = sink_rx_packets(names);
+    let before = sink_ipv4_received(names);
     let mut command = Command::new("/usr/bin/ping");
     command.args(["-n", "-c", "1", "-W", "2"]);
     if let Some(mark) = initial_mark {
@@ -930,7 +930,7 @@ fn assert_probe_reaches_only(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let after = sink_rx_packets(names);
+    let after = sink_ipv4_received(names);
     for lane in 0..3 {
         if lane == expected_sink {
             assert!(
@@ -948,27 +948,32 @@ fn assert_probe_reaches_only(
     }
 }
 
-fn sink_rx_packets(names: &RunNames) -> [u64; 3] {
+/// IPv4 datagrams each sink's network stack has received (`Ip: InReceives`
+/// in the sink namespace's `/proc/net/snmp`). Interface frame counters are
+/// not used: freshly created links also carry IPv6 link-local traffic (router
+/// solicitation, MLD) at unpredictable moments, which strict-RPF runs showed
+/// as spurious +2 on a sink that never saw an IPv4 probe.
+fn sink_ipv4_received(names: &RunNames) -> [u64; 3] {
     std::array::from_fn(|lane| {
         let output = checked_output(
             Command::new("/usr/sbin/ip").args([
                 "netns",
                 "exec",
                 &names.sinks[lane],
-                "/usr/sbin/ip",
-                "-j",
-                "-s",
-                "link",
-                "show",
-                "dev",
-                &names.sink_interfaces[lane],
+                "/usr/bin/cat",
+                "/proc/net/snmp",
             ]),
-            "read sink receive counters",
+            "read sink IPv4 receive counters",
         );
-        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-        value[0]["stats64"]["rx"]["packets"]
-            .as_u64()
-            .expect("ip -j -s link exposes RX packet counter")
+        let snmp = String::from_utf8(output.stdout).unwrap();
+        let mut ip = snmp.lines().filter(|line| line.starts_with("Ip: "));
+        let (header, values) = (ip.next().unwrap(), ip.next().unwrap());
+        header
+            .split_whitespace()
+            .zip(values.split_whitespace())
+            .find(|(key, _)| *key == "InReceives")
+            .and_then(|(_, value)| value.parse().ok())
+            .expect("/proc/net/snmp exposes Ip InReceives")
     })
 }
 

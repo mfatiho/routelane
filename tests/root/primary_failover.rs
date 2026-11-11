@@ -400,8 +400,12 @@ fn runtime_refresh(names: &RunNames, routing: &mut Routing) {
     assert_effective(&failover, "lane-c", None);
 
     let backup = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // Exchanges completed so far: the proof below is that the backup flows
+    // keep exchanging after failback, independent of how fast the VM is.
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let traffic = {
         let running = std::sync::Arc::clone(&backup);
+        let completed = std::sync::Arc::clone(&progress);
         std::thread::spawn(move || {
             let mut stream = tcp_connect(SHARED_TARGET).expect("backup session");
             let datagrams = UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -424,6 +428,7 @@ fn runtime_refresh(names: &RunNames, routing: &mut Routing) {
                     Err(_) => lost += 1,
                 }
                 exchanges += 1;
+                completed.store(exchanges, std::sync::atomic::Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(20));
             }
             (exchanges, lost)
@@ -443,11 +448,24 @@ fn runtime_refresh(names: &RunNames, routing: &mut Routing) {
     std::thread::sleep(Duration::from_millis(300));
     let failback = helper.ok(json!({"method": "refresh_runtime", "now_ms": 7_100}));
     assert_effective(&failback, "lane-a", Some("lane-a"));
-    std::thread::sleep(Duration::from_millis(300));
+    let at_failback = progress.load(std::sync::atomic::Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while progress.load(std::sync::atomic::Ordering::SeqCst) < at_failback + 5
+        && !traffic.is_finished()
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     backup.store(false, std::sync::atomic::Ordering::SeqCst);
     let (exchanges, lost) = traffic.join().expect("backup TCP and UDP kept working");
-    eprintln!("evidence: backup flows {exchanges} exchanges, {lost} UDP replies lost");
-    assert!(exchanges > 20);
+    eprintln!(
+        "evidence: backup flows {exchanges} exchanges ({at_failback} before failback), {lost} UDP replies lost"
+    );
+    assert!(at_failback > 0, "backup flows exchanged before failback");
+    assert!(
+        exchanges >= at_failback + 5,
+        "backup flows kept exchanging after failback: {exchanges} total, {at_failback} before"
+    );
 
     let mut fresh = tcp_connect(SHARED_TARGET).expect("new flow after failback");
     assert_echo(&tcp_exchange(&mut fresh, "fresh"), 0, "fresh");
