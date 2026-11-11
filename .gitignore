@@ -25,6 +25,7 @@ docs/*
 !docs/reliability-audit.md
 !docs/handoff.md
 !docs/overview-and-tray.md
+!docs/system-primary.md
 !docs/screenshots/
 docs/screenshots/*
 !docs/screenshots/overview-tray/
@@ -33,3 +34,5 @@ docs/screenshots/overview-tray/*
 !docs/screenshots/overview-tray/overview-en.png
 !docs/screenshots/overview-tray/overview-narrow-tr.png
 !docs/screenshots/overview-tray/overview-narrow-en.png
+!docs/screenshots/overview-tray/system-primary-tr.png
+!docs/screenshots/overview-tray/system-primary-en.png

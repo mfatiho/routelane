@@ -81,12 +81,21 @@ route, rule, nftables, ownership, and conflict evidence.
 
 Overview highlights what needs attention and the verified applied scope and
 IPv4/IPv6 exits. Saved preferences and local health evidence remain available
-under Routing details. A connection selector shows up to seven measured days
-of total interface traffic, with a quota bar only when configured; shortcuts
-lead to the existing connection, rule and application pages.
+under Routing details. Connection lists and shortcuts stay in their own tabs;
+usage charts and quota details are in the selected connection's detail window.
 The system-tray menu shows verified status and offers the same guarded routing
 actions as the window. "Quit interface" leaves routing running; turning routing
 off is a separate action. See [Overview and tray behavior](docs/overview-and-tray.md).
+
+Connections also provides an explicit **Make system primary (IPv4)** operation.
+It compares the selected primary with the actual OS default and, after a separate
+confirmation and NetworkManager authorization, saves only that profile's IPv4
+route metric. The setting survives closing RouteLane. **Restore previous priority**
+uses a private recovery record and refuses changed identities or unrelated settings.
+This is not part of routing activation or automatic failover; it preserves
+`PreserveSystem`. Safe updates require NetworkManager 1.44+; older or unsupported
+managers remain usable for routing, but this action is unavailable. See
+[System primary connection](docs/system-primary.md) for boundaries and recovery.
 Rules and Applications keep Add and Search above their lists; contextual menus
 provide editing, deletion and ordering without permanently expanded controls.
 Ctrl+F focuses search, Ctrl+N opens the current section's editor, and Escape
@@ -250,9 +259,9 @@ networks counts them too; the quota window says so for wireless adapters.
 Quotas by Wi-Fi network (SSID) are a later item.
 
 Each row on Connections shows that connection's own usage: today's totals,
-the last seven days, or the quota bar for this period. Overview also shows a
-selected connection's daily chart and configured quota, and lists quota warnings
-in its "needs attention" group once they reach the warning threshold. The
+the last seven days, or the quota bar for this period. Full charts are available
+only in connection details; Overview lists quota warnings in "needs attention"
+once they reach the warning threshold. The
 Events tab holds the event history: profile applied or turned off, failed
 applies and their rollback, rules applied, failover and failback, attention
 states and quota thresholds, with filters. Events are kept for 30 days (at most 5,000)

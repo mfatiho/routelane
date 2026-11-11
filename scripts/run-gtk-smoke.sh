@@ -16,6 +16,8 @@ export BROADWAY_DISPLAY=:1
 export GIO_USE_VFS=local
 export GSETTINGS_BACKEND=memory
 export GTK_USE_PORTAL=0
+# A GTK test must never observe or activate the host's NetworkManager/Polkit.
+export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"
 export G_DEBUG=fatal-warnings
 gtk4-broadwayd --port=0 :1 >"$smoke_root/broadway.log" 2>&1 &
 broadway_pid=$!
@@ -31,3 +33,4 @@ for _ in {1..50}; do
     sleep 0.1
 done
 cargo test --bin routelane gtk_smoke_ -- --ignored --test-threads=1 --nocapture
+cargo test --lib nm_private_bus_write_contract -- --ignored --test-threads=1 --nocapture

@@ -455,6 +455,7 @@ impl PrimaryControls {
 #[derive(Clone)]
 pub struct ConnectionsPage {
     pub list: ListPage,
+    pub system_primary: Rc<super::system_primary::SystemPrimary>,
     profile: Rc<RefCell<Profile>>,
     parent: glib::WeakRef<adw::ApplicationWindow>,
     texts: Texts,
@@ -480,6 +481,11 @@ impl ConnectionsPage {
             on_save.clone(),
         ));
         let page = Self {
+            system_primary: super::system_primary::SystemPrimary::new(
+                parent,
+                profile.clone(),
+                texts,
+            ),
             list: ListPage::new(texts, Section::Connections),
             profile,
             parent: parent.downgrade(),
@@ -495,6 +501,7 @@ impl ConnectionsPage {
         page.list.root.append(&page.primary.group);
         page.list.root.append(&page.primary.feedback);
         page.list.root.append(&page.primary.backups);
+        page.list.root.append(&page.system_primary.root);
         page.connect_primary_controls();
         page.refresh_system_default();
         let parent = page.parent.clone();
@@ -636,6 +643,10 @@ impl ConnectionsPage {
     }
 
     pub fn update(&self, editing_enabled: bool) {
+        self.system_primary.update(editing_enabled);
+        if let Some(default) = self.system_primary.observed_default() {
+            *self.primary.system_default.borrow_mut() = Some(default);
+        }
         self.list.add.set_sensitive(editing_enabled);
         self.list.group.set_sensitive(editing_enabled);
         self.primary.group.set_sensitive(editing_enabled);

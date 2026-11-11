@@ -15,6 +15,7 @@ pub mod rule_row;
 pub mod session;
 pub mod settings;
 pub mod shell;
+pub mod system_primary;
 pub mod tray;
 pub mod window;
 

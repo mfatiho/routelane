@@ -126,6 +126,15 @@ impl TrayPresentation {
     pub fn allows(&self, action: TrayRoutingAction) -> bool {
         self.action == Some(action)
     }
+    pub fn block_for_system_change(&mut self) {
+        self.action = None;
+        self.can_quit = false;
+        self.status = self.language.texts().system_primary.busy.into();
+    }
+    pub fn add_system_warning(&mut self, message: String) {
+        self.problem = true;
+        self.details.push(message);
+    }
 }
 
 struct RouteLaneTray {

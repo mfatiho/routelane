@@ -134,7 +134,6 @@ struct WindowUi {
     /// Last verified effective exit, to announce each transition once.
     last_effective: RefCell<Option<routelane::backend::FamilyPair<routelane::backend::FamilyExit>>>,
     recovery_dialog_open: Cell<bool>,
-    quick_application: gtk::Button,
     preferences: gtk::Button,
     tray_updates: mpsc::Sender<TrayPresentation>,
     last_tray: RefCell<Option<TrayPresentation>>,
@@ -142,6 +141,9 @@ struct WindowUi {
 
 impl WindowUi {
     fn route_from_tray(self: &Rc<Self>, action: crate::ui::tray::TrayRoutingAction) {
+        if self.connections.system_primary.is_busy() {
+            return;
+        }
         let allowed = TrayPresentation::from_session(
             &self.profile.borrow(),
             &self.controller.session(),
@@ -177,6 +179,9 @@ impl WindowUi {
         candidate: Profile,
         enabled_change: Option<(RuleId, bool)>,
     ) -> bool {
+        if self.connections.system_primary.is_busy() {
+            return false;
+        }
         if let Err(error) = routelane::domain::validate_profile(&candidate) {
             log::warn!("invalid UI candidate: {error:?}");
             return false;
@@ -214,6 +219,9 @@ impl WindowUi {
     }
 
     fn apply(self: &Rc<Self>) {
+        if self.connections.system_primary.is_busy() {
+            return;
+        }
         let profile = self.profile.borrow().clone();
         let first_activation = self
             .controller
@@ -455,7 +463,10 @@ impl WindowUi {
 
     fn editable(&self) -> bool {
         let session = self.controller.session();
-        session.config_writable() && session.snapshot_known() && !session.is_busy()
+        session.config_writable()
+            && session.snapshot_known()
+            && !session.is_busy()
+            && !self.connections.system_primary.is_busy()
     }
 
     fn delete(self: &Rc<Self>, id: RuleId) {
@@ -512,6 +523,9 @@ impl WindowUi {
     }
 
     fn application_action(self: &Rc<Self>, id: RuleId, action: ApplicationAction) {
+        if self.connections.system_primary.is_busy() {
+            return;
+        }
         let profile = self.profile.borrow().clone();
         let Some(rule) = profile.rules.iter().find(|rule| rule.id == id) else {
             return;
@@ -754,7 +768,20 @@ impl WindowUi {
         self.shell
             .status_row
             .set_subtitle(if title == detail { "" } else { detail });
-        let tray = TrayPresentation::from_session(&profile, &session, self.texts.language);
+        let mut tray = TrayPresentation::from_session(&profile, &session, self.texts.language);
+        let system_warning = self.connections.system_primary.attention();
+        if let Some(message) = &system_warning {
+            tray.add_system_warning(message.clone());
+        }
+        self.overview
+            .set_system_attention(system_warning.as_deref());
+        let system_busy = self.connections.system_primary.is_busy();
+        if system_busy {
+            tray.block_for_system_change();
+            self.shell
+                .status_row
+                .set_subtitle(self.texts.system_primary.busy);
+        }
         if self.last_tray.borrow().as_ref() != Some(&tray) {
             let _ = self.tray_updates.send(tray.clone());
             *self.last_tray.borrow_mut() = Some(tray);
@@ -779,10 +806,13 @@ impl WindowUi {
         self.shell.primary.set_tooltip_text(Some(full_action));
         self.shell
             .primary
-            .set_sensitive(state.primary_action_enabled);
-        let editable = session.config_writable() && session.snapshot_known() && !session.is_busy();
+            .set_sensitive(state.primary_action_enabled && !system_busy);
+        let editable = session.config_writable()
+            && session.snapshot_known()
+            && !session.is_busy()
+            && !system_busy;
         self.preferences
-            .set_sensitive(session.config_writable() && !session.is_busy());
+            .set_sensitive(session.config_writable() && !session.is_busy() && !system_busy);
         self.rules.add.set_sensitive(editable);
         self.rules.group.set_sensitive(editable);
         self.applications.add.set_sensitive(editable);
@@ -798,7 +828,9 @@ impl WindowUi {
                         .is_none_or(|choice| choice.unsupported_reason.is_none()),
                     _ => false,
                 };
-                let eligible = supported && session.application_actions_enabled(&profile, rule);
+                let eligible = supported
+                    && !system_busy
+                    && session.application_actions_enabled(&profile, rule);
                 if let Some(adopt) =
                     crate::ui::form::menu_action(&row.menu, self.texts.ux.adopt_confirm)
                 {
@@ -819,18 +851,11 @@ impl WindowUi {
                 } else {
                     self.texts.ux.launch_neutral
                 });
-                row.row.set_sensitive(!session.is_busy());
+                row.row.set_sensitive(!session.is_busy() && !system_busy);
             }
         }
-        self.quick_application.set_visible(
-            !profile.lanes.is_empty()
-                && !profile
-                    .rules
-                    .iter()
-                    .any(|rule| matches!(rule.source, RuleSource::Application(_))),
-        );
-        self.quick_application.set_sensitive(editable);
         self.overview.update(&profile, &session);
+        self.overview.reapply.set_sensitive(editable);
         self.events_page.update(&profile, session.events());
         self.connections.update(editable);
         let status = session.confirmed_status().cloned();
@@ -1045,9 +1070,6 @@ fn build_window_with_repository(
     shell.add_page(Section::Applications, &applications.root);
     shell.add_page(Section::Connections, &connections.list.root);
     shell.add_page(Section::Events, &events_page.root);
-    let quick_application = gtk::Button::with_label(texts.add_application);
-    quick_application.set_halign(gtk::Align::Start);
-    overview.add_quick_application(&quick_application);
     let toast = adw::ToastOverlay::new();
     toast.set_child(Some(&shell.root));
     toast.set_vexpand(true);
@@ -1080,12 +1102,19 @@ fn build_window_with_repository(
         last_desktop_notice: RefCell::new(None),
         last_effective: RefCell::new(None),
         recovery_dialog_open: Cell::new(false),
-        quick_application,
         preferences,
         tray_updates,
         last_tray: RefCell::new(None),
     });
     *weak_slot.borrow_mut() = Rc::downgrade(&ui);
+    let weak = Rc::downgrade(&ui);
+    ui.connections
+        .system_primary
+        .connect_changed(Rc::new(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.render();
+            }
+        }));
     #[cfg(test)]
     tests::LAST_UI.with(|slot| *slot.borrow_mut() = Rc::downgrade(&ui));
     let weak = Rc::downgrade(&ui);
@@ -1100,7 +1129,7 @@ fn build_window_with_repository(
     ui.shell.primary.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
             let state = dashboard_state(&ui.profile.borrow(), &ui.controller.session());
-            if !state.primary_action_enabled {
+            if !state.primary_action_enabled || ui.connections.system_primary.is_busy() {
                 return;
             }
             match state.primary_action {
@@ -1138,7 +1167,6 @@ fn build_window_with_repository(
     for (button, section) in [
         (ui.rules.add.clone(), Section::Rules),
         (ui.applications.add.clone(), Section::Applications),
-        (ui.quick_application.clone(), Section::Applications),
     ] {
         let weak = Rc::downgrade(&ui);
         button.connect_clicked(move |_| {
@@ -1401,17 +1429,23 @@ fn build_window_with_repository(
                 }
             }
             TrayCommand::Quit => {
-                if weak_ui
-                    .upgrade()
-                    .is_some_and(|ui| !ui.controller.session().is_busy())
-                {
+                if weak_ui.upgrade().is_some_and(|ui| {
+                    !ui.controller.session().is_busy() && !ui.connections.system_primary.is_busy()
+                }) {
                     app_quit.quit();
                 }
             }
         };
         glib::Continue(true)
     });
+    let closing_ui = Rc::downgrade(&ui);
     window.connect_close_request(move |window| {
+        if closing_ui
+            .upgrade()
+            .is_some_and(|ui| ui.connections.system_primary.is_busy())
+        {
+            return glib::signal::Inhibit(true);
+        }
         if tray_available.load(Ordering::Relaxed) {
             window.hide();
             glib::signal::Inhibit(true)
@@ -1424,7 +1458,7 @@ fn build_window_with_repository(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use routelane::health::HealthReport;
     use routelane::ipc::DaemonStatus;
@@ -2148,6 +2182,7 @@ mod tests {
             assert_routing_scope_and_activation_preview(&app, language);
             assert_usage_screens(&app, language);
             assert_overview_and_events(&app, language);
+            crate::ui::system_primary::tests::gtk_contract(&app, language.texts());
         }
     }
 
@@ -2216,7 +2251,7 @@ mod tests {
     }
 
     /// Writes a PNG of `widget` when ROUTELANE_SMOKE_SHOTS names a directory.
-    fn screenshot(widget: &impl IsA<gtk::Widget>, name: &str) {
+    pub(crate) fn screenshot(widget: &impl IsA<gtk::Widget>, name: &str) {
         let Some(directory) = std::env::var_os("ROUTELANE_SMOKE_SHOTS") else {
             return;
         };
@@ -2338,6 +2373,19 @@ mod tests {
         let summary = Overview::new(texts);
         summary.update(&summary_profile, &summary_session);
         let summary_root = summary.root.upcast_ref::<gtk::Widget>();
+        assert!(!find_named(summary_root, "overview-attention")
+            .unwrap()
+            .is_visible());
+        summary.set_system_attention(Some(texts.system_primary.mismatch));
+        summary.update(&summary_profile, &summary_session);
+        assert!(
+            find_named(summary_root, "overview-attention")
+                .unwrap()
+                .is_visible(),
+            "a system-exit mismatch is visible even with a healthy managed plan"
+        );
+        summary.set_system_attention(None);
+        summary.update(&summary_profile, &summary_session);
         assert!(!find_named(summary_root, "overview-attention")
             .unwrap()
             .is_visible());
@@ -2526,7 +2574,14 @@ mod tests {
         let overview = stack.child_by_name("overview").unwrap();
         assert!(!has_text(&overview, texts.usage.usage_overview));
         assert!(!has_text(&overview, texts.usage.recent_events));
-        for name in ["overview-events", "events-open", "overview-counts"] {
+        for name in [
+            "overview-events",
+            "events-open",
+            "overview-counts",
+            "overview-usage",
+            "overview-connections",
+            "overview-shortcuts",
+        ] {
             assert!(find_named(&overview, name).is_none());
         }
         let details = find_named(&overview, "overview-routing-details")
@@ -2534,50 +2589,8 @@ mod tests {
             .downcast::<gtk::Expander>()
             .unwrap();
         assert!(!details.is_expanded(), "technical rows start collapsed");
-        let selector = find_named(&overview, "overview-usage-connection")
-            .unwrap()
-            .downcast::<gtk::ComboBoxText>()
-            .unwrap();
-        assert_eq!(selector.active_id().as_deref(), Some("ethernet"));
-        assert!(find_named(&overview, "overview-usage-chart")
-            .unwrap()
-            .is_visible());
-        let caption = find_named(&overview, "overview-usage-caption")
-            .unwrap()
-            .downcast::<gtk::Label>()
-            .unwrap();
-        assert!(caption.text().contains("2026-11-04") && caption.text().contains("2026-11-10"));
-        assert!(
-            caption
-                .text()
-                .contains(if tr { "3,5 GB" } else { "3.5 GB" }),
-            "a visible scale accompanies the bars"
-        );
-        let quota = find_named(&overview, "overview-quota").unwrap();
-        assert!(
-            !quota.is_visible(),
-            "no quota UI for an unlimited connection"
-        );
-        selector.set_active_id(Some("vinn"));
-        drain();
-        assert!(quota.is_visible());
-        assert!(
-            (find_named(&overview, "overview-quota-bar")
-                .unwrap()
-                .downcast::<gtk::ProgressBar>()
-                .unwrap()
-                .fraction()
-                - 0.8)
-                .abs()
-                < 0.001
-        );
         let ui = LAST_UI.with(|slot| slot.borrow().upgrade().unwrap());
         ui.render();
-        assert_eq!(
-            selector.active_id().as_deref(),
-            Some("vinn"),
-            "polling preserves the selected connection"
-        );
         ui.route_from_tray(crate::ui::tray::TrayRoutingAction::Disable);
         assert!(
             requests.try_recv().is_err(),
@@ -2598,14 +2611,6 @@ mod tests {
         let narrow_shell = Shell::new(texts);
         let narrow_overview = Overview::new(texts);
         narrow_overview.update(&ui.profile.borrow(), &ui.controller.session());
-        find_named(
-            narrow_overview.root.upcast_ref(),
-            "overview-usage-connection",
-        )
-        .unwrap()
-        .downcast::<gtk::ComboBoxText>()
-        .unwrap()
-        .set_active_id(Some("vinn"));
         narrow_shell.add_page(Section::Overview, &narrow_overview.root);
         narrow_shell.status_row.set_title(texts.routing_inactive);
         narrow_shell.primary.set_label(texts.dashboard.enable);
@@ -2623,52 +2628,8 @@ mod tests {
         );
         narrow_shell.primary.grab_focus();
         screenshot(&narrow, &format!("overview-narrow-{tag}.png"));
-        // Loading, empty, and disconnected states must not masquerade as a
-        // current zero-usage measurement or leave a stale quota on screen.
-        let current_profile = ui.profile.borrow().clone();
-        let mut usage_session = crate::ui::overview::tests::applied_session(&current_profile);
-        narrow_overview.update(&current_profile, &usage_session);
-        let empty = find_named(narrow_overview.root.upcast_ref(), "overview-usage-empty")
-            .unwrap()
-            .downcast::<gtk::Label>()
-            .unwrap();
-        let chart = find_named(narrow_overview.root.upcast_ref(), "overview-usage-chart").unwrap();
-        let quota = find_named(narrow_overview.root.upcast_ref(), "overview-quota").unwrap();
-        assert_eq!(empty.text(), texts.dashboard.usage_loading);
-        assert!(!chart.is_visible() && !quota.is_visible());
-        let usage_id = usage_session
-            .begin_request(DaemonRequest::GetUsage { fast_lane: None }, None)
-            .unwrap()
-            .into_iter()
-            .find_map(|effect| match effect {
-                crate::ui::session::UiEffect::Send(request) => Some(request.request_id),
-                _ => None,
-            })
-            .unwrap();
-        usage_session.handle_daemon(DaemonToUi::Response {
-            epoch: 1,
-            response: DaemonResponse::success(
-                usage_id,
-                DaemonResult::Usage(UsageReport { lanes: vec![] }),
-            ),
-        });
-        narrow_overview.update(&current_profile, &usage_session);
-        assert_eq!(empty.text(), texts.dashboard.usage_empty);
-        assert!(!chart.is_visible() && !quota.is_visible());
-        usage_session.handle_daemon(DaemonToUi::DaemonUnavailable {
-            epoch: 1,
-            request_id: None,
-            error: routelane::ipc::IpcError::new("OFFLINE", "offline"),
-        });
-        narrow_overview.update(&current_profile, &usage_session);
-        assert_eq!(empty.text(), texts.dashboard.usage_unavailable);
-        assert!(!chart.is_visible() && !quota.is_visible());
         narrow.destroy();
-        find_named(&overview, "overview-lane-ethernet")
-            .unwrap()
-            .downcast::<adw::ActionRow>()
-            .unwrap()
-            .emit_by_name::<()>("activated", &[]);
+        ui.shell.select(Section::Connections);
         assert_eq!(stack.visible_child_name().as_deref(), Some("connections"));
         for (tab, active) in [("overview", false), ("connections", true)] {
             assert_eq!(

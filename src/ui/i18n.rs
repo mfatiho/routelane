@@ -7,9 +7,6 @@ pub struct UxTexts {
     pub events: &'static str,
     pub attention: &'static str,
     pub status: &'static str,
-    pub primary_role: &'static str,
-    pub backup_role: &'static str,
-    pub in_use_now: &'static str,
     pub quota_attention: &'static str,
     pub seven_day_totals: &'static str,
     pub help: &'static str,
@@ -73,7 +70,7 @@ pub struct UxTexts {
 
 const UX_TR: UxTexts = UxTexts {
     events: "Olaylar", attention: "Dikkat gerektirenler",
-    status: "Durum", primary_role: "Birincil", backup_role: "Yedek", in_use_now: "Şu an kullanımda",
+    status: "Durum",
     quota_attention: "{lane}: kotanın %{percent}{suffix} kullanıldı",
     seven_day_totals: "Son 7 gün ↓ {down} GB ↑ {up} GB", help: "Yardım",
     duplicate_rule: "Bu hedef ve işlem için zaten bir kural var. Yeni kayıt yerine mevcut kuralı düzenleyin.",
@@ -104,7 +101,7 @@ const UX_TR: UxTexts = UxTexts {
 
 const UX_EN: UxTexts = UxTexts {
     events: "Events", attention: "Needs attention",
-    status: "Status", primary_role: "Primary", backup_role: "Backup", in_use_now: "In use now",
+    status: "Status",
     quota_attention: "{lane}: {percent}% of quota used",
     seven_day_totals: "Last 7 days ↓ {down} GB ↑ {up} GB", help: "Help",
     duplicate_rule: "A rule with this target and action already exists. Edit the existing rule instead.",
@@ -293,16 +290,12 @@ pub struct DashboardTexts {
     pub disable: &'static str,
     pub routing_summary: &'static str,
     pub routing_details: &'static str,
-    pub usage_title: &'static str,
     pub usage_note: &'static str,
-    pub choose_connection: &'static str,
     pub usage_empty: &'static str,
     pub usage_unavailable: &'static str,
     pub usage_loading: &'static str,
-    pub today: &'static str,
     pub history_summary: &'static str,
     pub authorization_required: &'static str,
-    pub quick_actions: &'static str,
     pub tray_problem: &'static str,
 }
 
@@ -311,17 +304,17 @@ const DASHBOARD_TR: DashboardTexts = DashboardTexts {
     disable: "Devre dışı bırak",
     routing_summary: "Uygulanan yönlendirme",
     routing_details: "Yönlendirme ayrıntıları",
-    usage_title: "Son 7 gün · veri kullanımı",
+
     usage_note:
         "Arayüzün toplam indirme + yükleme trafiği · yaklaşık. Yalnızca RouteLane trafiği değildir.",
-    choose_connection: "Grafikte gösterilecek bağlantı",
+
     usage_empty: "Henüz kullanım geçmişi yok. Ölçümler geldikçe grafik burada görünecek.",
     usage_unavailable: "Güncel kullanım bilgisi alınamadı. Yenile ile tekrar deneyin.",
     usage_loading: "Kullanım bilgisi alınıyor…",
-    today: "Bugün: {value} · yaklaşık",
+
     history_summary: "{start} – {end} · En yüksek: {value}/gün",
     authorization_required: "Yönetici izni gerekiyor",
-    quick_actions: "Kısayollar",
+
     tray_problem: "Sorunu görüntüle",
 };
 const DASHBOARD_EN: DashboardTexts = DashboardTexts {
@@ -329,21 +322,79 @@ const DASHBOARD_EN: DashboardTexts = DashboardTexts {
     disable: "Disable",
     routing_summary: "Applied routing",
     routing_details: "Routing details",
-    usage_title: "Last 7 days · data usage",
+
     usage_note: "Total interface download + upload · approximate. Not just RouteLane traffic.",
-    choose_connection: "Connection shown in the chart",
+
     usage_empty: "No usage history yet. The chart will appear as measurements arrive.",
     usage_unavailable: "Current usage is unavailable. Use Refresh to try again.",
     usage_loading: "Loading usage…",
-    today: "Today: {value} · approximate",
+
     history_summary: "{start} – {end} · Peak: {value}/day",
     authorization_required: "Administrator authorization required",
-    quick_actions: "Shortcuts",
+
     tray_problem: "View problem",
 };
 
 #[derive(Debug, Clone, Copy)]
+pub struct SystemPrimaryTexts {
+    pub title: &'static str,
+    pub description: &'static str,
+    pub choose: &'static str,
+    pub make: &'static str,
+    pub undo: &'static str,
+    pub aligned: &'static str,
+    pub mismatch: &'static str,
+    pub checking: &'static str,
+    pub busy: &'static str,
+    pub confirmed: &'static str,
+    pub restored: &'static str,
+    pub confirmation: &'static str,
+    pub restore_confirmation: &'static str,
+    pub unavailable: &'static str,
+    pub unsupported: &'static str,
+    pub disconnected: &'static str,
+    pub conflict: &'static str,
+    pub denied: &'static str,
+    pub incomplete: &'static str,
+}
+const SYSTEM_PRIMARY_TR: SystemPrimaryTexts = SystemPrimaryTexts {
+    title: "Sistemin ana bağlantısı (IPv4)",
+    description: "Seçici yönlendirmede diğer trafiğin çıkışını işletim sistemi belirler. Ana bağlantı tercihi tek başına sistem önceliğini değiştirmez.",
+    choose: "Önce yukarıdan belirli bir ana bağlantı seçin. Sistem varsayılanını izlerken değişiklik yapılmaz.",
+    make: "Sistem ana hattı yap", undo: "Önceki önceliği geri al",
+    aligned: "Sistem seçilen bağlantıyı kullanıyor", mismatch: "Sistem başka bir bağlantıyı kullanıyor",
+    checking: "Sistem bağlantısı denetleniyor…", busy: "Sistem bağlantısı güncelleniyor…",
+    confirmed: "IPv4 önceliği kaydedildi ve sistem çıkışı doğrulandı", restored: "Önceki IPv4 önceliği geri yüklendi",
+    confirmation: "{interface} bağlantısının IPv4 rota önceliği {old} → {new} olacak. Normal trafik ve bu bağlantının varsayılan metrikli rotaları etkilenir; bazı oturumlar yeniden bağlanabilir. Ayar RouteLane kapandıktan sonra da kalır. Diğer bağlantıların profilleri, DNS ve IPv6 ayarları değiştirilmez. Sistem yönetici izni isteyebilir. Onaylıyor musunuz?",
+    restore_confirmation: "RouteLane’in bu bağlantı için kaydettiği önceki IPv4 önceliği geri yüklenecek. Normal çıkış değişebilir ve bazı oturumlar yeniden bağlanabilir. Bağlantı kimliği veya diğer ayarlar değişmişse hiçbir şeyin üzerine yazılmaz. Onaylıyor musunuz?",
+    unavailable: "Sistem bağlantısı doğrulanamadı. Yenileyip tekrar deneyin.",
+    unsupported: "Bu ağ yöneticisi güvenli yerinde değişikliği desteklemiyor. NetworkManager 1.44+ ve bağımsız Ethernet/Wi-Fi profili gerekiyor.",
+    disconnected: "Seçilen bağlantı kapalı veya IPv4 adresi/ağ geçidi yok. Önce sistem ağ ayarlarından bağlanın.",
+    conflict: "Bağlantı veya öncelik değişti. Yeni durumu inceleyin; yabancı ayarların üzerine yazılmadı.",
+    denied: "Yönetici izni alınamadı. İşlem tamamlanmadı; kaydedilmiş bir adım varsa geri alma durumunu kontrol edin.",
+    incomplete: "Değişiklik bütünüyle doğrulanamadı. Otomatik tekrar yapılmadı; yenileyip geri alma durumunu kontrol edin.",
+};
+const SYSTEM_PRIMARY_EN: SystemPrimaryTexts = SystemPrimaryTexts {
+    title: "System primary connection (IPv4)",
+    description: "In selective mode the operating system chooses the exit for other traffic. Selecting a primary here does not itself change system priority.",
+    choose: "Choose an explicit primary connection above. Following the system default makes no changes.",
+    make: "Make system primary", undo: "Restore previous priority",
+    aligned: "The system uses the selected connection", mismatch: "The system uses a different connection",
+    checking: "Checking system connection…", busy: "Updating system connection…",
+    confirmed: "IPv4 priority saved and system exit verified", restored: "Previous IPv4 priority restored",
+    confirmation: "The IPv4 route priority of {interface} will change from {old} to {new}. Normal traffic and this connection’s routes using the default metric are affected; some sessions may reconnect. This persists after RouteLane closes. Other connection profiles, DNS and IPv6 settings are not changed. Administrator authorization may be requested. Continue?",
+    restore_confirmation: "Restore the previous IPv4 priority recorded by RouteLane for this connection. The normal exit may change and some sessions may reconnect. A changed connection identity or unrelated settings will not be overwritten. Continue?",
+    unavailable: "The system connection could not be verified. Refresh and try again.",
+    unsupported: "This network manager cannot safely update in place. NetworkManager 1.44+ and an independent Ethernet/Wi-Fi profile are required.",
+    disconnected: "The selected connection is disconnected or has no IPv4 address/gateway. Connect it in system network settings first.",
+    conflict: "The connection or priority changed. Review the new state; foreign settings were not overwritten.",
+    denied: "Administrator authorization was not obtained. The operation is incomplete; check recovery if a step was saved.",
+    incomplete: "The change was not fully verified. No automatic retry was made; refresh and check recovery.",
+};
+
+#[derive(Debug, Clone, Copy)]
 pub struct Texts {
+    pub system_primary: SystemPrimaryTexts,
     pub language: Language,
     pub dashboard: DashboardTexts,
     pub usage: UsageTexts,
@@ -415,7 +466,7 @@ impl LanguageTexts for Language {
     fn texts(self) -> Texts {
         match self {
             Self::Tr => Texts {
-                language: self, usage: USAGE_TR, dashboard: DASHBOARD_TR,
+                language: self, usage: USAGE_TR, dashboard: DASHBOARD_TR, system_primary: SYSTEM_PRIMARY_TR,
                 confirm_delete_rule_heading: "Kural silinsin mi?",
                 ux: UX_TR,
                 primary: PRIMARY_TR,
@@ -491,7 +542,7 @@ impl LanguageTexts for Language {
                 copy_error: "Kopyala",
             },
             Self::En => Texts {
-                language: self, usage: USAGE_EN, dashboard: DASHBOARD_EN,
+                language: self, usage: USAGE_EN, dashboard: DASHBOARD_EN, system_primary: SYSTEM_PRIMARY_EN,
                 confirm_delete_rule_heading: "Delete this rule?",
                 ux: UX_EN,
                 primary: PRIMARY_EN,

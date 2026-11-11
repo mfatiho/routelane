@@ -147,6 +147,7 @@ pub enum ChartMode {
 }
 pub struct UsageChart {
     pub area: gtk::DrawingArea,
+    pub summary: gtk::Label,
     data: Rc<RefCell<Option<LaneUsage>>>,
     mode: Rc<Cell<ChartMode>>,
     language: Language,
@@ -160,6 +161,11 @@ impl UsageChart {
         let data = Rc::new(RefCell::new(None::<LaneUsage>));
         let mode = Rc::new(Cell::new(ChartMode::Period));
         let chart = Self {
+            summary: gtk::Label::builder()
+                .xalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .build(),
             area,
             data,
             mode,
@@ -231,6 +237,7 @@ impl UsageChart {
                 let limit = lane
                     .quota
                     .as_ref()
+                    .filter(|_| mode.get() == ChartMode::Period)
                     .zip(today)
                     .map(|(quota, today)| daily_limit(quota, today));
                 let max = daily
@@ -304,6 +311,32 @@ impl UsageChart {
         };
         self.area
             .update_property(&[gtk::accessible::Property::Label(&label)]);
+        let caption = if self.mode.get() == ChartMode::LiveRate {
+            label.clone()
+        } else if let Some(lane) = data.as_ref().filter(|lane| !lane.daily.is_empty()) {
+            let values = if self.mode.get() == ChartMode::LastSevenDays {
+                &lane.daily[lane.daily.len().saturating_sub(7)..]
+            } else {
+                &lane.daily[..]
+            };
+            self.language
+                .texts()
+                .dashboard
+                .history_summary
+                .replace("{start}", &values[0].0.to_string())
+                .replace("{end}", &values[values.len() - 1].0.to_string())
+                .replace(
+                    "{value}",
+                    &format_bytes(
+                        peak.map_or(0, |(_, v)| v.rx.saturating_add(v.tx)),
+                        self.language,
+                    ),
+                )
+        } else {
+            self.language.texts().dashboard.usage_empty.into()
+        };
+        self.summary.set_label(&caption);
+        self.area.set_tooltip_text(Some(&label));
     }
 }
 

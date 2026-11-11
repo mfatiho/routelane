@@ -7,8 +7,8 @@
 - Üstte tek durum kartı ve kısa ana eylem bulunur. Tam eylem adı ekran okuyucu etiketi ve araç ipucunda korunur.
 - Genel Bakış önce dikkat gerektiren durumları, ardından **uygulanan** kapsamı gösterir. Etkin planda IPv4/IPv6 çıkış özeti de görünür; kayıtlı tercih uygulanmış gibi sunulmaz.
 - Sağlık, kayıtlı kapsam ve ayrıntılı çıkış bilgileri klavyeyle açılabilen **Yönlendirme ayrıntıları** bölümündedir. Yerel durum kanıtı internet erişim garantisi değildir.
-- Tek grafik, seçilen bağlantının en fazla son yedi günlük toplam indirme/yükleme kullanımını gösterir. Bağlantı seçimi durum sorgularında korunur. Diğer bağlantı özetleri ve mevcut uygulama/kural kısayolları kaldırılmaz.
-- İnce kota çubuğu yalnız seçilen bağlantıda etkin, geçerli kota varsa görünür. Kota dolması trafiğin durdurulduğu anlamına gelmez.
+- Kullanıcının sonraki seçimiyle Genel Bakış'tan **Kısayollar**, **Bağlantılar** ve **Son 7 gün veri kullanımı** kartı kaldırıldı. İlgili listeler kendi sekmelerindedir; uygulama/kural ekleme düğmeleri orada korunur.
+- Grafik ve kota ayrıntıları yalnız bağlantının detay penceresindedir. Günlük sütunlar tüketimi, canlı çizgiler indirme/yükleme hızını gösterir. Tarih aralığı ve sayısal tepe miktarı grafiğin altında görünür. Kota dolması trafiğin durdurulduğu anlamına gelmez.
 - Ayrıntılı olay geçmişi **Olaylar** sekmesinde; canlı hız grafikleri bağlantı ayrıntısındadır.
 
 ## Verinin anlamı ve sınırları
@@ -46,7 +46,8 @@ Yeni bağımlılık, IPC şeması, ayrıcalıklı komut veya otomatik yönlendir
 
 ## Kod ve doğrulama
 
-- `src/ui/overview.rs`: özet, ayrıntılar, seçimli grafik ve kota.
+- `src/ui/overview.rs`: özet, dikkat gerektirenler ve katlanabilir yönlendirme ayrıntıları.
+- `src/ui/{lane_detail,usage_widgets}.rs`: grafik, ölçülen tarih/tepe miktarı ve kota.
 - `src/ui/tray.rs`: GTK içermeyen sunum modeli ve yerel menü.
 - `src/ui/window.rs`: güvenli eylem aktarımı, durum yayını ve GTK smoke kontrolleri.
 - `src/ui/{shell,i18n}.rs`: kompakt durum kartı, erişilebilir eylem adları, TR/EN metinler.

@@ -6,8 +6,18 @@ use super::{
 };
 use gtk4::{self as gtk, prelude::*};
 use libadwaita::{self as adw, prelude::*};
-use routelane::{domain::Lane, usage::service::LaneUsage};
+use routelane::{
+    domain::Lane,
+    usage::service::{LaneUsage, UsageReport},
+};
 use std::rc::Rc;
+
+fn selected_usage<'a>(report: &'a UsageReport, lane: &Lane) -> Option<&'a LaneUsage> {
+    report
+        .lanes
+        .iter()
+        .find(|usage| usage.lane_id == lane.id && usage.interface == lane.interface.as_str())
+}
 
 pub fn open(
     parent: &adw::ApplicationWindow,
@@ -94,6 +104,15 @@ pub fn open(
     }
     body.append(&modes);
     body.append(&chart.area);
+    chart.summary.set_widget_name("lane-chart-summary");
+    body.append(&chart.summary);
+    let note = gtk::Label::builder()
+        .label(texts.dashboard.usage_note)
+        .wrap(true)
+        .xalign(0.0)
+        .build();
+    note.add_css_class("dim-label");
+    body.append(&note);
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&body)
@@ -110,15 +129,23 @@ pub fn open(
         if !window.is_visible() {
             return;
         }
-        let usage = controller
-            .session()
-            .usage()
-            .and_then(|report| report.lanes.iter().find(|u| u.lane_id == lane.id))
+        let session = controller.session();
+        let unavailable = !session.snapshot_known() || session.usage_error().is_some();
+        let loading = !unavailable && session.usage().is_none();
+        let usage = (!unavailable)
+            .then(|| {
+                session
+                    .usage()
+                    .and_then(|report| selected_usage(report, &lane))
+            })
+            .flatten()
             .cloned();
-        if rendered.borrow().as_ref() == Some(&usage) {
+        drop(session);
+        let key = (usage.clone(), unavailable, loading);
+        if rendered.borrow().as_ref() == Some(&key) {
             return;
         }
-        *rendered.borrow_mut() = Some(usage.clone());
+        *rendered.borrow_mut() = Some(key);
         while let Some(child) = quota_box.first_child() {
             quota_box.remove(&child);
         }
@@ -202,6 +229,11 @@ pub fn open(
             texts.usage.approximate
         ));
         chart.update(usage);
+        if unavailable {
+            chart.summary.set_label(texts.dashboard.usage_unavailable);
+        } else if loading {
+            chart.summary.set_label(texts.dashboard.usage_loading);
+        }
     });
     let weak_update = Rc::downgrade(&update);
     controller.connect_changed(Rc::new(move || {
@@ -246,4 +278,36 @@ fn totals_for(usage: Option<&LaneUsage>) -> (u64, u64) {
                 (rx.saturating_add(value.rx), tx.saturating_add(value.tx))
             })
     })
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn reused_lane_id_never_relabels_usage_from_an_old_interface() {
+        let lane = Lane {
+            id: "eth".into(),
+            name: "Ethernet".into(),
+            interface: "eth0".into(),
+            fallback_lane: None,
+            failure_policy: routelane::domain::LaneFailurePolicy::Block,
+        };
+        let mut report = UsageReport {
+            lanes: vec![LaneUsage {
+                lane_id: "eth".into(),
+                interface: "old0".into(),
+                available: true,
+                today: Default::default(),
+                quota: None,
+                daily: vec![],
+                rate: None,
+                recent_rates: vec![],
+            }],
+        };
+        assert!(selected_usage(&report, &lane).is_none());
+        report.lanes[0].interface = "eth0".into();
+        assert!(selected_usage(&report, &lane).is_some());
+        report.lanes[0].lane_id = "other".into();
+        assert!(selected_usage(&report, &lane).is_none());
+    }
 }
