@@ -4,6 +4,17 @@ use routelane::config::Language;
 pub struct UxTexts {
     pub review_definitions: &'static str,
     pub fallback_in_use: &'static str,
+    pub events: &'static str,
+    pub attention: &'static str,
+    pub traffic_now: &'static str,
+    pub status: &'static str,
+    pub counts: &'static str,
+    pub primary_role: &'static str,
+    pub backup_role: &'static str,
+    pub in_use_now: &'static str,
+    pub quota_attention: &'static str,
+    pub seven_day_totals: &'static str,
+    pub help: &'static str,
     pub overview: &'static str,
     pub rules: &'static str,
     pub applications: &'static str,
@@ -63,6 +74,10 @@ pub struct UxTexts {
 }
 
 const UX_TR: UxTexts = UxTexts {
+    events: "Olaylar", attention: "Dikkat gerektirenler", traffic_now: "Trafik şu an nereden çıkıyor",
+    status: "Durum", counts: "Tanımlar", primary_role: "Birincil", backup_role: "Yedek", in_use_now: "Şu an kullanımda",
+    quota_attention: "{lane}: kotanın %{percent}{suffix} kullanıldı",
+    seven_day_totals: "Son 7 gün ↓ {down} GB ↑ {up} GB", help: "Yardım",
     duplicate_rule: "Bu hedef ve işlem için zaten bir kural var. Yeni kayıt yerine mevcut kuralı düzenleyin.",
     review_definitions: "Tanımları Gözden Geçir",
     fallback_in_use: "Bu bağlantı başka bir bağlantının yedeği olarak kullanılıyor. Önce yedek bağlantı tanımını değiştirin.",
@@ -90,6 +105,10 @@ const UX_TR: UxTexts = UxTexts {
 };
 
 const UX_EN: UxTexts = UxTexts {
+    events: "Events", attention: "Needs attention", traffic_now: "Where traffic leaves now",
+    status: "Status", counts: "Definitions", primary_role: "Primary", backup_role: "Backup", in_use_now: "In use now",
+    quota_attention: "{lane}: {percent}% of quota used",
+    seven_day_totals: "Last 7 days ↓ {down} GB ↑ {up} GB", help: "Help",
     duplicate_rule: "A rule with this target and action already exists. Edit the existing rule instead.",
     review_definitions: "Review definitions",
     fallback_in_use: "Another connection uses this connection as its fallback. Change that fallback definition first.",
@@ -524,11 +543,11 @@ pub struct UsageTexts {
     pub wifi_note: &'static str,
     pub quota_invalid: &'static str,
     pub used_summary: &'static str,
-    pub overview_lane_totals: &'static str,
     pub event_error_detail: &'static str,
+    #[cfg(test)]
     pub usage_overview: &'static str,
+    #[cfg(test)]
     pub recent_events: &'static str,
-    pub show_all: &'static str,
     pub events_title: &'static str,
     pub events_all: &'static str,
     pub events_problems: &'static str,
@@ -587,11 +606,11 @@ const USAGE_TR: UsageTexts = UsageTexts {
     wifi_note: "aynı kartla bağlandığınız diğer ağlar da sayılır",
     quota_invalid: "Kota en az 0,1 GB, yenilenme günü 1–31, uyarı eşiği 1–99 olmalıdır.",
     used_summary: "{used} GB / {limit} GB kullanıldı · yaklaşık",
-    overview_lane_totals: "{lane} · ↓ {down} GB ↑ {up} GB · yaklaşık",
     event_error_detail: "{code} · {message} · rollback: {rollback}",
+    #[cfg(test)]
     usage_overview: "Veri kullanımı (bu dönem)",
+    #[cfg(test)]
     recent_events: "Son olaylar",
-    show_all: "Tümünü göster ›",
     events_title: "Olay geçmişi",
     events_all: "Tümü",
     events_problems: "Sorunlar",
@@ -651,11 +670,11 @@ const USAGE_EN: UsageTexts = UsageTexts {
     wifi_note: "other networks you connect to with the same adapter are also counted",
     quota_invalid: "Quota must be at least 0.1 GB, reset day 1–31, and warning threshold 1–99.",
     used_summary: "{used} GB / {limit} GB used · approximate",
-    overview_lane_totals: "{lane} · ↓ {down} GB ↑ {up} GB · approximate",
     event_error_detail: "{code} · {message} · rollback: {rollback}",
+    #[cfg(test)]
     usage_overview: "Data usage (this period)",
+    #[cfg(test)]
     recent_events: "Recent events",
-    show_all: "Show all ›",
     events_title: "Event history",
     events_all: "All",
     events_problems: "Problems",

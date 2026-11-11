@@ -22,6 +22,21 @@ use std::{
     rc::Rc,
 };
 
+/// The report supplies the same seven daily buckets formerly shown on Overview.
+fn seven_day_totals(usage: &routelane::usage::service::LaneUsage, texts: Texts) -> String {
+    let (rx, tx) = usage
+        .daily
+        .iter()
+        .fold((0u64, 0u64), |(rx, tx), (_, totals)| {
+            (rx.saturating_add(totals.rx), tx.saturating_add(totals.tx))
+        });
+    texts
+        .ux
+        .seven_day_totals
+        .replace("{down}", &format_gb(rx, texts.language))
+        .replace("{up}", &format_gb(tx, texts.language))
+}
+
 #[derive(Debug, Clone)]
 pub struct LaneDraft {
     pub name: String,
@@ -777,7 +792,7 @@ impl ConnectionsPage {
                 Some(usage) if !usage.available && usage.quota.is_none() => {
                     texts.not_connected.to_owned()
                 }
-                Some(usage) => match &usage.quota {
+                Some(usage) => match usage.quota.as_ref().filter(|q| q.settings.enabled) {
                     Some(quota) => texts
                         .period_used
                         .replace("{used}", &format_gb(quota.used_bytes, language))
@@ -790,6 +805,9 @@ impl ConnectionsPage {
                         .replace("{down}", &format_bytes(usage.today.rx, language))
                         .replace("{up}", &format_bytes(usage.today.tx, language)),
                 },
+                None if session.usage().is_none() && session.usage_error().is_some() => {
+                    self.texts.ux.request_failed.to_owned()
+                }
                 None => self.texts.ux.checking.to_owned(),
             };
             let subtitle = if usage.is_some_and(|usage| !usage.available && usage.quota.is_some()) {
@@ -797,6 +815,13 @@ impl ConnectionsPage {
             } else {
                 subtitle
             };
+            row.set_tooltip_text(
+                session
+                    .usage_error()
+                    .filter(|_| session.usage().is_none())
+                    .map(|error| error.to_string())
+                    .as_deref(),
+            );
             row.set_subtitle(&glib::markup_escape_text(&format!(
                 "{} · {subtitle}",
                 lane.interface.as_str()
@@ -804,7 +829,10 @@ impl ConnectionsPage {
             while let Some(child) = box_.first_child() {
                 box_.remove(&child);
             }
-            if let Some(quota) = usage.and_then(|u| u.quota.as_ref()) {
+            if let Some(quota) = usage
+                .and_then(|u| u.quota.as_ref())
+                .filter(|q| q.settings.enabled)
+            {
                 let percent = (quota.used_bytes as f64 / quota.settings.limit_bytes.max(1) as f64
                     * 100.0)
                     .round();
@@ -818,6 +846,11 @@ impl ConnectionsPage {
                 let bar = QuotaBar::new(quota, language).area;
                 bar.set_widget_name(&format!("quota-bar-{}", id.as_str()));
                 box_.append(&bar);
+            } else if let Some(usage) = usage {
+                let label = gtk::Label::new(Some(&seven_day_totals(usage, self.texts)));
+                label.set_widget_name(&format!("lane-usage-{}", id.as_str()));
+                label.add_css_class("caption");
+                box_.append(&label);
             }
         }
     }
@@ -1041,6 +1074,40 @@ fn render_primary(controls: &Rc<PrimaryControls>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn seven_day_totals_sum_all_report_days_and_use_tr_and_en_decimal_separators() {
+        use super::*;
+        use crate::ui::i18n::LanguageTexts;
+        use routelane::{
+            config::Language,
+            usage::{service::LaneUsage, LocalDate, UsageTotals},
+        };
+        let usage = LaneUsage {
+            lane_id: "ethernet".into(),
+            interface: "eth0".into(),
+            available: true,
+            today: UsageTotals::default(),
+            quota: None,
+            rate: None,
+            recent_rates: vec![],
+            daily: [
+                ("2026-11-09", 1_000_000_000, 100_000_000),
+                ("2026-11-10", 2_100_000_000, 320_000_000),
+            ]
+            .into_iter()
+            .map(|(date, rx, tx)| (LocalDate::parse(date).unwrap(), UsageTotals { rx, tx }))
+            .collect(),
+        };
+        assert_eq!(
+            seven_day_totals(&usage, Language::Tr.texts()),
+            "Son 7 gün ↓ 3,1 GB ↑ 0,4 GB"
+        );
+        assert_eq!(
+            seven_day_totals(&usage, Language::En.texts()),
+            "Last 7 days ↓ 3.1 GB ↑ 0.4 GB"
+        );
+    }
+
     use super::*;
     fn profile() -> Profile {
         Profile {

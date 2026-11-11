@@ -118,7 +118,6 @@ struct WindowUi {
     shell: Shell,
     overview: Overview,
     events_page: EventsPage,
-    overview_stack: gtk::Stack,
     overview_loaded: Cell<bool>,
     rules: ListPage,
     applications: ListPage,
@@ -782,9 +781,6 @@ impl WindowUi {
         );
         self.quick_application.set_sensitive(editable);
         self.overview.update(&profile, &session);
-        if self.events_page.all.is_active() {
-            self.overview.update_events(&profile, session.events());
-        }
         self.events_page.update(&profile, session.events());
         self.connections.update(editable);
         let status = session.confirmed_status().cloned();
@@ -994,19 +990,14 @@ fn build_window_with_repository(
         controller.clone(),
     );
     let events_page = EventsPage::new(&window, texts, controller.clone());
-    let overview_stack = gtk::Stack::builder()
-        .vhomogeneous(false)
-        .hhomogeneous(false)
-        .build();
-    overview_stack.add_named(&overview.root, Some("summary"));
-    overview_stack.add_named(&events_page.root, Some("events"));
-    shell.add_page(Section::Overview, &overview_stack);
+    shell.add_page(Section::Overview, &overview.root);
     shell.add_page(Section::Rules, &rules.root);
     shell.add_page(Section::Applications, &applications.root);
     shell.add_page(Section::Connections, &connections.list.root);
+    shell.add_page(Section::Events, &events_page.root);
     let quick_application = gtk::Button::with_label(texts.add_application);
     quick_application.set_halign(gtk::Align::Start);
-    overview.root.prepend(&quick_application);
+    overview.add_quick_application(&quick_application);
     let toast = adw::ToastOverlay::new();
     toast.set_child(Some(&shell.root));
     toast.set_vexpand(true);
@@ -1023,7 +1014,6 @@ fn build_window_with_repository(
         shell,
         overview,
         events_page,
-        overview_stack,
         overview_loaded: Cell::new(false),
         rules,
         applications,
@@ -1125,26 +1115,21 @@ fn build_window_with_repository(
         if let Some(ui) = weak.upgrade() {
             ui.controller.refresh();
             ui.controller.refresh_usage(None);
-            ui.controller
-                .refresh_events(routelane::usage::events::EventCategory::All);
+            ui.controller.refresh_events(ui.events_page.category());
         }
     });
     let weak = Rc::downgrade(&ui);
-    ui.overview.events_open.connect_clicked(move |_| {
+    ui.overview.set_on_select(Rc::new(move |section| {
         if let Some(ui) = weak.upgrade() {
-            ui.overview_stack.set_visible_child_name("events");
-            ui.events_page.all.set_active(true);
-            ui.controller
-                .refresh_events(routelane::usage::events::EventCategory::All);
+            ui.shell.select(section);
         }
-    });
+    }));
     let weak = Rc::downgrade(&ui);
-    ui.events_page.back.connect_clicked(move |_| {
+    ui.shell.stack.connect_visible_child_name_notify(move |_| {
         if let Some(ui) = weak.upgrade() {
-            ui.overview_stack.set_visible_child_name("summary");
-            ui.events_page.all.set_active(true);
-            ui.controller
-                .refresh_events(routelane::usage::events::EventCategory::All);
+            if ui.shell.section() == Section::Events {
+                ui.controller.refresh_events(ui.events_page.category());
+            }
         }
     });
     let weak = Rc::downgrade(&ui);
@@ -1251,10 +1236,9 @@ fn build_window_with_repository(
             .window
             .upgrade()
             .is_some_and(|window| window.is_visible())
-            && ui.overview_stack.visible_child_name().as_deref() == Some("summary")
+            && ui.shell.section() == Section::Events
         {
-            ui.controller
-                .refresh_events(routelane::usage::events::EventCategory::All);
+            ui.controller.refresh_events(ui.events_page.category());
         }
         glib::Continue(true)
     });
@@ -1293,6 +1277,7 @@ fn build_window_with_repository(
             match ui.shell.section() {
                 Section::Connections => ui.connections.open_add(),
                 Section::Applications => ui.open_application(None),
+                Section::Events => {}
                 _ => ui.open_rule(None),
             }
         }
@@ -1454,7 +1439,7 @@ mod tests {
     #[ignore = "requires display; run bash scripts/run-gtk-smoke.sh"]
     fn gtk_smoke_window_survives_profile_refresh_and_add_dialogs() {
         adw::init().unwrap();
-        crate::ui::shell::tests::assert_four_sections();
+        crate::ui::shell::tests::assert_five_sections();
         let temp = tempfile::TempDir::new().unwrap();
         let app = adw::Application::builder()
             .application_id("io.github.routelane.SmokeTest")
@@ -2258,6 +2243,49 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+        // Exercise applied and saved-unapplied layouts independently of the IPC fixture below.
+        let mut summary_profile = ConfigRepository::new(&path)
+            .load()
+            .unwrap()
+            .profiles
+            .remove(0);
+        let summary_session = crate::ui::overview::tests::applied_session(&summary_profile);
+        let summary = Overview::new(texts);
+        summary.update(&summary_profile, &summary_session);
+        let summary_root = summary.root.upcast_ref::<gtk::Widget>();
+        assert!(!find_named(summary_root, "overview-attention")
+            .unwrap()
+            .is_visible());
+        assert_eq!(
+            find_named(summary_root, "overview-ipv6")
+                .unwrap()
+                .downcast::<adw::ActionRow>()
+                .unwrap()
+                .subtitle()
+                .as_deref(),
+            Some(texts.primary.blocked)
+        );
+        summary_profile.routing.unmatched_traffic = routelane::domain::UnmatchedTraffic::UsePrimary;
+        summary.update(&summary_profile, &summary_session);
+        assert!(find_named(summary_root, "overview-attention")
+            .unwrap()
+            .is_visible());
+        assert!(summary.reapply.is_visible());
+        assert!(find_named(summary_root, "overview-saved-unapplied")
+            .unwrap()
+            .is_visible());
+        let applied = find_named(summary_root, "overview-applied-scope")
+            .unwrap()
+            .downcast::<adw::ActionRow>()
+            .unwrap();
+        assert!(applied
+            .subtitle()
+            .unwrap()
+            .contains(texts.ux.saved_unapplied));
+        assert!(applied.subtitle().unwrap().contains(scope_line(
+            routelane::domain::UnmatchedTraffic::PreserveSystem,
+            texts.primary
+        )));
         let before = std::fs::read(&path).unwrap();
         let (sender, requests) = async_channel::unbounded();
         let (events, receiver) = async_channel::unbounded();
@@ -2377,7 +2405,7 @@ mod tests {
                 ),
             })
             .unwrap();
-        wait_for(|| row_count(window.upcast_ref(), "overview-events") == 3);
+        wait_for(|| row_count(window.upcast_ref(), "events-list") == 5);
         // A subsequent recorded event independently refreshes the current category.
         events
             .try_send(DaemonToUi::Event {
@@ -2402,21 +2430,61 @@ mod tests {
             })
             .unwrap();
         drain();
-        assert!(has_text(window.upcast_ref(), texts.usage.usage_overview));
-        assert!(has_text(window.upcast_ref(), texts.usage.recent_events));
-        assert!(has_text(
-            window.upcast_ref(),
-            if tr {
-                "Ethernet · ↓ 3,1 GB ↑ 0,4 GB · yaklaşık"
-            } else {
-                "Ethernet · ↓ 3.1 GB ↑ 0.4 GB · approximate"
-            }
-        ));
-        assert!(find_named(window.upcast_ref(), "overview-quota-vinn").is_some());
-        screenshot(&window, &format!("overview-usage-{tag}.png"));
-        find_named(window.upcast_ref(), "events-open")
+        let stack = find_named(window.upcast_ref(), "sections")
             .unwrap()
-            .downcast::<gtk::Button>()
+            .downcast::<gtk::Stack>()
+            .unwrap();
+        let overview = stack.child_by_name("overview").unwrap();
+        assert!(!has_text(&overview, texts.usage.usage_overview));
+        assert!(!has_text(&overview, texts.usage.recent_events));
+        for name in ["overview-usage", "overview-events", "events-open"] {
+            assert!(find_named(&overview, name).is_none());
+        }
+        assert!(find_named(&overview, "overview-traffic").is_some());
+        for name in [
+            "overview-ipv4",
+            "overview-ipv6",
+            "overview-saved-scope",
+            "overview-applied-scope",
+        ] {
+            assert!(find_named(&overview, name).is_some());
+        }
+        screenshot(&window, &format!("overview-{tag}.png"));
+        find_named(&overview, "overview-lane-ethernet")
+            .unwrap()
+            .downcast::<adw::ActionRow>()
+            .unwrap()
+            .emit_by_name::<()>("activated", &[]);
+        assert_eq!(stack.visible_child_name().as_deref(), Some("connections"));
+        for (tab, active) in [("overview", false), ("connections", true)] {
+            assert_eq!(
+                find_named(window.upcast_ref(), tab)
+                    .unwrap()
+                    .downcast::<gtk::ToggleButton>()
+                    .unwrap()
+                    .is_active(),
+                active,
+                "navigation button {tab} follows the selected section"
+            );
+        }
+        assert!(find_named(window.upcast_ref(), "quota-bar-vinn").is_some());
+        let totals = find_named(window.upcast_ref(), "lane-usage-ethernet")
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert_eq!(
+            totals.text(),
+            if tr {
+                "Son 7 gün ↓ 3,1 GB ↑ 0,4 GB"
+            } else {
+                "Last 7 days ↓ 3.1 GB ↑ 0.4 GB"
+            }
+        );
+        wait_for(|| totals.is_mapped());
+        screenshot(&window, &format!("connections-usage-{tag}.png"));
+        find_named(window.upcast_ref(), "events")
+            .unwrap()
+            .downcast::<gtk::ToggleButton>()
             .unwrap()
             .emit_clicked();
         let read = next_request(&requests);
@@ -2472,7 +2540,7 @@ mod tests {
             "DAEMON_RECONCILIATION_FAILED · failure · rollback: ok"
         );
         assert!(has_text(&page, texts.usage.events_retention));
-        screenshot(&window, &format!("events-{tag}.png"));
+        screenshot(&window, &format!("events-tab-{tag}.png"));
         for (filter, category) in [
             ("problems", EventCategory::Problems),
             ("transitions", EventCategory::Transitions),
@@ -2696,15 +2764,22 @@ mod tests {
             escape(&detail);
             while requests.try_recv().is_ok() {}
         }
-        find_button(&page, &format!("‹ {}", texts.ux.overview))
-            .unwrap()
-            .emit_clicked();
-        drain();
-        assert!(!page.is_mapped());
+        // Leaving the Events tab hides the page; returning re-reads the
+        // selected category.
+        while requests.try_recv().is_ok() {}
+        for (tab, mapped) in [("overview", false), ("events", true)] {
+            find_named(window.upcast_ref(), tab)
+                .unwrap()
+                .downcast::<gtk::ToggleButton>()
+                .unwrap()
+                .emit_clicked();
+            drain();
+            assert_eq!(page.is_mapped(), mapped, "{tab}");
+        }
         assert_eq!(
             next_request(&requests).request,
             DaemonRequest::ListEvents {
-                category: EventCategory::All
+                category: ui.events_page.category()
             }
         );
         assert_eq!(
@@ -2966,7 +3041,7 @@ mod tests {
             "Edit remains available"
         );
         assert!(vinn.is_activatable());
-        screenshot(&window, &format!("connections-usage-{tag}.png"));
+        screenshot(&window, &format!("connections-usage-detail-{tag}.png"));
         vinn.emit_by_name::<()>("activated", &[]);
         let fast = next_request(&requests);
         assert_eq!(

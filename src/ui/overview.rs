@@ -1,10 +1,18 @@
+use crate::ui::shell::Section;
 use crate::ui::{
     i18n::Texts,
     session::{OperationKind, OperationStage, SaveState, UiSession},
 };
-use gtk4::{self as gtk, prelude::*};
+use gtk4 as gtk;
+use libadwaita::{self as adw, prelude::*};
 use routelane::domain::{HealthState, Profile, RuleSource};
 use routelane::health::{DiagnosticCode, DiagnosticSubject};
+use routelane::{
+    backend::{FamilyExit, RuntimePhase},
+    domain::{LaneId, PrimarySelection},
+    ipc::DaemonStatus,
+};
+use std::{cell::RefCell, rc::Rc};
 
 pub fn profile_counts(profile: &Profile) -> (usize, usize, usize) {
     let applications = profile
@@ -83,131 +91,342 @@ pub fn status_copy(session: &UiSession, texts: Texts) -> (&'static str, &'static
     )
 }
 
-/// Saved preference and verified effective exits, kept visibly separate.
-fn primary_lines(
+/// Saved roles remain useful when runtime evidence is unavailable; effective roles do not.
+fn lane_roles(
     profile: &Profile,
-    status: Option<&routelane::ipc::DaemonStatus>,
+    status: Option<&DaemonStatus>,
+    id: &LaneId,
     texts: Texts,
-) -> String {
-    use routelane::backend::{FamilyExit, RuntimePhase};
-    use routelane::domain::PrimarySelection;
+) -> Vec<&'static str> {
+    let mut roles = vec![];
+    if profile.routing.primary == PrimarySelection::Lane(id.clone()) {
+        roles.push(texts.ux.primary_role);
+    }
+    if profile.routing.backups.contains(id) {
+        roles.push(texts.ux.backup_role);
+    }
+    if crate::ui::primary::primary_overview(profile, status)
+        .effective
+        .is_some_and(|(v4, v6)| [v4, v6].contains(&FamilyExit::Lane(id.clone())))
+    {
+        roles.push(texts.ux.in_use_now);
+    }
+    roles
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttentionAction {
+    None,
+    Reapply,
+    Connections,
+}
+struct AttentionItem {
+    text: String,
+    action: AttentionAction,
+}
+struct Attention {
+    items: Vec<AttentionItem>,
+    technical: Vec<String>,
+}
+
+fn attention_items(profile: &Profile, session: &UiSession, texts: Texts) -> Attention {
+    let status = session
+        .snapshot_known()
+        .then(|| session.confirmed_status())
+        .flatten();
+    let mut result = Attention {
+        items: vec![],
+        technical: vec![],
+    };
+    if let Some(error) = session
+        .last_error()
+        .or_else(|| status.and_then(|s| s.last_error.as_ref()))
+    {
+        result.items.push(AttentionItem {
+            text: if error.code == "UI_CONFIG_FAILED" {
+                texts.ux.config_failed
+            } else if error.code == "DAEMON_NEEDS_AUTHORIZATION" {
+                texts.authorization_denied
+            } else {
+                texts.ux.request_failed
+            }
+            .to_owned(),
+            action: AttentionAction::None,
+        });
+        result.technical.push(error.to_string());
+    }
+    if let Some(status) = status {
+        for diagnostic in &status.health.diagnostics {
+            let summary = match diagnostic.code {
+                DiagnosticCode::LaneInterfaceMissing => texts.ux.missing_interface,
+                DiagnosticCode::LaneGatewayUnreachable => texts.ux.gateway_issue,
+                DiagnosticCode::NftablesFeatureMissing => texts.ux.nft_issue,
+                DiagnosticCode::PolicyApplyRolledBack => texts.ux.rolled_back,
+                DiagnosticCode::RoutingResourceConflict => texts.ux.conflict,
+            };
+            let subject = match &diagnostic.subject {
+                DiagnosticSubject::Lane(id) => profile
+                    .lanes
+                    .iter()
+                    .find(|l| &l.id == id)
+                    .map(|l| l.name.as_str())
+                    .unwrap_or(id.as_str()),
+                _ => texts.health_title,
+            };
+            result.items.push(AttentionItem {
+                text: format!("{subject}: {summary}"),
+                action: AttentionAction::None,
+            });
+            result.technical.push(format!(
+                "{}\n{}\n{}",
+                diagnostic.summary,
+                diagnostic.technical_detail,
+                diagnostic
+                    .suggested_action
+                    .as_ref()
+                    .map(|a| a.description.as_str())
+                    .unwrap_or("")
+            ));
+        }
+        if status.primary.phase == RuntimePhase::NeedsReauthorization {
+            result.items.push(AttentionItem {
+                text: texts.primary.needs_reauthorization.to_owned(),
+                action: AttentionAction::None,
+            });
+        }
+        if status.applied_profile_id.as_ref() == Some(&profile.id) && session.needs_reapply(profile)
+        {
+            result.items.push(AttentionItem {
+                text: texts.ux.saved_unapplied.to_owned(),
+                action: AttentionAction::Reapply,
+            });
+        }
+    }
+    if let Some(report) = session.usage() {
+        for lane in &profile.lanes {
+            let quota = report
+                .lanes
+                .iter()
+                .find(|u| u.lane_id == lane.id)
+                .and_then(|u| u.quota.as_ref())
+                .filter(|q| q.settings.enabled);
+            if let Some(quota) = quota.filter(|q| {
+                u128::from(q.used_bytes) * 100
+                    >= u128::from(q.settings.limit_bytes) * u128::from(q.settings.warn_percent)
+            }) {
+                let percent = (u128::from(quota.used_bytes) * 100
+                    / u128::from(quota.settings.limit_bytes.max(1)))
+                .min(u128::from(u64::MAX)) as u64;
+                result.items.push(AttentionItem {
+                    text: texts
+                        .ux
+                        .quota_attention
+                        .replace("{lane}", &lane.name)
+                        .replace("{percent}", &percent.to_string())
+                        .replace(
+                            "{suffix}",
+                            routelane::usage::notify::turkish_percent_suffix(match percent % 100 {
+                                0 if percent > 0 => 100,
+                                remainder => remainder as u8,
+                            }),
+                        ),
+                    action: AttentionAction::Connections,
+                });
+            }
+        }
+    }
+    result
+}
+
+struct TrafficRow {
+    name: &'static str,
+    title: String,
+    subtitle: String,
+}
+fn traffic_rows(profile: &Profile, session: &UiSession, texts: Texts) -> Vec<TrafficRow> {
+    let known = session.snapshot_known();
+    let status = known.then(|| session.confirmed_status()).flatten();
     let overview = crate::ui::primary::primary_overview(profile, status);
-    let lane_name = |id: &routelane::domain::LaneId| {
+    let lane_name = |id: &LaneId| {
         profile
             .lanes
             .iter()
-            .find(|lane| &lane.id == id)
-            .map_or_else(|| id.as_str().to_owned(), |lane| lane.name.clone())
+            .find(|l| &l.id == id)
+            .map_or_else(|| id.as_str().to_owned(), |l| l.name.clone())
     };
-    let preferred = match &overview.preferred {
-        PrimarySelection::FollowSystemDefault => texts.primary.system_default.to_owned(),
-        PrimarySelection::Lane(id) => lane_name(id),
+    let health = status
+        .map(|s| health_label(s.health.state, texts))
+        .unwrap_or(texts.ux.unknown);
+    let health = if !known {
+        session
+            .confirmed_status()
+            .map(|s| {
+                format!(
+                    "{health} · {}: {}",
+                    texts.ux.last_known,
+                    if s.applied_profile_id.is_some() {
+                        texts.routing_active
+                    } else {
+                        texts.routing_inactive
+                    }
+                )
+            })
+            .unwrap_or_else(|| health.to_owned())
+    } else {
+        health.to_owned()
     };
-    let mut lines = vec![format!("{}: {preferred}", texts.primary.preferred)];
-    // The saved scope and the helper-verified one are never merged.
+    let mut rows = vec![TrafficRow {
+        name: "overview-status",
+        title: texts.ux.status.into(),
+        subtitle: health,
+    }];
+    for (name, title, exit) in [
+        (
+            "overview-ipv4",
+            texts.primary.effective_v4,
+            overview.effective.as_ref().map(|(v4, _)| v4),
+        ),
+        (
+            "overview-ipv6",
+            texts.primary.effective_v6,
+            overview.effective.as_ref().map(|(_, v6)| v6),
+        ),
+    ] {
+        rows.push(TrafficRow {
+            name,
+            title: title.into(),
+            subtitle: if !known {
+                texts.ux.unknown.into()
+            } else {
+                match exit {
+                    Some(FamilyExit::Lane(id)) => lane_name(id),
+                    Some(FamilyExit::Blocked) => texts.primary.blocked.into(),
+                    None => texts.primary.not_active.into(),
+                }
+            },
+        });
+    }
+    rows.push(TrafficRow {
+        name: "overview-preferred",
+        title: texts.primary.preferred.into(),
+        subtitle: match overview.preferred {
+            PrimarySelection::Lane(id) => lane_name(&id),
+            PrimarySelection::FollowSystemDefault => texts.primary.system_default.into(),
+        },
+    });
+    if overview.backup_in_use {
+        rows.push(TrafficRow {
+            name: "overview-backup",
+            title: texts.primary.backup_in_use.into(),
+            subtitle: String::new(),
+        });
+    }
     let scope = crate::ui::primary::scope_overview(profile, status);
     let mode_name = |mode| match mode {
         routelane::domain::UnmatchedTraffic::PreserveSystem => texts.primary.scope_selective,
         routelane::domain::UnmatchedTraffic::UsePrimary => texts.primary.scope_use_primary,
     };
-    lines.push(format!(
-        "{}: {}",
-        texts.primary.saved_scope,
-        mode_name(scope.saved)
-    ));
-    lines.push(format!(
-        "{}: {}",
-        texts.primary.applied_scope,
-        scope
-            .applied
-            .map_or(texts.primary.scope_not_applied, mode_name)
-    ));
-    if let Some(applied) = scope.applied {
-        lines.push(crate::ui::window::scope_line(applied, texts.primary).to_owned());
-    }
-    if scope.differs() {
-        lines.push(texts.ux.saved_unapplied.to_owned());
-    }
-    match &overview.effective {
-        None => lines.push(texts.primary.not_active.to_owned()),
-        Some((v4, v6)) => {
-            for (label, exit) in [
-                (texts.primary.effective_v4, v4),
-                (texts.primary.effective_v6, v6),
-            ] {
-                let exit = match exit {
-                    FamilyExit::Lane(id) => lane_name(id),
-                    FamilyExit::Blocked => texts.primary.blocked.to_owned(),
-                };
-                lines.push(format!("{label}: {exit}"));
+    rows.push(TrafficRow {
+        name: "overview-saved-scope",
+        title: texts.primary.saved_scope.into(),
+        subtitle: mode_name(scope.saved).into(),
+    });
+    let detail = scope
+        .applied
+        .map(|mode| crate::ui::window::scope_line(mode, texts.primary))
+        .unwrap_or("");
+    rows.push(TrafficRow {
+        name: "overview-applied-scope",
+        title: format!(
+            "{}: {}",
+            texts.primary.applied_scope,
+            if !known {
+                texts.ux.unknown
+            } else {
+                scope
+                    .applied
+                    .map_or(texts.primary.scope_not_applied, mode_name)
             }
-        }
-    }
-    if overview.backup_in_use {
-        lines.push(texts.primary.backup_in_use.to_owned());
-    }
-    match overview.phase {
-        RuntimePhase::NeedsReauthorization => {
-            lines.push(texts.primary.needs_reauthorization.to_owned())
-        }
-        RuntimePhase::Degraded => lines.push(texts.status_degraded.to_owned()),
-        _ => {}
-    }
-    lines.push(texts.primary.local_evidence.to_owned());
-    lines.join("\n")
+        ),
+        subtitle: if scope.differs() {
+            format!("{detail}\n{}", texts.ux.saved_unapplied)
+        } else {
+            detail.into()
+        },
+    });
+    rows
 }
+
+type SelectSection = Rc<RefCell<Rc<dyn Fn(Section)>>>;
 
 #[derive(Clone)]
 pub struct Overview {
     pub root: gtk::Box,
     pub reapply: gtk::Button,
     pub refresh: gtk::Button,
-    pub events_open: gtk::Button,
-    usage: gtk::Box,
-    events: gtk::ListBox,
-    rendered_events: std::cell::RefCell<Vec<super::events_page::EventText>>,
-    summary: gtk::Label,
-    primary: gtk::Label,
-    lanes: gtk::Box,
-    health: gtk::Label,
-    error: gtk::Label,
+    attention: adw::PreferencesGroup,
+    notices: gtk::ListBox,
+    quotas: gtk::ListBox,
+    reapply_row: adw::ActionRow,
+    traffic: gtk::ListBox,
+    lanes: gtk::ListBox,
+    rules: adw::ActionRow,
+    apps: adw::ActionRow,
+    counts: adw::PreferencesGroup,
     technical: gtk::Label,
     expander: gtk::Expander,
+    on_select: SelectSection,
+    rendered: RefCell<String>,
     texts: Texts,
+}
+
+fn list() -> gtk::ListBox {
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("boxed-list");
+    list
+}
+fn clear(list: &gtk::ListBox) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+}
+fn row(title: &str, subtitle: &str, name: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(&glib::markup_escape_text(title))
+        .subtitle(&glib::markup_escape_text(subtitle))
+        .build();
+    row.set_title_lines(0);
+    row.set_subtitle_lines(0);
+    row.set_widget_name(name);
+    row
+}
+fn navigate(row: &adw::ActionRow, on_select: &SelectSection, section: Section) {
+    row.set_activatable(true);
+    let on_select = on_select.clone();
+    row.connect_activated(move |_| {
+        let select = on_select.borrow().clone();
+        select(section);
+    });
 }
 
 impl Overview {
     pub fn new(texts: Texts) -> Self {
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 18);
         root.set_margin_top(12);
         root.set_margin_bottom(24);
         root.set_margin_start(12);
         root.set_margin_end(12);
-        let summary = gtk::Label::builder()
-            .xalign(0.0)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .build();
-        summary.add_css_class("heading");
-        let primary = gtk::Label::builder()
-            .xalign(0.0)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .selectable(true)
-            .build();
-        let lanes = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        let health = gtk::Label::builder()
-            .xalign(0.0)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .build();
-        let error = gtk::Label::builder()
-            .xalign(0.0)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .selectable(true)
-            .build();
-        error.add_css_class("error");
+        let group = |title: &str, name: &str| {
+            let group = adw::PreferencesGroup::builder().title(title).build();
+            group.set_widget_name(name);
+            root.append(&group);
+            group
+        };
+        let attention = group(texts.ux.attention, "overview-attention");
+        attention.set_visible(false);
+        let notices = list();
+        attention.add(&notices);
         let technical = gtk::Label::builder()
             .xalign(0.0)
             .wrap(true)
@@ -225,314 +444,167 @@ impl Overview {
             .label(texts.technical_details)
             .child(&technical_box)
             .build();
+        expander.set_widget_name("overview-technical");
+        attention.add(&expander);
         let reapply = gtk::Button::with_label(texts.ux.reapply);
-        reapply.set_halign(gtk::Align::Start);
+        reapply.set_widget_name("overview-reapply");
+        reapply.set_valign(gtk::Align::Center);
+        crate::ui::form::wrap_button(&reapply);
+        let reapply_row = row(texts.ux.saved_unapplied, "", "overview-saved-unapplied");
+        reapply_row.add_suffix(&reapply);
+        attention.add(&reapply_row);
+        let quotas = list();
+        attention.add(&quotas);
+        let traffic_group = group(texts.ux.traffic_now, "overview-traffic");
+        traffic_group.set_description(Some(texts.primary.local_evidence));
+        let traffic = list();
+        traffic_group.add(&traffic);
+        let connections = group(texts.ux.connections, "overview-connections");
+        let lanes = list();
+        connections.add(&lanes);
+        let counts = group(texts.ux.counts, "overview-counts");
+        let rules = row("", "", "overview-rules");
+        counts.add(&rules);
+        let apps = row("", "", "overview-applications");
+        counts.add(&apps);
+        let on_select: SelectSection = Rc::new(RefCell::new(Rc::new(|_| {})));
+        navigate(&rules, &on_select, Section::Rules);
+        navigate(&apps, &on_select, Section::Applications);
+        let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        footer.set_widget_name("overview-footer");
         let refresh = gtk::Button::with_label(texts.ux.refresh);
-        refresh.set_halign(gtk::Align::Start);
-        let help = gtk::Label::builder()
+        refresh.set_widget_name("overview-refresh");
+        let help = gtk::Button::with_label(texts.ux.help);
+        help.set_widget_name("overview-help");
+        footer.append(&refresh);
+        footer.append(&help);
+        root.append(&footer);
+        let help_text = gtk::Label::builder()
             .label(texts.ux.snapshot_help)
             .xalign(0.0)
             .wrap(true)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .visible(false)
             .build();
-        help.add_css_class("dim-label");
-        for widget in [
-            summary.upcast_ref::<gtk::Widget>(),
-            primary.upcast_ref(),
-            lanes.upcast_ref(),
-            health.upcast_ref(),
-            error.upcast_ref(),
-            expander.upcast_ref(),
-            reapply.upcast_ref(),
-            refresh.upcast_ref(),
-            help.upcast_ref(),
-        ] {
-            root.append(widget);
-        }
-        let usage = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        usage.set_widget_name("overview-usage");
-        let events = gtk::ListBox::new();
-        events.set_widget_name("overview-events");
-        events.set_selection_mode(gtk::SelectionMode::None);
-        events.add_css_class("boxed-list");
-        let events_open = gtk::Button::with_label(texts.usage.show_all);
-        events_open.set_widget_name("events-open");
-        events_open.set_halign(gtk::Align::End);
-        let usage_card = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        let events_card = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        for (card, title) in [
-            (&usage_card, texts.usage.usage_overview),
-            (&events_card, texts.usage.recent_events),
-        ] {
-            card.add_css_class("card");
-            card.set_margin_top(8);
-            let heading = gtk::Label::builder()
-                .label(title)
-                .xalign(0.0)
-                .wrap(true)
-                .build();
-            heading.add_css_class("heading");
-            card.append(&heading);
-        }
-        usage_card.append(&usage);
-        events_card.append(&events);
-        events_card.append(&events_open);
-        root.insert_child_after(&usage_card, Some(&summary));
-        root.insert_child_after(&events_card, Some(&usage_card));
+        help_text.set_widget_name("overview-help-text");
+        help_text.add_css_class("dim-label");
+        root.append(&help_text);
+        help.connect_clicked(move |_| help_text.set_visible(!help_text.is_visible()));
         Self {
             root,
             reapply,
             refresh,
-            events_open,
-            usage,
-            events,
-            rendered_events: std::cell::RefCell::new(vec![]),
-            summary,
-            primary,
+            attention,
+            notices,
+            quotas,
+            reapply_row,
+            traffic,
             lanes,
-            health,
-            error,
+            rules,
+            apps,
+            counts,
             technical,
             expander,
+            on_select,
+            rendered: RefCell::new(String::new()),
             texts,
         }
     }
-
-    fn update_usage(&self, profile: &Profile, session: &UiSession) {
-        use super::usage_widgets::{format_gb, format_limit, QuotaBar};
-        while let Some(child) = self.usage.first_child() {
-            self.usage.remove(&child);
-        }
-        if let Some(error) = session.usage_error() {
-            let label = gtk::Label::new(Some(self.texts.ux.request_failed));
-            label.set_tooltip_text(Some(&error.to_string()));
-            self.usage.append(&label);
-        }
-        let Some(report) = session.usage() else {
-            self.usage
-                .append(&gtk::Label::new(Some(self.texts.ux.checking)));
-            return;
-        };
-        for lane in &profile.lanes {
-            let Some(usage) = report.lanes.iter().find(|usage| usage.lane_id == lane.id) else {
-                continue;
-            };
-            let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
-            let text = if let Some(quota) =
-                usage.quota.as_ref().filter(|quota| quota.settings.enabled)
-            {
-                let bar = QuotaBar::new(quota, self.texts.language);
-                bar.area
-                    .set_widget_name(&format!("overview-quota-{}", lane.id.as_str()));
-                body.append(&bar.area);
-                format!(
-                    "{} · {}",
-                    lane.name,
-                    self.texts
-                        .usage
-                        .used_summary
-                        .replace("{used}", &format_gb(quota.used_bytes, self.texts.language))
-                        .replace(
-                            "{limit}",
-                            &format_limit(quota.settings.limit_bytes, self.texts.language)
-                        )
-                )
-            } else {
-                let (rx, tx) = usage
-                    .daily
-                    .iter()
-                    .fold((0u64, 0u64), |(rx, tx), (_, totals)| {
-                        (rx.saturating_add(totals.rx), tx.saturating_add(totals.tx))
-                    });
-                self.texts
-                    .usage
-                    .overview_lane_totals
-                    .replace("{lane}", &lane.name)
-                    .replace("{down}", &format_gb(rx, self.texts.language))
-                    .replace("{up}", &format_gb(tx, self.texts.language))
-            };
-            body.prepend(
-                &gtk::Label::builder()
-                    .label(&text)
-                    .xalign(0.0)
-                    .wrap(true)
-                    .build(),
-            );
-            if usage.quota.is_none() {
-                // The daemon report supplies seven daily totals for unmetered lanes.
-                let timeframe = gtk::Label::builder()
-                    .label(self.texts.usage.last_seven_days)
-                    .xalign(0.0)
-                    .build();
-                timeframe.add_css_class("dim-label");
-                body.append(&timeframe);
-            }
-            self.usage.append(&body);
-        }
+    pub fn set_on_select(&self, on_select: Rc<dyn Fn(Section)>) {
+        *self.on_select.borrow_mut() = on_select;
     }
-
-    pub fn update_events(
-        &self,
-        profile: &Profile,
-        events: &[routelane::usage::events::UsageEvent],
-    ) {
-        use super::events_page::{event_row, event_text, now_unix_ms, EventNames};
-        let names = EventNames::from_profile(profile);
-        let now = now_unix_ms();
-        let rows: Vec<_> = events
-            .iter()
-            .take(3)
-            .map(|event| event_text(event, &names, now, self.texts.language))
-            .collect();
-        if *self.rendered_events.borrow() == rows {
-            return;
-        }
-        while let Some(child) = self.events.first_child() {
-            self.events.remove(&child);
-        }
-        for (i, text) in rows.iter().enumerate() {
-            self.events.append(&event_row(text, i, false));
-        }
-        *self.rendered_events.borrow_mut() = rows;
+    pub fn add_quick_application(&self, button: &gtk::Button) {
+        self.counts.add(button);
     }
-
     pub fn update(&self, profile: &Profile, session: &UiSession) {
-        self.update_usage(profile, session);
         let texts = self.texts;
-        let (lanes, rules, apps) = profile_counts(profile);
-        self.summary.set_label(&format!(
-            "{lanes} {} · {rules} {} · {apps} {}",
-            texts.ux.connections, texts.ux.rules, texts.ux.applications
-        ));
-        self.primary.set_label(&primary_lines(
-            profile,
-            session
-                .snapshot_known()
-                .then(|| session.confirmed_status())
-                .flatten(),
-            texts,
-        ));
-        while let Some(child) = self.lanes.first_child() {
-            self.lanes.remove(&child);
-        }
-        for lane in &profile.lanes {
-            let state = if session.snapshot_known() {
-                session
-                    .confirmed_status()
+        let attention = attention_items(profile, session, texts);
+        let traffic: Vec<(String, String, &'static str)> = traffic_rows(profile, session, texts)
+            .into_iter()
+            .map(|row| (row.title, row.subtitle, row.name))
+            .collect();
+        let status = session
+            .snapshot_known()
+            .then(|| session.confirmed_status())
+            .flatten();
+        let lanes: Vec<(String, String, String)> = profile
+            .lanes
+            .iter()
+            .map(|lane| {
+                let health = status
                     .and_then(|s| s.health.lanes.get(&lane.id))
-                    .map(|health| health_label(*health, texts))
-                    .unwrap_or(texts.ux.unknown)
-            } else {
-                texts.ux.unknown
-            };
-            self.lanes.append(
-                &gtk::Label::builder()
-                    .label(&format!(
-                        "{} — {} · {state}",
-                        lane.name,
-                        lane.interface.as_str()
-                    ))
-                    .xalign(0.0)
-                    .wrap(true)
-                    .wrap_mode(gtk::pango::WrapMode::WordChar)
-                    .build(),
-            );
-        }
-        let health = if session.snapshot_known() {
-            session
-                .confirmed_status()
-                .map(|s| health_label(s.health.state, texts))
-                .unwrap_or(texts.ux.checking)
-        } else {
-            texts.ux.unknown
-        };
-        let health = if !session.snapshot_known() {
-            session
-                .confirmed_status()
-                .map(|status| {
-                    format!(
-                        "{health}\n{}: {}",
-                        texts.ux.last_known,
-                        if status.applied_profile_id.is_some() {
-                            texts.routing_active
-                        } else {
-                            texts.routing_inactive
-                        }
-                    )
-                })
-                .unwrap_or_else(|| health.to_owned())
-        } else {
-            health.to_owned()
-        };
-        self.health.set_label(&health);
-        let mut summaries = vec![];
-        let mut technical = vec![];
-        if let Some(error) = session.last_error().or_else(|| {
-            session
-                .confirmed_status()
-                .and_then(|status| status.last_error.as_ref())
-        }) {
-            summaries.push(
-                if error.code == "UI_CONFIG_FAILED" {
-                    texts.ux.config_failed
-                } else if error.code == "DAEMON_NEEDS_AUTHORIZATION" {
-                    texts.authorization_denied
-                } else {
-                    texts.ux.request_failed
+                    .map(|h| health_label(*h, texts))
+                    .unwrap_or(texts.ux.unknown);
+                let mut subtitle = format!("{} · {health}", lane.interface.as_str());
+                for role in lane_roles(profile, status, &lane.id, texts) {
+                    subtitle.push_str(&format!(" · {role}"));
                 }
-                .to_owned(),
-            );
-            technical.push(error.to_string());
-        }
-        if let Some(status) = session.confirmed_status() {
-            for diagnostic in &status.health.diagnostics {
-                let summary = match diagnostic.code {
-                    DiagnosticCode::LaneInterfaceMissing => texts.ux.missing_interface,
-                    DiagnosticCode::LaneGatewayUnreachable => texts.ux.gateway_issue,
-                    DiagnosticCode::NftablesFeatureMissing => texts.ux.nft_issue,
-                    DiagnosticCode::PolicyApplyRolledBack => texts.ux.rolled_back,
-                    DiagnosticCode::RoutingResourceConflict => texts.ux.conflict,
-                };
-                let subject = match &diagnostic.subject {
-                    DiagnosticSubject::Lane(id) => profile
-                        .lanes
-                        .iter()
-                        .find(|l| &l.id == id)
-                        .map(|l| l.name.as_str())
-                        .unwrap_or(id.as_str()),
-                    _ => texts.health_title,
-                };
-                summaries.push(format!("{subject}: {summary}"));
-                technical.push(format!(
-                    "{}\n{}\n{}",
-                    diagnostic.summary,
-                    diagnostic.technical_detail,
-                    diagnostic
-                        .suggested_action
-                        .as_ref()
-                        .map(|a| a.description.as_str())
-                        .unwrap_or("")
-                ));
+                (
+                    lane.name.clone(),
+                    subtitle,
+                    format!("overview-lane-{}", lane.id.as_str()),
+                )
+            })
+            .collect();
+        let items: Vec<(String, AttentionAction)> = attention
+            .items
+            .iter()
+            .map(|item| (item.text.clone(), item.action))
+            .collect();
+        // Rows are rebuilt only when their content changes: a usage or status
+        // poll must not reset keyboard focus on an activatable row.
+        let key = format!("{items:?}{:?}{traffic:?}{lanes:?}", attention.technical);
+        if *self.rendered.borrow() != key {
+            *self.rendered.borrow_mut() = key;
+            clear(&self.notices);
+            clear(&self.quotas);
+            let mut reapply = false;
+            for (text, action) in &items {
+                match action {
+                    AttentionAction::Reapply => reapply = true,
+                    AttentionAction::Connections => {
+                        let row = row(text, "", "overview-notice");
+                        navigate(&row, &self.on_select, Section::Connections);
+                        self.quotas.append(&row);
+                    }
+                    AttentionAction::None => self.notices.append(&row(text, "", "overview-notice")),
+                }
+            }
+            self.reapply_row.set_visible(reapply);
+            self.reapply.set_visible(reapply);
+            self.notices
+                .set_visible(self.notices.first_child().is_some());
+            self.quotas.set_visible(self.quotas.first_child().is_some());
+            self.technical.set_label(&attention.technical.join("\n\n"));
+            self.expander.set_visible(!attention.technical.is_empty());
+            self.attention.set_visible(!items.is_empty());
+            clear(&self.traffic);
+            for (title, subtitle, name) in &traffic {
+                self.traffic.append(&row(title, subtitle, name));
+            }
+            clear(&self.lanes);
+            for (title, subtitle, name) in &lanes {
+                let row = row(title, subtitle, name);
+                navigate(&row, &self.on_select, Section::Connections);
+                self.lanes.append(&row);
+            }
+            if profile.lanes.is_empty() {
+                self.lanes
+                    .append(&row(texts.ux.no_connections, "", "overview-empty"));
             }
         }
-        self.error.set_label(&summaries.join("\n"));
-        self.error.set_visible(!summaries.is_empty());
-        self.technical.set_label(&technical.join("\n\n"));
-        self.expander.set_visible(!technical.is_empty());
-        self.reapply.set_visible(
-            session.snapshot_known()
-                && session
-                    .confirmed_status()
-                    .is_some_and(|s| s.applied_profile_id.as_ref() == Some(&profile.id))
-                && session.needs_reapply(profile),
-        );
         self.reapply
             .set_sensitive(session.config_writable() && !session.is_busy());
+        let (_, rules, apps) = profile_counts(profile);
+        self.rules
+            .set_title(&format!("{} · {rules}", texts.ux.rules));
+        self.apps
+            .set_title(&format!("{} · {apps}", texts.ux.applications));
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use routelane::domain::{
         ApplicationSelector, Lane, LaneFailurePolicy, Rule, RuleAction, RuleSource, RuleTarget,
@@ -578,5 +650,374 @@ mod tests {
             action: RuleAction::Route("vinn".into()),
         });
         assert_eq!(profile_counts(&profile), (2, 1, 1));
+    }
+    use crate::{models::DaemonToUi, ui::i18n::LanguageTexts};
+    use routelane::{
+        backend::{FamilyPair, PrimaryDecision, RuntimeGrant, RuntimeStatus},
+        config::Language,
+        domain::UnmatchedTraffic,
+        health::HealthReport,
+        ipc::{ApplyProfileResult, DaemonRequest, DaemonResponse, DaemonResult},
+        usage::{
+            quota::LaneQuota,
+            service::{LaneUsage, QuotaStatus, UsageReport},
+            LocalDate, UsageTotals,
+        },
+    };
+
+    fn profile() -> Profile {
+        Profile {
+            id: "work".into(),
+            name: "Work".into(),
+            enabled: true,
+            routing: routelane::domain::RoutingPolicy {
+                primary: PrimarySelection::Lane("ethernet".into()),
+                backups: vec!["vinn".into()],
+                ..Default::default()
+            },
+            lanes: [("ethernet", "Ethernet"), ("vinn", "VINN")]
+                .into_iter()
+                .map(|(id, name)| Lane {
+                    id: id.into(),
+                    name: name.into(),
+                    interface: id.into(),
+                    fallback_lane: None,
+                    failure_policy: LaneFailurePolicy::Block,
+                })
+                .collect(),
+            rules: vec![],
+        }
+    }
+    fn sent(effects: Vec<crate::ui::session::UiEffect>) -> String {
+        effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                crate::ui::session::UiEffect::Send(request) => Some(request.request_id),
+                _ => None,
+            })
+            .expect("a request")
+    }
+    /// Establishes a locally confirmed apply, including independent family exits and scope.
+    pub(crate) fn applied_session(profile: &Profile) -> UiSession {
+        let mut session = UiSession::new(profile.clone(), true);
+        session.handle_daemon(DaemonToUi::ConnectionEstablished { epoch: 1 });
+        let mut status = DaemonStatus {
+            generation: 0,
+            event_sequence: 0,
+            health: HealthReport::inactive(),
+            desired_profile_id: None,
+            applied_profile_id: None,
+            last_error: None,
+            primary: RuntimeStatus::default(),
+        };
+        session.handle_daemon(DaemonToUi::Snapshot {
+            epoch: 1,
+            status: status.clone(),
+            profiles: vec![profile.clone()],
+        });
+        let id = sent(
+            session
+                .begin_request(
+                    DaemonRequest::ApplyProfile(profile.clone()),
+                    Some(profile.clone()),
+                )
+                .unwrap(),
+        );
+        let hash = routelane::backend::policy_hash(
+            profile,
+            &routelane::backend::ResolutionSnapshot::empty(),
+        );
+        session.handle_daemon(DaemonToUi::Response {
+            epoch: 1,
+            response: DaemonResponse::success(
+                id,
+                DaemonResult::Applied(ApplyProfileResult {
+                    generation: 1,
+                    plan_hash: hash,
+                }),
+            ),
+        });
+        status.generation = 1;
+        status.event_sequence = 1;
+        status.desired_profile_id = Some(profile.id.clone());
+        status.applied_profile_id = Some(profile.id.clone());
+        status.health = HealthReport::from_parts(
+            HealthState::Healthy,
+            profile
+                .lanes
+                .iter()
+                .map(|l| (l.id.clone(), HealthState::Healthy))
+                .collect(),
+            vec![],
+        );
+        status.primary = RuntimeStatus {
+            grant: Some(RuntimeGrant {
+                owner_uid: 1000,
+                boot_id: "boot".into(),
+                network_namespace: 1,
+                policy_hash: hash,
+                interfaces: Default::default(),
+            }),
+            generation: 1,
+            phase: RuntimePhase::Armed,
+            unmatched_traffic: Some(profile.routing.unmatched_traffic),
+            decision: Some(PrimaryDecision {
+                preferred: FamilyPair {
+                    v4: profile.lanes.first().map(|l| l.id.clone()),
+                    v6: None,
+                },
+                effective: FamilyPair {
+                    v4: profile
+                        .lanes
+                        .first()
+                        .map_or(FamilyExit::Blocked, |l| FamilyExit::Lane(l.id.clone())),
+                    v6: FamilyExit::Blocked,
+                },
+            }),
+            ..RuntimeStatus::default()
+        };
+        session.handle_daemon(DaemonToUi::Snapshot {
+            epoch: 1,
+            status,
+            profiles: vec![profile.clone()],
+        });
+        assert!(!session.needs_reapply(profile));
+        session
+    }
+    #[test]
+    fn lane_roles_distinguish_saved_primary_backup_and_verified_effective_exit() {
+        let profile = profile();
+        let texts = Language::En.texts();
+        let session = applied_session(&profile);
+        assert_eq!(
+            lane_roles(
+                &profile,
+                session.confirmed_status(),
+                &"ethernet".into(),
+                texts
+            ),
+            ["Primary", "In use now"]
+        );
+        assert_eq!(
+            lane_roles(&profile, session.confirmed_status(), &"vinn".into(), texts),
+            ["Backup"]
+        );
+        assert_eq!(
+            lane_roles(&profile, None, &"ethernet".into(), texts),
+            ["Primary"]
+        );
+    }
+    #[test]
+    fn healthy_applied_profile_has_no_attention_but_saved_changes_need_reapply() {
+        let mut profile = profile();
+        let session = applied_session(&profile);
+        assert!(attention_items(&profile, &session, Language::En.texts())
+            .items
+            .is_empty());
+        profile.routing.unmatched_traffic = UnmatchedTraffic::UsePrimary;
+        let attention = attention_items(&profile, &session, Language::En.texts());
+        assert_eq!(attention.items.len(), 1);
+        assert_eq!(attention.items[0].action, AttentionAction::Reapply);
+    }
+    #[test]
+    fn traffic_keeps_family_exits_and_saved_applied_scopes_separate() {
+        let mut profile = profile();
+        let session = applied_session(&profile);
+        profile.routing.unmatched_traffic = UnmatchedTraffic::UsePrimary;
+        let texts = Language::En.texts();
+        let rows = traffic_rows(&profile, &session, texts);
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.name == "overview-ipv4")
+                .unwrap()
+                .subtitle,
+            "Ethernet"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.name == "overview-ipv6")
+                .unwrap()
+                .subtitle,
+            texts.primary.blocked
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.name == "overview-saved-scope")
+                .unwrap()
+                .subtitle,
+            texts.primary.scope_use_primary
+        );
+        let applied = rows
+            .iter()
+            .find(|r| r.name == "overview-applied-scope")
+            .unwrap();
+        assert!(applied.title.contains(texts.primary.scope_selective));
+        assert!(applied.subtitle.contains(crate::ui::window::scope_line(
+            UnmatchedTraffic::PreserveSystem,
+            texts.primary
+        )));
+        assert!(applied.subtitle.contains(texts.ux.saved_unapplied));
+    }
+    #[test]
+    fn unknown_snapshot_hides_effective_exits_roles_and_health_diagnostics() {
+        let profile = profile();
+        let mut session = applied_session(&profile);
+        let texts = Language::En.texts();
+        let mut status = session.confirmed_status().unwrap().clone();
+        status.event_sequence += 1;
+        status.health = HealthReport::failure(
+            HealthState::Degraded,
+            DiagnosticCode::LaneInterfaceMissing,
+            DiagnosticSubject::Lane("vinn".into()),
+            "missing interface",
+            "usb0 missing",
+            None,
+        );
+        session.handle_daemon(DaemonToUi::Snapshot {
+            epoch: 1,
+            status,
+            profiles: vec![profile.clone()],
+        });
+        let attention = attention_items(&profile, &session, texts);
+        assert_eq!(
+            attention.items[0].text,
+            format!("VINN: {}", texts.ux.missing_interface)
+        );
+        assert!(attention.technical[0].contains("usb0 missing"));
+        session.handle_daemon(DaemonToUi::DaemonUnavailable {
+            epoch: 1,
+            request_id: None,
+            error: routelane::ipc::IpcError::new("OFFLINE", "offline"),
+        });
+        let texts = Language::En.texts();
+        let rows = traffic_rows(&profile, &session, texts);
+        assert!(rows
+            .iter()
+            .find(|r| r.name == "overview-status")
+            .unwrap()
+            .subtitle
+            .contains(texts.ux.last_known));
+        for name in ["overview-ipv4", "overview-ipv6"] {
+            assert_eq!(
+                rows.iter().find(|r| r.name == name).unwrap().subtitle,
+                texts.ux.unknown
+            );
+        }
+        let attention = attention_items(&profile, &session, texts);
+        assert_eq!(attention.items.len(), 1);
+        assert_eq!(attention.items[0].text, texts.ux.request_failed);
+        assert_eq!(attention.technical, ["OFFLINE: offline"]);
+        assert!(!attention
+            .items
+            .iter()
+            .any(|item| item.action == AttentionAction::Reapply));
+        let known_status = session
+            .snapshot_known()
+            .then(|| session.confirmed_status())
+            .flatten();
+        assert_eq!(
+            lane_roles(&profile, known_status, &"ethernet".into(), texts),
+            ["Primary"]
+        );
+    }
+    #[test]
+    fn reauthorization_attention_requires_a_known_snapshot() {
+        let profile = profile();
+        let mut session = applied_session(&profile);
+        let mut status = session.confirmed_status().unwrap().clone();
+        status.event_sequence += 1;
+        status.primary.phase = RuntimePhase::NeedsReauthorization;
+        session.handle_daemon(DaemonToUi::Snapshot {
+            epoch: 1,
+            status,
+            profiles: vec![profile.clone()],
+        });
+        let texts = Language::Tr.texts();
+        assert!(attention_items(&profile, &session, texts)
+            .items
+            .iter()
+            .any(|item| item.text == texts.primary.needs_reauthorization));
+    }
+    #[test]
+    fn enabled_quotas_warn_at_threshold_with_turkish_suffixes_and_english_copy() {
+        let profile = profile();
+        let mut session = applied_session(&profile);
+        for (used, tr, en) in [
+            (79, None, None),
+            (
+                80,
+                Some("VINN: kotanın %80'i kullanıldı"),
+                Some("VINN: 80% of quota used"),
+            ),
+            (
+                90,
+                Some("VINN: kotanın %90'ı kullanıldı"),
+                Some("VINN: 90% of quota used"),
+            ),
+            (
+                100,
+                Some("VINN: kotanın %100'ü kullanıldı"),
+                Some("VINN: 100% of quota used"),
+            ),
+        ] {
+            let id = sent(
+                session
+                    .begin_request(DaemonRequest::GetUsage { fast_lane: None }, None)
+                    .unwrap(),
+            );
+            session.handle_daemon(DaemonToUi::Response {
+                epoch: 1,
+                response: DaemonResponse::success(
+                    id,
+                    DaemonResult::Usage(UsageReport {
+                        lanes: vec![LaneUsage {
+                            lane_id: "vinn".into(),
+                            interface: "usb0".into(),
+                            available: true,
+                            today: UsageTotals::default(),
+                            daily: vec![],
+                            rate: None,
+                            recent_rates: vec![],
+                            quota: Some(QuotaStatus {
+                                settings: LaneQuota {
+                                    enabled: true,
+                                    limit_bytes: 100,
+                                    reset_day: 1,
+                                    warn_percent: 80,
+                                },
+                                period_start: LocalDate::parse("2026-11-01").unwrap(),
+                                next_reset: LocalDate::parse("2026-12-01").unwrap(),
+                                used_bytes: used,
+                                measured: UsageTotals::default(),
+                            }),
+                        }],
+                    }),
+                ),
+            });
+            for (language, expected) in [(Language::Tr, tr), (Language::En, en)] {
+                let attention = attention_items(&profile, &session, language.texts());
+                assert_eq!(
+                    attention.items.first().map(|item| item.text.as_str()),
+                    expected
+                );
+                if expected.is_some() {
+                    assert_eq!(attention.items[0].action, AttentionAction::Connections);
+                }
+            }
+        }
+        let id = sent(
+            session
+                .begin_request(DaemonRequest::GetUsage { fast_lane: None }, None)
+                .unwrap(),
+        );
+        let mut report = session.usage().unwrap().clone();
+        report.lanes[0].quota.as_mut().unwrap().settings.enabled = false;
+        session.handle_daemon(DaemonToUi::Response {
+            epoch: 1,
+            response: DaemonResponse::success(id, DaemonResult::Usage(report)),
+        });
+        assert!(attention_items(&profile, &session, Language::En.texts())
+            .items
+            .is_empty());
     }
 }

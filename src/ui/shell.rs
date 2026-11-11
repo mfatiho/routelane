@@ -8,6 +8,7 @@ pub enum Section {
     Rules,
     Applications,
     Connections,
+    Events,
 }
 
 impl Section {
@@ -17,6 +18,7 @@ impl Section {
             Self::Rules => "rules",
             Self::Applications => "applications",
             Self::Connections => "connections",
+            Self::Events => "events",
         }
     }
 }
@@ -78,6 +80,11 @@ impl Shell {
                 texts.ux.connections,
                 "network-wired-symbolic",
             ),
+            (
+                Section::Events,
+                texts.ux.events,
+                "document-open-recent-symbolic",
+            ),
         ] {
             let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             content.append(&gtk::Image::from_icon_name(icon));
@@ -138,6 +145,7 @@ impl Shell {
             Some("rules") => Section::Rules,
             Some("applications") => Section::Applications,
             Some("connections") => Section::Connections,
+            Some("events") => Section::Events,
             _ => Section::Overview,
         }
     }
@@ -149,22 +157,28 @@ pub(crate) mod tests {
     use crate::ui::i18n::LanguageTexts;
     use routelane::config::Language;
 
-    pub fn assert_four_sections() {
+    pub fn assert_five_sections() {
         let shell = Shell::new(Language::Tr.texts());
         for section in [
             Section::Overview,
             Section::Rules,
             Section::Applications,
             Section::Connections,
+            Section::Events,
         ] {
             shell.add_page(section, &gtk::Box::new(gtk::Orientation::Vertical, 0));
         }
         assert_eq!(shell.section(), Section::Overview);
-        for section in [Section::Rules, Section::Applications, Section::Connections] {
+        for section in [
+            Section::Rules,
+            Section::Applications,
+            Section::Connections,
+            Section::Events,
+        ] {
             shell.select(section);
             assert_eq!(shell.section(), section);
         }
-        assert_eq!(shell.stack.pages().n_items(), 4);
+        assert_eq!(shell.stack.pages().n_items(), 5);
         assert_eq!(shell.primary.widget_name(), "routing-primary");
     }
 }

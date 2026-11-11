@@ -145,8 +145,10 @@ impl ListPage {
         let add = gtk::Button::with_label(match section {
             Section::Applications => texts.add_application,
             Section::Connections => texts.ux.add_connection,
+            Section::Events => texts.ux.events,
             _ => texts.add_rule,
         });
+        add.set_visible(section != Section::Events);
         add.set_halign(gtk::Align::Start);
         crate::ui::form::wrap_button(&add);
         add.add_css_class("suggested-action");
@@ -189,6 +191,7 @@ impl ListPage {
             match self.section {
                 Section::Applications => self.texts.ux.no_apps,
                 Section::Connections => self.texts.ux.no_connections,
+                Section::Events => self.texts.ux.events,
                 _ => self.texts.ux.no_rules,
             }
         });

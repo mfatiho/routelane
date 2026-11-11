@@ -287,7 +287,6 @@ pub fn event_row(text: &EventText, index: usize, expandable: bool) -> gtk::ListB
 
 pub struct EventsPage {
     pub root: gtk::Box,
-    pub back: gtk::Button,
     pub all: gtk::ToggleButton,
     list: gtk::ListBox,
     category: Rc<Cell<EventCategory>>,
@@ -310,7 +309,6 @@ impl EventsPage {
             .build();
         root.set_widget_name("events-page");
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        let back = gtk::Button::with_label(&format!("‹ {}", texts.ux.overview));
         let title = gtk::Label::builder()
             .label(texts.usage.events_title)
             .hexpand(true)
@@ -337,7 +335,6 @@ impl EventsPage {
                 Rc::new(|| {}),
             );
         });
-        header.append(&back);
         header.append(&title);
         header.append(&clear);
         root.append(&header);
@@ -401,7 +398,6 @@ impl EventsPage {
         root.append(&footer);
         Self {
             root,
-            back,
             all,
             list,
             category,
@@ -410,7 +406,11 @@ impl EventsPage {
         }
     }
     pub fn category(&self) -> EventCategory {
-        self.category.get()
+        if self.all.is_active() {
+            EventCategory::All
+        } else {
+            self.category.get()
+        }
     }
 
     pub fn update(&self, profile: &routelane::domain::Profile, events: &[UsageEvent]) {
@@ -419,7 +419,7 @@ impl EventsPage {
         let rows: Vec<_> = events
             .iter()
             .filter(|event| {
-                self.category.get() == EventCategory::All
+                self.category() == EventCategory::All
                     || event.kind.category() == self.category.get()
             })
             .map(|event| event_text(event, &names, now, self.texts.language))
