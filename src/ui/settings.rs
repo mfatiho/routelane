@@ -124,10 +124,13 @@ pub fn build_general_settings_dialog(
     initial_language: Language,
     on_language: Rc<dyn Fn(Language)>,
 ) -> adw::PreferencesWindow {
+    // The window is cached and presented again on the next open, so closing
+    // it hides it; a destroyed window shown again stops responding to close.
     let dialog = adw::PreferencesWindow::builder()
         .title(texts.settings_title)
         .transient_for(parent)
         .modal(true)
+        .hide_on_close(true)
         .build();
     let page = adw::PreferencesPage::new();
     let language_group = adw::PreferencesGroup::builder()
