@@ -286,9 +286,12 @@ const PRIMARY_EN: PrimaryTexts = PrimaryTexts {
 
 #[derive(Debug, Clone, Copy)]
 pub struct DashboardTexts {
+    pub routing_group: &'static str,
+    pub role_primary: &'static str,
+    pub role_backup: &'static str,
+    pub role_in_use: &'static str,
     pub enable: &'static str,
     pub disable: &'static str,
-    pub routing_summary: &'static str,
     pub routing_details: &'static str,
     pub usage_note: &'static str,
     pub usage_empty: &'static str,
@@ -300,9 +303,12 @@ pub struct DashboardTexts {
 }
 
 const DASHBOARD_TR: DashboardTexts = DashboardTexts {
+    routing_group: "Yönlendirme",
+    role_primary: "Birincil",
+    role_backup: "Yedek",
+    role_in_use: "Şu an kullanımda",
     enable: "Etkinleştir",
     disable: "Devre dışı bırak",
-    routing_summary: "Uygulanan yönlendirme",
     routing_details: "Yönlendirme ayrıntıları",
 
     usage_note:
@@ -318,9 +324,12 @@ const DASHBOARD_TR: DashboardTexts = DashboardTexts {
     tray_problem: "Sorunu görüntüle",
 };
 const DASHBOARD_EN: DashboardTexts = DashboardTexts {
+    routing_group: "Routing",
+    role_primary: "Primary",
+    role_backup: "Backup",
+    role_in_use: "In use now",
     enable: "Enable",
     disable: "Disable",
-    routing_summary: "Applied routing",
     routing_details: "Routing details",
 
     usage_note: "Total interface download + upload · approximate. Not just RouteLane traffic.",

@@ -1558,6 +1558,22 @@ pub(crate) mod tests {
     #[ignore = "requires display; run bash scripts/run-gtk-smoke.sh"]
     fn gtk_smoke_window_survives_profile_refresh_and_add_dialogs() {
         adw::init().unwrap();
+        // Review matrix (screenshots only): ROUTELANE_SMOKE_SCHEME=dark,
+        // ROUTELANE_SMOKE_DPI=120 (large text) and ROUTELANE_SMOKE_SIZE=560x600
+        // render the same flow in other conditions.
+        if std::env::var("ROUTELANE_SMOKE_SCHEME").as_deref() == Ok("dark") {
+            adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+        }
+        // Broadway leaves gtk-xft-dpi unset (-1), which collapses Libadwaita's
+        // sp-based clamps (e.g. Preferences) to their minimum width. A desktop
+        // session always sets it; GNOME "Large text" is 1.25 x 96 DPI.
+        let dpi = std::env::var("ROUTELANE_SMOKE_DPI")
+            .ok()
+            .and_then(|dpi| dpi.parse::<i32>().ok())
+            .unwrap_or(96);
+        gtk::Settings::default()
+            .unwrap()
+            .set_gtk_xft_dpi(dpi * 1024);
         crate::ui::shell::tests::assert_five_sections();
         let temp = tempfile::TempDir::new().unwrap();
         let app = adw::Application::builder()
@@ -1644,6 +1660,7 @@ pub(crate) mod tests {
                 .unwrap();
             nav.emit_clicked();
             drain();
+            screenshot(&window, &format!("empty-{section}.png"));
             let stack = find_named(window.upcast_ref(), "sections")
                 .unwrap()
                 .downcast::<gtk::Stack>()
@@ -1697,6 +1714,7 @@ pub(crate) mod tests {
                     "editing fields cannot autosave"
                 );
             }
+            screenshot(&dialogs[0], &format!("editor-{section}.png"));
             for dialog in dialogs {
                 escape(&dialog);
             }
@@ -1926,6 +1944,7 @@ pub(crate) mod tests {
         drain();
         let focus = gtk::prelude::GtkWindowExt::focus(&window).unwrap();
         assert!(focus == query.clone().upcast::<gtk::Widget>() || focus.is_ancestor(&query));
+        screenshot(&window, "rules-list.png");
         gtk::prelude::WidgetExt::activate_action(&window, "win.new", None).unwrap();
         drain();
         escape(&transient(&window));
@@ -1938,6 +1957,7 @@ pub(crate) mod tests {
             .emit_clicked();
         drain();
         let preferences = transient(&window);
+        screenshot(&preferences, "preferences.png");
         let version = find_named(preferences.upcast_ref(), "app-version")
             .expect("Preferences shows the application version")
             .downcast::<adw::ActionRow>()
@@ -1960,6 +1980,24 @@ pub(crate) mod tests {
         escape(&transient(&preferences));
         preferences.close();
         drain();
+        // The title-bar close button (close-request) must close Preferences
+        // every time, also after it was opened again.
+        for attempt in 1..=2 {
+            find_named(window.upcast_ref(), "preferences")
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap()
+                .emit_clicked();
+            drain();
+            let reopened = transient(&window);
+            assert!(reopened.is_visible(), "preferences open, attempt {attempt}");
+            reopened.close();
+            drain();
+            assert!(
+                !reopened.is_visible(),
+                "the close button closes preferences, attempt {attempt}"
+            );
+        }
         assert!(
             !temp.path().join("config.json").exists(),
             "language cancellation must not persist"
@@ -2256,6 +2294,22 @@ pub(crate) mod tests {
             return;
         };
         let widget = widget.as_ref();
+        let resized = std::env::var("ROUTELANE_SMOKE_SIZE")
+            .ok()
+            .and_then(|size| {
+                let (w, h) = size.split_once('x')?;
+                Some((w.parse::<i32>().ok()?, h.parse::<i32>().ok()?))
+            })
+            .and_then(|(w, h)| {
+                let window = widget.downcast_ref::<gtk::Window>()?;
+                let previous = window.default_size();
+                window.set_default_size(w, h);
+                for _ in 0..30 {
+                    drain();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Some((window.clone(), previous))
+            });
         wait_for(|| widget.width() > 0 && widget.height() > 0);
         let paintable = gtk::WidgetPaintable::new(Some(widget));
         // The paintable has content only after the widget drew a frame.
@@ -2280,6 +2334,10 @@ pub(crate) mod tests {
         texture
             .save_to_png(std::path::Path::new(&directory).join(name))
             .unwrap();
+        if let Some((window, (w, h))) = resized {
+            window.set_default_size(w, h);
+            drain();
+        }
     }
 
     fn visible_dialog(window: &adw::ApplicationWindow) -> Option<gtk::Window> {
@@ -2376,6 +2434,20 @@ pub(crate) mod tests {
         assert!(!find_named(summary_root, "overview-attention")
             .unwrap()
             .is_visible());
+        if std::env::var_os("ROUTELANE_SMOKE_SHOTS").is_some() {
+            // The applied, healthy state, captured on its own surface.
+            let preview = adw::Window::builder()
+                .title("RouteLane")
+                .default_width(900)
+                .default_height(720)
+                .content(&summary.root)
+                .build();
+            preview.present();
+            screenshot(&preview, &format!("overview-active-{tag}.png"));
+            preview.set_content(None::<&gtk::Widget>);
+            preview.destroy();
+            drain();
+        }
         summary.set_system_attention(Some(texts.system_primary.mismatch));
         summary.update(&summary_profile, &summary_session);
         assert!(
@@ -2579,14 +2651,13 @@ pub(crate) mod tests {
             "events-open",
             "overview-counts",
             "overview-usage",
-            "overview-connections",
             "overview-shortcuts",
         ] {
             assert!(find_named(&overview, name).is_none());
         }
         let details = find_named(&overview, "overview-routing-details")
             .unwrap()
-            .downcast::<gtk::Expander>()
+            .downcast::<adw::ExpanderRow>()
             .unwrap();
         assert!(!details.is_expanded(), "technical rows start collapsed");
         let ui = LAST_UI.with(|slot| slot.borrow().upgrade().unwrap());
@@ -2606,6 +2677,16 @@ pub(crate) mod tests {
             assert!(find_named(&overview, name).is_some());
         }
         screenshot(&window, &format!("overview-{tag}.png"));
+        // Design A: each connection has one summary row that opens Connections.
+        let lane_row = find_named(&overview, "overview-lane-ethernet")
+            .expect("overview lists each connection")
+            .downcast::<adw::ActionRow>()
+            .unwrap();
+        lane_row.emit_by_name::<()>("activated", &[]);
+        drain();
+        assert_eq!(stack.visible_child_name().as_deref(), Some("connections"));
+        ui.shell.select(Section::Overview);
+        drain();
         // Broadway has no browser client to acknowledge a resize of a mapped
         // window. Exercise the same widgets in a fresh, initially narrow surface.
         let narrow_shell = Shell::new(texts);

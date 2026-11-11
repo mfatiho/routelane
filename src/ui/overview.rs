@@ -11,7 +11,10 @@ use routelane::{
     backend::{FamilyExit, RuntimePhase},
     domain::{LaneId, PrimarySelection},
 };
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 pub fn health_label(health: HealthState, texts: Texts) -> &'static str {
     match health {
@@ -324,6 +327,136 @@ pub(crate) fn traffic_rows(
     rows
 }
 
+/// The visual tone of a status row. Colour is never the only signal: every
+/// tone also has its own icon and the row text names the state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tone {
+    Good,
+    Warning,
+    Error,
+    Inactive,
+    Unknown,
+}
+
+impl Tone {
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Good => "emblem-ok-symbolic",
+            Self::Warning => "dialog-warning-symbolic",
+            Self::Error => "dialog-error-symbolic",
+            Self::Inactive => "system-shutdown-symbolic",
+            Self::Unknown => "dialog-question-symbolic",
+        }
+    }
+    fn style_class(self) -> Option<&'static str> {
+        match self {
+            Self::Good => Some("success"),
+            Self::Warning => Some("warning"),
+            Self::Error => Some("error"),
+            Self::Inactive | Self::Unknown => None,
+        }
+    }
+}
+
+fn health_tone(health: HealthState) -> Tone {
+    match health {
+        HealthState::Healthy => Tone::Good,
+        HealthState::Inactive => Tone::Inactive,
+        HealthState::Applying => Tone::Unknown,
+        HealthState::Degraded | HealthState::NeedsAuthorization => Tone::Warning,
+        HealthState::Failed => Tone::Error,
+    }
+}
+
+/// Only a known snapshot may claim a state; otherwise the tone is unknown.
+pub(crate) fn routing_tone(session: &UiSession) -> Tone {
+    match session
+        .snapshot_known()
+        .then(|| session.confirmed_status())
+        .flatten()
+    {
+        None => Tone::Unknown,
+        Some(status) if status.applied_profile_id.is_none() => Tone::Inactive,
+        Some(status) => health_tone(status.health.state),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ConnectionRow {
+    pub name: String,
+    pub title: String,
+    pub subtitle: String,
+    pub tone: Tone,
+    /// Fraction of an enabled quota used this period, at most 1.
+    pub quota: Option<f64>,
+    /// The enabled quota itself, drawn with the app's shared quota bar.
+    pub quota_status: Option<routelane::usage::service::QuotaStatus>,
+}
+
+/// One summary row per connection: verified health and current use only from
+/// a known snapshot, saved roles always, and an enabled quota when reported.
+pub(crate) fn connection_rows(
+    profile: &Profile,
+    session: &UiSession,
+    texts: Texts,
+) -> Vec<ConnectionRow> {
+    let status = session
+        .snapshot_known()
+        .then(|| session.confirmed_status())
+        .flatten();
+    let effective = crate::ui::primary::primary_overview(profile, status).effective;
+    profile
+        .lanes
+        .iter()
+        .map(|lane| {
+            let health = status.and_then(|s| s.health.lanes.get(&lane.id).copied());
+            let mut parts = vec![
+                lane.interface.as_str().to_owned(),
+                health
+                    .map_or(texts.ux.unknown, |h| health_label(h, texts))
+                    .to_owned(),
+            ];
+            if profile.routing.primary == PrimarySelection::Lane(lane.id.clone()) {
+                parts.push(texts.dashboard.role_primary.to_owned());
+            }
+            if profile.routing.backups.contains(&lane.id) {
+                parts.push(texts.dashboard.role_backup.to_owned());
+            }
+            let exit = FamilyExit::Lane(lane.id.clone());
+            if effective
+                .as_ref()
+                .is_some_and(|(v4, v6)| *v4 == exit || *v6 == exit)
+            {
+                parts.push(texts.dashboard.role_in_use.to_owned());
+            }
+            let enabled_quota = session
+                .usage()
+                .and_then(|report| report.lanes.iter().find(|u| u.lane_id == lane.id))
+                .and_then(|usage| usage.quota.as_ref())
+                .filter(|quota| quota.settings.enabled);
+            let quota = enabled_quota.map(|quota| {
+                (quota.used_bytes as f64 / quota.settings.limit_bytes.max(1) as f64).min(1.0)
+            });
+            if let Some(fraction) = quota {
+                parts.push(
+                    texts
+                        .usage
+                        .quota_badge
+                        .replace("{percent}", &format!("{:.0}", fraction * 100.0)),
+                );
+            }
+            ConnectionRow {
+                name: format!("overview-lane-{}", lane.id.as_str()),
+                title: lane.name.clone(),
+                subtitle: parts.join(" · "),
+                tone: health.map_or(Tone::Unknown, health_tone),
+                quota,
+                quota_status: enabled_quota.cloned(),
+            }
+        })
+        .collect()
+}
+
 type SelectSection = Rc<RefCell<Rc<dyn Fn(Section)>>>;
 
 #[derive(Clone)]
@@ -336,8 +469,10 @@ pub struct Overview {
     notices: gtk::ListBox,
     quotas: gtk::ListBox,
     reapply_row: adw::ActionRow,
-    traffic: gtk::ListBox,
-    summary: gtk::ListBox,
+    routing: gtk::ListBox,
+    connections_group: adw::PreferencesGroup,
+    connections: gtk::ListBox,
+    details_expanded: Rc<Cell<bool>>,
     technical: gtk::Label,
     expander: gtk::Expander,
     on_select: SelectSection,
@@ -366,8 +501,23 @@ fn row(title: &str, subtitle: &str, name: &str) -> adw::ActionRow {
     row.set_widget_name(name);
     row
 }
+/// A status icon at the start of a row; the row text always names the state.
+fn tone_icon(tone: Tone) -> gtk::Image {
+    let icon = gtk::Image::from_icon_name(tone.icon());
+    if let Some(class) = tone.style_class() {
+        icon.add_css_class(class);
+    } else {
+        icon.add_css_class("dim-label");
+    }
+    icon.set_accessible_role(gtk::AccessibleRole::Presentation);
+    icon
+}
 fn navigate(row: &adw::ActionRow, on_select: &SelectSection, section: Section) {
     row.set_activatable(true);
+    let chevron = gtk::Image::from_icon_name("go-next-symbolic");
+    chevron.add_css_class("dim-label");
+    chevron.set_accessible_role(gtk::AccessibleRole::Presentation);
+    row.add_suffix(&chevron);
     let on_select = on_select.clone();
     row.connect_activated(move |_| {
         let select = on_select.borrow().clone();
@@ -377,26 +527,55 @@ fn navigate(row: &adw::ActionRow, on_select: &SelectSection, section: Section) {
 
 impl Overview {
     pub fn new(texts: Texts) -> Self {
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 18);
-        root.set_margin_top(12);
-        root.set_margin_bottom(24);
-        root.set_margin_start(12);
-        root.set_margin_end(12);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 24);
+        content.set_margin_top(12);
+        content.set_margin_bottom(24);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        // Readable line length on wide windows, full width on narrow ones.
+        let clamp = adw::Clamp::builder()
+            .maximum_size(760)
+            .tightening_threshold(560)
+            .child(&content)
+            .build();
+        root.append(&clamp);
         let group = |title: &str, name: &str| {
             let group = adw::PreferencesGroup::builder().title(title).build();
             group.set_widget_name(name);
-            root.append(&group);
+            content.append(&group);
             group
         };
         let on_select: SelectSection = Rc::new(RefCell::new(Rc::new(|_| {})));
+
+        // 1. Routing: verified state first, family exits, applied scope;
+        //    saved preferences and evidence notes behind "details".
+        let traffic_group = group(texts.dashboard.routing_group, "overview-traffic");
+        let routing = list();
+        traffic_group.add(&routing);
+
+        // 2. Needs attention: only when something needs the user.
         let attention = group(texts.ux.attention, "overview-attention");
         attention.set_visible(false);
         let notices = list();
         attention.add(&notices);
         let system_attention = row(texts.system_primary.title, "", "overview-system-primary");
         system_attention.set_visible(false);
+        system_attention.add_prefix(&tone_icon(Tone::Warning));
         navigate(&system_attention, &on_select, Section::Connections);
-        attention.add(&system_attention);
+        notices.append(&system_attention);
+        let reapply = gtk::Button::with_label(texts.ux.reapply);
+        reapply.set_widget_name("overview-reapply");
+        reapply.set_valign(gtk::Align::Center);
+        reapply.add_css_class("suggested-action");
+        crate::ui::form::wrap_button(&reapply);
+        let reapply_row = row(texts.ux.saved_unapplied, "", "overview-saved-unapplied");
+        reapply_row.add_prefix(&tone_icon(Tone::Warning));
+        reapply_row.add_suffix(&reapply);
+        reapply_row.set_visible(false);
+        notices.append(&reapply_row);
+        let quotas = list();
+        attention.add(&quotas);
         let technical = gtk::Label::builder()
             .xalign(0.0)
             .wrap(true)
@@ -413,37 +592,16 @@ impl Overview {
         let expander = gtk::Expander::builder()
             .label(texts.technical_details)
             .child(&technical_box)
+            .margin_top(6)
             .build();
         expander.set_widget_name("overview-technical");
         attention.add(&expander);
-        let reapply = gtk::Button::with_label(texts.ux.reapply);
-        reapply.set_widget_name("overview-reapply");
-        reapply.set_valign(gtk::Align::Center);
-        crate::ui::form::wrap_button(&reapply);
-        let reapply_row = row(texts.ux.saved_unapplied, "", "overview-saved-unapplied");
-        reapply_row.add_suffix(&reapply);
-        attention.add(&reapply_row);
-        let quotas = list();
-        attention.add(&quotas);
-        let traffic_group = group(texts.dashboard.routing_summary, "overview-traffic");
-        let summary = list();
-        traffic_group.add(&summary);
-        let traffic = list();
-        let details_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        let evidence = gtk::Label::builder()
-            .label(texts.primary.local_evidence)
-            .xalign(0.0)
-            .wrap(true)
-            .build();
-        evidence.add_css_class("dim-label");
-        details_content.append(&evidence);
-        details_content.append(&traffic);
-        let routing_details = gtk::Expander::builder()
-            .label(texts.dashboard.routing_details)
-            .child(&details_content)
-            .build();
-        routing_details.set_widget_name("overview-routing-details");
-        traffic_group.add(&routing_details);
+
+        // 3. Connections: one row each; details live on the Connections tab.
+        let connections_group = group(texts.ux.connections, "overview-connections");
+        let connections = list();
+        connections_group.add(&connections);
+
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         footer.set_widget_name("overview-footer");
         let refresh = gtk::Button::with_label(texts.ux.refresh);
@@ -452,7 +610,7 @@ impl Overview {
         help.set_widget_name("overview-help");
         footer.append(&refresh);
         footer.append(&help);
-        root.append(&footer);
+        content.append(&footer);
         let help_text = gtk::Label::builder()
             .label(texts.ux.snapshot_help)
             .xalign(0.0)
@@ -462,7 +620,7 @@ impl Overview {
             .build();
         help_text.set_widget_name("overview-help-text");
         help_text.add_css_class("dim-label");
-        root.append(&help_text);
+        content.append(&help_text);
         help.connect_clicked(move |_| help_text.set_visible(!help_text.is_visible()));
         Self {
             root,
@@ -473,8 +631,10 @@ impl Overview {
             notices,
             quotas,
             reapply_row,
-            traffic,
-            summary,
+            routing,
+            connections_group,
+            connections,
+            details_expanded: Rc::new(Cell::new(false)),
             technical,
             expander,
             on_select,
@@ -497,10 +657,8 @@ impl Overview {
             .into_iter()
             .map(|row| (row.title, row.subtitle, row.name))
             .collect();
-        let status = session
-            .snapshot_known()
-            .then(|| session.confirmed_status())
-            .flatten();
+        let tone = routing_tone(session);
+        let lanes = connection_rows(profile, session, texts);
         let items: Vec<(String, AttentionAction)> = attention
             .items
             .iter()
@@ -508,62 +666,113 @@ impl Overview {
             .collect();
         // Rows are rebuilt only when their content changes: a usage or status
         // poll must not reset keyboard focus on an activatable row.
-        let key = format!("{items:?}{:?}{traffic:?}", attention.technical);
+        let key = format!(
+            "{items:?}{:?}{traffic:?}{tone:?}{lanes:?}",
+            attention.technical
+        );
         if *self.rendered.borrow() != key {
             *self.rendered.borrow_mut() = key;
-            clear(&self.notices);
-            clear(&self.quotas);
-            let mut reapply = false;
-            for (text, action) in &items {
-                match action {
-                    AttentionAction::Reapply => reapply = true,
-                    AttentionAction::Connections => {
-                        let row = row(text, "", "overview-notice");
-                        navigate(&row, &self.on_select, Section::Connections);
-                        self.quotas.append(&row);
-                    }
-                    AttentionAction::None => self.notices.append(&row(text, "", "overview-notice")),
-                }
-            }
-            self.reapply_row.set_visible(reapply);
-            self.reapply.set_visible(reapply);
-            self.notices
-                .set_visible(self.notices.first_child().is_some());
-            self.quotas.set_visible(self.quotas.first_child().is_some());
-            self.technical.set_label(&attention.technical.join("\n\n"));
-            self.expander.set_visible(!attention.technical.is_empty());
-            clear(&self.traffic);
-            clear(&self.summary);
-            for (title, subtitle, name) in &traffic {
-                if matches!(*name, "overview-applied-scope" | "overview-backup") {
-                    let mut detail = subtitle.clone();
-                    if *name == "overview-applied-scope"
-                        && status.is_some_and(|s| s.applied_profile_id.is_some())
-                    {
-                        let exits = traffic
-                            .iter()
-                            .filter(|(_, _, name)| {
-                                matches!(*name, "overview-ipv4" | "overview-ipv6")
-                            })
-                            .map(|(title, value, _)| format!("{title}: {value}"))
-                            .collect::<Vec<_>>()
-                            .join(" · ");
-                        if !detail.is_empty() {
-                            detail.push('\n');
-                        }
-                        detail.push_str(&exits);
-                    }
-                    self.summary.append(&row(title, &detail, name));
-                } else {
-                    self.traffic.append(&row(title, subtitle, name));
-                }
-            }
+            self.render_attention(&items, &attention.technical);
+            self.render_routing(&traffic, tone);
+            self.render_connections(&lanes, profile.lanes.is_empty());
         }
         self.reapply
             .set_sensitive(session.config_writable() && !session.is_busy());
         self.refresh.set_sensitive(!session.is_busy());
         self.attention
             .set_visible(!attention.items.is_empty() || self.system_attention.get_visible());
+        let mut child = self.notices.first_child();
+        let mut any_visible = false;
+        while let Some(widget) = child {
+            any_visible |= widget.get_visible();
+            child = widget.next_sibling();
+        }
+        self.notices.set_visible(any_visible);
+    }
+
+    fn render_attention(&self, items: &[(String, AttentionAction)], technical: &[String]) {
+        // The system-exit and reapply rows are permanent; only notices change.
+        let mut child = self.notices.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if widget.widget_name() == "overview-notice" {
+                self.notices.remove(&widget);
+            }
+        }
+        clear(&self.quotas);
+        let mut reapply = false;
+        for (text, action) in items {
+            match action {
+                AttentionAction::Reapply => reapply = true,
+                AttentionAction::Connections => {
+                    let row = row(text, "", "overview-notice");
+                    row.add_prefix(&tone_icon(Tone::Warning));
+                    navigate(&row, &self.on_select, Section::Connections);
+                    self.quotas.append(&row);
+                }
+                AttentionAction::None => {
+                    let row = row(text, "", "overview-notice");
+                    row.add_prefix(&tone_icon(Tone::Error));
+                    self.notices.append(&row);
+                }
+            }
+        }
+        self.reapply_row.set_visible(reapply);
+        self.reapply.set_visible(reapply);
+        self.quotas.set_visible(self.quotas.first_child().is_some());
+        self.technical.set_label(&technical.join("\n\n"));
+        self.expander.set_visible(!technical.is_empty());
+    }
+
+    fn render_routing(&self, traffic: &[(String, String, &'static str)], tone: Tone) {
+        // While routing is off or unverified the exits all say the same thing;
+        // keep them one click away instead of repeating it on four rows.
+        let active = !matches!(tone, Tone::Inactive | Tone::Unknown);
+        clear(&self.routing);
+        let details = adw::ExpanderRow::builder()
+            .title(self.texts.dashboard.routing_details)
+            .subtitle(self.texts.primary.local_evidence)
+            .expanded(self.details_expanded.get())
+            .build();
+        details.set_widget_name("overview-routing-details");
+        let remembered = self.details_expanded.clone();
+        details.connect_expanded_notify(move |row| remembered.set(row.is_expanded()));
+        for (title, subtitle, name) in traffic {
+            let item = row(title, subtitle, name);
+            match *name {
+                "overview-status" => {
+                    item.add_prefix(&tone_icon(tone));
+                    self.routing.append(&item);
+                }
+                "overview-backup" => {
+                    item.add_prefix(&tone_icon(Tone::Warning));
+                    self.routing.append(&item);
+                }
+                "overview-ipv4" | "overview-ipv6" | "overview-applied-scope" if active => {
+                    self.routing.append(&item)
+                }
+                _ => details.add_row(&item),
+            }
+        }
+        self.routing.append(&details);
+    }
+
+    fn render_connections(&self, lanes: &[ConnectionRow], empty: bool) {
+        clear(&self.connections);
+        self.connections_group.set_visible(!empty);
+        for lane in lanes {
+            let item = row(&lane.title, &lane.subtitle, &lane.name);
+            item.add_prefix(&tone_icon(lane.tone));
+            if let Some(quota) = &lane.quota_status {
+                let bar = crate::ui::usage_widgets::QuotaBar::new(quota, self.texts.language).area;
+                bar.set_hexpand(false);
+                bar.set_valign(gtk::Align::Center);
+                bar.set_widget_name(&format!("{}-quota", lane.name));
+                item.add_suffix(&bar);
+            }
+            navigate(&item, &self.on_select, Section::Connections);
+            self.connections.append(&item);
+        }
     }
 }
 
@@ -827,6 +1036,105 @@ pub(crate) mod tests {
             .iter()
             .any(|item| item.text == texts.primary.needs_reauthorization));
     }
+    fn with_vinn_quota(session: &mut UiSession, used_bytes: u64, enabled: bool) {
+        let id = sent(
+            session
+                .begin_request(DaemonRequest::GetUsage { fast_lane: None }, None)
+                .unwrap(),
+        );
+        session.handle_daemon(DaemonToUi::Response {
+            epoch: 1,
+            response: DaemonResponse::success(
+                id,
+                DaemonResult::Usage(UsageReport {
+                    lanes: vec![LaneUsage {
+                        lane_id: "vinn".into(),
+                        interface: "usb0".into(),
+                        available: true,
+                        today: UsageTotals::default(),
+                        daily: vec![],
+                        rate: None,
+                        recent_rates: vec![],
+                        quota: Some(QuotaStatus {
+                            settings: LaneQuota {
+                                enabled,
+                                limit_bytes: 100,
+                                reset_day: 1,
+                                warn_percent: 80,
+                            },
+                            period_start: LocalDate::parse("2026-11-01").unwrap(),
+                            next_reset: LocalDate::parse("2026-12-01").unwrap(),
+                            used_bytes,
+                            measured: UsageTotals::default(),
+                        }),
+                    }],
+                }),
+            ),
+        });
+    }
+
+    #[test]
+    fn connection_rows_show_verified_health_roles_and_enabled_quota() {
+        let profile = profile();
+        let mut session = applied_session(&profile);
+        for language in [Language::Tr, Language::En] {
+            let texts = language.texts();
+            let rows = connection_rows(&profile, &session, texts);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].name, "overview-lane-ethernet");
+            assert_eq!(rows[0].title, "Ethernet");
+            assert_eq!(rows[0].tone, Tone::Good);
+            assert_eq!(
+                rows[0].subtitle,
+                format!(
+                    "ethernet · {} · {} · {}",
+                    texts.status_healthy, texts.dashboard.role_primary, texts.dashboard.role_in_use
+                )
+            );
+            assert_eq!(
+                rows[1].subtitle,
+                format!(
+                    "vinn · {} · {}",
+                    texts.status_healthy, texts.dashboard.role_backup
+                )
+            );
+            assert_eq!(rows[1].quota, None, "no usage report yet");
+        }
+        with_vinn_quota(&mut session, 80, true);
+        let texts = Language::Tr.texts();
+        let rows = connection_rows(&profile, &session, texts);
+        assert_eq!(rows[1].quota, Some(0.8));
+        assert_eq!(
+            rows[1].quota_status.as_ref().map(|quota| quota.used_bytes),
+            Some(80)
+        );
+        assert!(
+            rows[1].subtitle.ends_with(" · Kota %80"),
+            "{}",
+            rows[1].subtitle
+        );
+        with_vinn_quota(&mut session, 80, false);
+        assert_eq!(connection_rows(&profile, &session, texts)[1].quota, None);
+    }
+
+    #[test]
+    fn connection_rows_never_claim_health_or_use_without_a_known_snapshot() {
+        let profile = profile();
+        let session = UiSession::new(profile.clone(), true);
+        let texts = Language::En.texts();
+        let rows = connection_rows(&profile, &session, texts);
+        assert_eq!(rows[0].tone, Tone::Unknown);
+        assert_eq!(
+            rows[0].subtitle,
+            format!(
+                "ethernet · {} · {}",
+                texts.ux.unknown, texts.dashboard.role_primary
+            ),
+            "saved roles stay, verified health and current use do not"
+        );
+        assert_eq!(routing_tone(&session), Tone::Unknown);
+    }
+
     #[test]
     fn enabled_quotas_warn_at_threshold_with_turkish_suffixes_and_english_copy() {
         let profile = profile();
