@@ -93,6 +93,63 @@ güncellendi (geniş yedeğe geçiş senaryosu bu opt-in'e aittir).
 Polkit kararı test kuralıyla (`polkit.addRule`) verildi; etkileşimli
 masaüstü Polkit ajanı **NOT VERIFIED**.
 
+## Denetim Task 9 — geri almada yönetilen kapsam korunur (11 Kasım 2026)
+
+Ortam: tek kullanımlık `routelane-test-u2404-20261111` (Ubuntu 24.04 x86_64,
+yalnız bu iş için kullanıcı onayıyla açıldı). Önceden derlenmiş ikililer host
+mutlak yollarına kopyalandı, sha256 misafirde doğrulandı.
+
+Bulgu (E5): başarısız bir geçişin geri alınması RouteLane tablosunu boşaltıp
+önceki neslin politika kuralları ve rotaları yeniden kurulana kadar o neslin
+yönettiği hedefleri korumasız bırakıyordu. Düzeltme (`9950eac`): geri alma
+önce yalnız korumayı içeren bir belgeyle tabloyu atomik olarak değiştirir
+(önceki neslin yönetilen kapsamı reddedilir, yönetilmeyen trafik akmaya devam
+eder), sonra kuralları/rotaları kurar ve sahipli kural setini atomik olarak
+geri yükler. Bu aralıkta çöken helper için yeni `RestoreGuard` kurtarma evresi
+eklendi; parmak izi journal'daki aktif plandan hesaplanır, journal biçimi
+değişmedi.
+
+| Kanıt | Sonuç |
+|---|---|
+| `selective_routing::rollback_keeps_the_previous_managed_scope_guarded`, eski kod (root `ea9f18ed…`, helper `59aba4f9…`) | **RED**: `managed destination escaped during the rollback via Ok("10.10.2.2")` (`t9-vm-red.log`) |
+| Aynı senaryo, düzeltilmiş kod (root `13e62f38…`, helper `fafab88a…`) | **PASS**: geri alma duraklatıldığında yönetilen hedef reddedildi, lab ve eşleşmeyen trafik sistem çıkışından aktı; geri alma sonrası nesil 1 ve kaynak `10.10.1.2` |
+| Tam root suite, standart ve `ROUTELANE_TEST_STRICT_RPF=1` | 25/26 PASS; `v2_upgrade` eski journal-v2 helper'ı ister (`ROUTELANE_TEST_OLD_HELPER`), ardından ayrı koşuda iki modda da **PASS** (helper `d1ab4931…`) |
+| Rootless: birim sıra testi, `RestoreGuard` çökme penceresi, `transaction_contract` geri alma koruma probu | PASS; üç mutasyon (tabloyu silmek, `RestoreGuard` sınıflandırmasını kaldırmak, boş koruma belgesi) her birini RED yaptı |
+| Gerçek system bus + Polkit, `9950eac`'ten derlenen `routelane_0.1.2_amd64.deb` (sha256 `9245d026…`) misafire kuruldu | **PASS** (`t9-vm-system-bus.log`): yetkili etkinleştirme, yetkisiz politika/hat/yabancı UID reddi, yetkisiz otomatik yedeğe geçiş ve `RuntimeChanged`, `kill -9` sonrası Armed sürer, geri dönüş, yetkili cleanup; teardown 0 namespace/paket/kullanıcı |
+| Yavaş Polkit kararı okumaları bloklar mı? Test kuralı 5 s bekleyip YES döner; `Cleanup` bunu beklerken aynı kullanıcı `Inspect` çağırır | **Bloklamaz**: `Cleanup` 5,01 s sürdü, eşzamanlı `Inspect` 0,13 s'de döndü (`t9-vm-polkit-concurrency.log`) |
+
+## Denetim Task 10 — aralıklı strict-RPF hatası (11 Kasım 2026)
+
+Aynı VM, `ROUTELANE_TEST_STRICT_RPF=1`.
+
+| Ölçüm | Sonuç |
+|---|---|
+| `real_helper_routes_three_lanes…` tek başına 30×, düzeltme öncesi | 27/30; 3 hata, hepsi yanlış sink'te +2 çerçeve |
+| Tam suite 10×, düzeltme öncesi | 8/10; iki hata yalnız `runtime_refresh` `exchanges > 20` (tam 20 değişim, 0 UDP kaybı) |
+| Protokol başına sayaçlı tanı derlemesi, 37 koşu | 3 hatanın üçünde yanlış sink'in fazlası tam olarak `Ip6InReceives` artışı; IPv4 `IpInReceives`/`IcmpInEchos` değişmedi. IPv4 probu yalnız beklenen sink'e ulaştı |
+
+Kök neden: test ölçümü. Sink arayüzünün çerçeve sayacı, yeni oluşturulan
+bağlantıların IPv6 link-local trafiğini (RS/MLD) de sayıyordu; bu bir
+yönlendirme hatası değildi. Düzeltme yalnız testte: sink sayacı sink
+namespace'inin IPv4 `Ip InReceives` değerini okur (yanlış yöne giden her IPv4
+datagramını yakalar). `runtime_refresh` artık toplam sayı yerine geri
+dönüşten sonra en az 5 yedek akış değişimi ister.
+
+| Düzeltme sonrası (root `88538509…`, helper `fafab88a…`) | Sonuç |
+|---|---|
+| `real_helper_routes_three_lanes…` 30× | **30/30 PASS** |
+| Tam suite standart ve strict (eski journal-v2 helper ile) | **26/26 PASS** ikisinde de |
+| `runtime_refresh…` 15× | 14/15; 1 hata **yeni ve ayrı bir bulgu**: yedek UDP akışının `send` çağrısı `EPERM` aldı |
+
+Açık bulgu (doğrulanmadı, hipotez): `UsePrimary` modunda geçici koruma
+(`guard`) geniş `reject` uygular ve yalnız sahipsiz (`ct mark 0`) oturumları
+geçirir. Bu yüzden bir çalışma zamanı geçişinin kısa koruma aralığında
+RouteLane'e ait, kurulu bir yedek akışın paketi de reddedilebilir. TCP yeniden
+gönderimle sürer; UDP uygulamaya `EPERM` döner ve datagram kaybolur. Ürün
+kuralı "mevcut yedek akışlar koparılmaz" ile çelişebilir. Koruma sayaçlarıyla
+gerçek kernel kanıtı ve tasarım kararı gerekiyor; test bunu gizlemesin diye
+katı bırakıldı.
+
 ### NOT VERIFIED
 
 - Etkileşimli Polkit ajanı ve GUI'nin kurulu paketle gerçek oturumu.
