@@ -1470,6 +1470,14 @@ impl Routing {
         }
     }
 
+    /// A fresh helper process on the same journal, as after a crash.
+    pub(super) fn restart_helper(&mut self) {
+        match self {
+            Self::Helper { helper, _state } => *helper = HelperProcess::spawn(_state.path()),
+            Self::Legacy { .. } => panic!("the schema-1 baseline has no helper"),
+        }
+    }
+
     pub(super) fn start(names: &RunNames) -> Self {
         if env::var_os(LEGACY_ENV).is_some() {
             return Self::Legacy { active: None };

@@ -1140,6 +1140,20 @@ impl HelperProcess {
         serde_json::from_str(&response).unwrap()
     }
 
+    pub(super) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// A request whose helper may die before answering: `None` then.
+    pub(super) fn try_request(&mut self, request: Value) -> Option<Value> {
+        serde_json::to_writer(&mut self.stdin, &request).ok()?;
+        self.stdin.write_all(b"\n").ok()?;
+        self.stdin.flush().ok()?;
+        let mut response = String::new();
+        self.stdout.read_line(&mut response).ok()?;
+        serde_json::from_str(&response).ok()
+    }
+
     pub(super) fn ok(&mut self, request: Value) -> Value {
         let response = self.request(request);
         assert!(response.get("error").is_none(), "helper error: {response}");

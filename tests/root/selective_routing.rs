@@ -91,6 +91,26 @@ fn rollback_keeps_the_previous_managed_scope_guarded() {
 }
 
 #[test]
+fn helper_crash_mid_rollback_stays_guarded_and_recovers() {
+    run_worker_scenario(WORKER, "rollback_crash_recover", |names| {
+        let mut servers = lab_and_uplinks(names);
+        servers.push(EchoServer::spawn(&names.sinks[0], &["198.18.0.10:7000"]));
+        servers.push(EchoServer::spawn(&names.sinks[1], &["198.18.0.10:7000"]));
+        servers
+    });
+}
+
+#[test]
+fn unfinished_rollback_is_removed_by_an_authorized_cleanup() {
+    run_worker_scenario(WORKER, "rollback_crash_cleanup", |names| {
+        let mut servers = lab_and_uplinks(names);
+        servers.push(EchoServer::spawn(&names.sinks[0], &["198.18.0.10:7000"]));
+        servers.push(EchoServer::spawn(&names.sinks[1], &["198.18.0.10:7000"]));
+        servers
+    });
+}
+
+#[test]
 fn selective_worker() {
     let Ok(scenario) = env::var(SCENARIO_ENV) else {
         return;
@@ -103,6 +123,8 @@ fn selective_worker() {
         "foreign_and_forwarded" => foreign_and_forwarded(&names),
         "v2_upgrade" => v2_upgrade(&names),
         "rollback_guard" => rollback_guard(&names),
+        "rollback_crash_recover" => rollback_crash(&names, false),
+        "rollback_crash_cleanup" => rollback_crash(&names, true),
         other => panic!("unknown selective scenario {other}"),
     }
 }
@@ -451,6 +473,105 @@ fn rollback_guard(names: &RunNames) {
         "10.10.1.2"
     );
     routing.cleanup();
+}
+
+/// The helper is killed while only the restore guard is live. The kernel
+/// keeps holding the managed scope back; a fresh helper on the same journal
+/// classifies the guard-only table from the real nft dump and either
+/// completes the rollback or, when the previous route can no longer be
+/// installed, lets an authorized cleanup remove everything it owns.
+fn rollback_crash(names: &RunNames, unrecoverable: bool) {
+    let mut routing = Routing::start(names);
+    let first = plan(
+        1,
+        names,
+        vec![rule(
+            "shared-site",
+            5,
+            &format!("{SHARED_ROUTED}/32"),
+            CompiledAction::Mark(MARK_BASE),
+        )],
+    );
+    routing.apply(&first);
+    assert_eq!(
+        fresh_source(SHARED_ROUTED).expect("managed route before the transition"),
+        "10.10.1.2"
+    );
+    let next = plan(2, names, vec![vinn_rule()]);
+    let (helper, state) = routing.helper();
+    let pause = state.join("rollback-paused");
+    helper.ok(json!({
+        "method": "set_fail_point",
+        "value": "activate_nft",
+        "restore_pause_file": pause.to_str().unwrap(),
+    }));
+    let pid = helper.pid();
+    std::thread::scope(|scope| {
+        let pause_file = pause.clone();
+        let transition = scope.spawn(move || {
+            helper.try_request(json!({
+                "method": "apply",
+                "plan_json": serde_json::to_string(&next).unwrap(),
+            }))
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !pause_file.exists() {
+            assert!(Instant::now() < deadline, "the rollback never paused");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // SAFETY: signalling the helper child this test spawned.
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
+        assert!(
+            transition.join().unwrap().is_none(),
+            "the killed helper must not answer"
+        );
+    });
+    let _ = std::fs::remove_file(&pause);
+    let held = fresh_source(SHARED_ROUTED);
+    assert!(
+        held.is_err(),
+        "managed destination escaped after the helper died via {held:?}"
+    );
+    assert_lab_reachable("after the helper died");
+    assert_eq!(
+        fresh_source(UNMATCHED).expect("unmatched traffic flows"),
+        "10.10.2.2"
+    );
+
+    routing.restart_helper();
+    let (helper, _) = routing.helper();
+    assert_eq!(helper.ok(json!({"method": "inspect"}))["generation"], 1);
+    assert!(
+        fresh_source(SHARED_ROUTED).is_err(),
+        "inspect never replays the journal"
+    );
+    if unrecoverable {
+        // The previous generation's lane is gone: its route cannot return.
+        let lane = names.client_interfaces[0].clone();
+        run_ip(["link", "set", &lane, "down"]);
+        let error = helper.error(json!({
+            "method": "apply",
+            "plan_json": serde_json::to_string(&first).unwrap(),
+        }));
+        assert!(error.contains("recover pending"), "recovery fails: {error}");
+        assert!(
+            fresh_source(SHARED_ROUTED).is_err(),
+            "a failed recovery keeps the guard"
+        );
+        let cleaned = helper.ok(json!({"method": "cleanup"}));
+        assert_eq!(cleaned["cleaned"], true, "{cleaned}");
+        assert_managed_resources_absent();
+        run_ip(["link", "set", &lane, "up"]);
+        evidence("helper killed mid-rollback: guard held; unrecoverable rollback removed by authorized cleanup");
+    } else {
+        routing.apply(&first);
+        assert_eq!(
+            fresh_source(SHARED_ROUTED).expect("previous route recovered"),
+            "10.10.1.2"
+        );
+        evidence("helper killed mid-rollback: guard held; fresh helper recovered generation 1");
+        routing.cleanup();
+    }
 }
 
 fn foreign_and_forwarded(names: &RunNames) {
